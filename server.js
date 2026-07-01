@@ -6,7 +6,8 @@ const cors = require("cors");
 const connectDB = require("./config/db");
 
 const chatRoutes = require("./routes/chatRoutes");
-const geminiRoutes = require("./routes/geminiRoutes");
+const ollamaRoutes=require("./routes/aiRoutes")
+// const geminiRoutes = require("./routes/geminiRoutes");
 const authRoutes = require("./routes/authRoutes");
 connectDB();
 const app = express();
@@ -22,7 +23,8 @@ app.use(express.json());
 
 app.use("/api/chats", chatRoutes);
 app.use("/api/auth", authRoutes);
-app.use("/api/gemini", geminiRoutes);
+app.use("/api/ollama", ollamaRoutes);
+// app.use("/api/gemini", geminiRoutes);
 
 app.get("/", (req, res) => {
   res.send("Server Running");

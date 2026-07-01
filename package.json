@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "@google/genai": "^2.9.0",
+    "axios": "^1.18.1",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -20,6 +21,7 @@
     "mongodb": "^7.3.0",
     "mongoose": "^9.7.1",
     "nodemon": "^3.1.14",
+    "ollama": "^0.6.3",
     "openai": "^6.44.0",
     "zod": "^4.4.3"
   }
