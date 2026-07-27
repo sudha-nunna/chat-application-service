@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const chatController = require("../controllers/chatController"); // Points to streaming controller
 const authMiddleware = require("../middleware/auth");
+const Contact = require("../models/Contact");
 
 const protect = typeof authMiddleware === "function" ? authMiddleware : authMiddleware.protect;
 
@@ -19,6 +20,27 @@ router.post("/crm/forward-contact", protect, async (req, res) => {
     const apiKey = process.env.CRM_API_KEY ;
     const apiUrl = process.env.CRM_API_URL ;
 
+    // ALSO STORE IN SEPARATE MONGOOSE CONTACT COLLECTION (Deduplicated by userId)
+    if (payload.firstName && payload.lastName && payload.email && payload.phone) {
+      try {
+        await Contact.findOneAndUpdate(
+          { userId: req.user.id },
+          {
+            userId: req.user.id,
+            chatId: payload.chatId || req.user.id,
+            firstName: payload.firstName,
+            lastName: payload.lastName,
+            email: payload.email,
+            phone: payload.phone === "null" || !payload.phone ? null : payload.phone,
+            companyName: payload.companyName === "null" || !payload.companyName ? null : payload.companyName
+          },
+          { upsert: true, new: true }
+        );
+      } catch (dbErr) {
+        console.error("Contact collection saving notice:", dbErr.message);
+      }
+    }
+
     const response = await fetch(apiUrl, {
       method: "POST",
       headers: {
@@ -29,11 +51,11 @@ router.post("/crm/forward-contact", protect, async (req, res) => {
         firstName: payload.firstName,
         lastName: payload.lastName,
         email: payload.email,
-        phone: payload.phone || "+1234567890",
-        companyName: payload.companyName || "Acme Corp",
+        phone: payload.phone === "null" || !payload.phone ? null : payload.phone,
+        companyName: payload.companyName === "null" || !payload.companyName ? null : payload.companyName,
         pipelineId: "64b1c2d3e4f5a6b7c8d9e0f1",
         stageId: "new",
-        description: payload.description || "Created automatically by AI live agent assistant workspace interface."
+        description: payload.description === "null" || !payload.description ? null : payload.description
       })
     });
 
