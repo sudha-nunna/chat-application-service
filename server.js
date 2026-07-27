@@ -20,10 +20,10 @@ app.use(cors({
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-app.use("/api/chats", chatRoutes);
-app.use("/api/auth", authRoutes);
-app.use("/api/ollama", ollamaRoutes);
-app.use("/api/bots", botRoutes);
+app.use("/chats", chatRoutes);
+app.use("/auth", authRoutes);
+app.use("/ollama", ollamaRoutes);
+app.use("/bots", botRoutes);
 
 app.get("/", (req, res) => {
   res.send("Server Running");
