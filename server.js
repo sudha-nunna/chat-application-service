@@ -12,8 +12,14 @@ const botRoutes = require("./routes/botRoutes");
 connectDB();
 const app = express();
 
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://chat-application-app-gold.vercel.app",
+  process.env.CLIENT_URL
+].filter(Boolean);
+
 app.use(cors({
-  origin: "http://localhost:5173" || "https://chat-application-app-gold.vercel.app/",
+  origin: allowedOrigins,
   credentials: true
 }));
 
