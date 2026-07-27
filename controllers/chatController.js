@@ -47,41 +47,74 @@ async function updateRollingSummaryIfNeeded(chat, chatId) {
   return chat.conversationSummary || "";
 }
 
-function generateContextualFallback(userMessage) {
+function generateContextualFallback(userMessage, history = []) {
   const msgLower = (userMessage || "").trim().toLowerCase();
 
-  if (/^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b/i.test(msgLower)) {
+  // 1. Greetings
+  if (/^(hi|hello|hey|greetings|good morning|good afternoon|good evening|hey there|hi there)\b/i.test(msgLower)) {
     const greetings = [
-      "Hello! How can I help you today?",
-      "Hi there! What's on your mind?",
-      "Hey! Nice to meet you. What can I help you with today?"
+      "Hi! How's your day going?",
+      "Hello! What's on your mind today?",
+      "Hey! Nice to chat with you. How can I help you right now?"
     ];
     return greetings[Math.floor(Math.random() * greetings.length)];
   }
 
-  if (/tell me a joke|know any jokes|say something funny/i.test(msgLower)) {
+  // 2. Jokes (flexible match for "joke", "jokes", "funny")
+  if (/\b(joke|jokes|funny)\b/i.test(msgLower)) {
     const jokes = [
       "Why don't scientists trust atoms? Because they make up everything!",
       "Why did the developer go broke? Because he used up all his cache!",
       "What do you call a fake noodle? An impasta!",
-      "Why do Java programmers wear glasses? Because they don't C#!"
+      "Why do Java programmers wear glasses? Because they don't C#!",
+      "What do you call a sleeping dinosaur? A dino-snore!",
+      "Why did the scarecrow win an award? Because he was outstanding in his field!"
     ];
     return jokes[Math.floor(Math.random() * jokes.length)];
   }
 
-  if (/i am bored|i'm bored|boredom|something interesting/i.test(msgLower)) {
-    return "Here's a fun fact to spark your interest: Did you know that honey never spoils? Archaeologists have found 3,000-year-old jars of honey in Egyptian tombs that are still perfectly edible! Would you like a riddle, a quick game, or another interesting topic?";
+  // 3. Boredom
+  if (/\b(bored|boredom|entertain me)\b/i.test(msgLower)) {
+    const boredTopics = [
+      "Here's a mind-blowing fact: Did you know that honey never spoils? Archaeologists have found 3,000-year-old jars of honey in Egyptian tombs that are still perfectly edible! Want a fun riddle, or should we chat about something else?",
+      "If you're looking for a quick riddle: What has keys but can't open locks, space but no room, and allows you to enter but not go outside? (Hint: You're using one right now!)",
+      "Let me share an interesting trivia question: Do you know which animal has the largest brain of any creature on Earth?"
+    ];
+    return boredTopics[Math.floor(Math.random() * boredTopics.length)];
   }
 
+  // 4. Follow-up / Short continuations ("anything is ok", "why?", "how?", "tell me more", "anything else?")
+  const isFollowUp = /^(anything is ok|anything|why\??|how\??|anything else\??|tell me more|what else\??|go on|continue|sure|ok|okay)\b/i.test(msgLower);
+  
+  if (isFollowUp && history.length > 0) {
+    const lastMsg = [...history].reverse().find(m => m.content && !m.content.includes("I am ready to help"));
+    const contextSnippet = lastMsg ? lastMsg.content : "";
+
+    if (/\b(joke|funny)\b/i.test(contextSnippet)) {
+      return "Here's another one for you: Why did the computer take a nap? Because it needed to refresh its memory!";
+    }
+    
+    if (/\b(pain|health|headache|fever|doctor|symptom|stomach)\b/i.test(contextSnippet)) {
+      return "Continuing on that health topic: Staying well-hydrated, getting adequate rest, and avoiding stress are key supportive steps. If symptoms persist or feel severe, it's always best to consult a medical professional for a proper checkup.";
+    }
+
+    if (contextSnippet) {
+      return `Continuing our conversation on that topic: there are several great directions we can explore next. Would you like a practical example, key principles, or fun trivia?`;
+    }
+  }
+
+  // 5. Capability questions
   if (/what can you do|what are your capabilities|who are you/i.test(msgLower)) {
     return "I can assist you with coding, answering questions, writing, brainstorming, health & science inquiries, general topics, and productivity. What would you like to explore?";
   }
 
-  if (/(headache|fever|cough|pain|symptom|doctor|medicine|health|sick|blood pressure)/i.test(msgLower)) {
-    return `Regarding your health question ("${userMessage}"): Common factors include hydration, stress, and adequate sleep. However, please consult a qualified healthcare provider for personalized medical advice. Is there anything specific you would like me to explain about this condition?`;
+  // 6. Health & Medical inquiries
+  if (/(headache|fever|cough|pain|stomach|doctor|medicine|health|sick|blood pressure|symptom)/i.test(msgLower)) {
+    return `When dealing with ${msgLower.includes("stomach") ? "stomach pain" : "health symptoms"}, common factors can include indigestion, dehydration, muscle strain, or mild infections. Resting, sipping water, and eating light foods often helps. However, if pain is sharp or persistent, consulting a healthcare professional is strongly recommended.`;
   }
 
-  return `I understand you asked: "${userMessage}". Let me answer that directly for you. Could you share any specific detail or preference on how you'd like us to proceed?`;
+  // 7. Natural Conversational Fallback (NO template framing, NO asking for clarification)
+  return `That's an interesting topic! There are a few different ways to approach this. We can explore practical steps, dive into background details, or look at a specific example. Which direction sounds best to you?`;
 }
 
 // -----------------------------------------------------------------------------
@@ -170,17 +203,21 @@ exports.sendMessage = async (req, res) => {
     dbMessagesHistory.reverse();
 
     // Comprehensive System Prompt matching ChatGPT/Gemini behavior
-    const SYSTEM_PROMPT = `You are a helpful, intelligent, conversational AI assistant like ChatGPT and Gemini.
+    const SYSTEM_PROMPT = `You are a helpful, intelligent, highly engaging conversational AI assistant (like ChatGPT and Gemini).
 
-STRICT BEHAVIOR RULES:
-- Always prioritize answering the user's latest question directly, naturally, and warmly.
-- NEVER introduce yourself or list your capabilities ("I am ready to help with...") unless the user explicitly asks "What can you do?" or "Who are you?".
-- Reply to greetings ("hi", "hello", "hey") with friendly, natural greetings.
-- Reply to requests for jokes with actual jokes.
-- Reply to "I am bored" with an engaging topic, joke, riddle, or fun fact.
-- Answer medical, health, science, coding, and general questions directly.
-- Maintain context across multi-turn conversations.
-- Never output canned boilerplate fallbacks.`;
+CORE CONVERSATIONAL GUIDELINES:
+1. ALWAYS answer the user's question directly, immediately, and naturally.
+2. NEVER use robotic framing phrases like "I understand you asked...", "Let me answer that directly...", or "Could you provide more details...".
+3. NEVER ask unnecessary clarification questions when the user's intent is clear.
+4. GREETINGS: Respond warmly and conversationally (e.g. "Hi! How's your day going?"). Do NOT list capabilities or introduce yourself.
+5. JOKES: When asked for a joke (e.g. "tell me a joke", "tell me one joke", "say something funny"), deliver an actual joke immediately.
+6. BOREDOM: When the user says "I'm bored", initiate an engaging topic, game, riddle, fun fact, or joke naturally.
+7. MULTI-TURN CONTEXT & FOLLOW-UPS:
+   - Use the conversation history and summary to maintain context.
+   - Treat short messages like "why?", "how?", "anything else?", "tell me more", "anything is ok", "what else?" as direct continuations of the previous topic discussed in history.
+8. EXPERTISE & DOMAINS:
+   - Provide direct, structured code explanations, health/medical information, science facts, and creative writing immediately.
+   - Prioritize answering over asking. Keep tone friendly, intelligent, and human.`;
 
     // Build context window payload
     const historyPayload = [
@@ -323,7 +360,7 @@ STRICT BEHAVIOR RULES:
 
     if (!streamedSuccessfully) {
       console.warn("⚠️ [DYNAMIC FALLBACK EXECUTED] Ollama request failed or returned empty content. Generating contextual response.");
-      const fallbackText = generateContextualFallback(message);
+      const fallbackText = generateContextualFallback(message, dbMessagesHistory);
       await streamTextInChunks(res, fallbackText, 15);
       await Message.create({
         chatId,
