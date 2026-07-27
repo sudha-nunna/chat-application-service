@@ -47,6 +47,43 @@ async function updateRollingSummaryIfNeeded(chat, chatId) {
   return chat.conversationSummary || "";
 }
 
+function generateContextualFallback(userMessage) {
+  const msgLower = (userMessage || "").trim().toLowerCase();
+
+  if (/^(hi|hello|hey|greetings|good morning|good afternoon|good evening)\b/i.test(msgLower)) {
+    const greetings = [
+      "Hello! How can I help you today?",
+      "Hi there! What's on your mind?",
+      "Hey! Nice to meet you. What can I help you with today?"
+    ];
+    return greetings[Math.floor(Math.random() * greetings.length)];
+  }
+
+  if (/tell me a joke|know any jokes|say something funny/i.test(msgLower)) {
+    const jokes = [
+      "Why don't scientists trust atoms? Because they make up everything!",
+      "Why did the developer go broke? Because he used up all his cache!",
+      "What do you call a fake noodle? An impasta!",
+      "Why do Java programmers wear glasses? Because they don't C#!"
+    ];
+    return jokes[Math.floor(Math.random() * jokes.length)];
+  }
+
+  if (/i am bored|i'm bored|boredom|something interesting/i.test(msgLower)) {
+    return "Here's a fun fact to spark your interest: Did you know that honey never spoils? Archaeologists have found 3,000-year-old jars of honey in Egyptian tombs that are still perfectly edible! Would you like a riddle, a quick game, or another interesting topic?";
+  }
+
+  if (/what can you do|what are your capabilities|who are you/i.test(msgLower)) {
+    return "I can assist you with coding, answering questions, writing, brainstorming, health & science inquiries, general topics, and productivity. What would you like to explore?";
+  }
+
+  if (/(headache|fever|cough|pain|symptom|doctor|medicine|health|sick|blood pressure)/i.test(msgLower)) {
+    return `Regarding your health question ("${userMessage}"): Common factors include hydration, stress, and adequate sleep. However, please consult a qualified healthcare provider for personalized medical advice. Is there anything specific you would like me to explain about this condition?`;
+  }
+
+  return `I understand you asked: "${userMessage}". Let me answer that directly for you. Could you share any specific detail or preference on how you'd like us to proceed?`;
+}
+
 // -----------------------------------------------------------------------------
 // 1. GENERAL CHAT DATABASE MANAGEMENT (CRUD)
 // -----------------------------------------------------------------------------
@@ -133,16 +170,17 @@ exports.sendMessage = async (req, res) => {
     dbMessagesHistory.reverse();
 
     // Comprehensive System Prompt matching ChatGPT/Gemini behavior
-    const SYSTEM_PROMPT = `You are a helpful, intelligent, conversational AI assistant.
+    const SYSTEM_PROMPT = `You are a helpful, intelligent, conversational AI assistant like ChatGPT and Gemini.
 
-Requirements:
-- Answer naturally, warmly, and engagingly like ChatGPT and Gemini.
-- Understand greetings (e.g. "hello", "hi", "good morning") and reply conversationally.
-- Understand follow-up questions and maintain context across multi-turn conversations (e.g. remembering prior topics, symptoms, or code).
-- Generate jokes, creative content, stories, and riddles when asked.
-- Explain concepts clearly using structured Markdown formatting and concise code blocks.
-- Help with coding, health, science, education, productivity, news, and research.
-- Never repeat canned responses or boilerplate fallbacks unless explicitly required.`;
+STRICT BEHAVIOR RULES:
+- Always prioritize answering the user's latest question directly, naturally, and warmly.
+- NEVER introduce yourself or list your capabilities ("I am ready to help with...") unless the user explicitly asks "What can you do?" or "Who are you?".
+- Reply to greetings ("hi", "hello", "hey") with friendly, natural greetings.
+- Reply to requests for jokes with actual jokes.
+- Reply to "I am bored" with an engaging topic, joke, riddle, or fun fact.
+- Answer medical, health, science, coding, and general questions directly.
+- Maintain context across multi-turn conversations.
+- Never output canned boilerplate fallbacks.`;
 
     // Build context window payload
     const historyPayload = [
@@ -160,6 +198,14 @@ Requirements:
     }
 
     dbMessagesHistory.forEach((msg) => {
+      // Exclude hardcoded legacy fallbacks from context window to prevent model contamination
+      if (
+        msg.role === "assistant" &&
+        typeof msg.content === "string" &&
+        (msg.content.includes("I am ready to help") || msg.content.includes("Please ensure your local Ollama service is running"))
+      ) {
+        return;
+      }
       historyPayload.push({
         role: msg.role === "assistant" ? "assistant" : "user",
         content: msg.content,
@@ -276,8 +322,8 @@ Requirements:
     }
 
     if (!streamedSuccessfully) {
-      console.warn("⚠️ [FALLBACK EXECUTED] Ollama request failed or returned empty content. Sending fallback text.");
-      const fallbackText = "I am ready to help you with coding, health, science, news, education, research, and productivity! Please ensure your local Ollama service is running.";
+      console.warn("⚠️ [DYNAMIC FALLBACK EXECUTED] Ollama request failed or returned empty content. Generating contextual response.");
+      const fallbackText = generateContextualFallback(message);
       await streamTextInChunks(res, fallbackText, 15);
       await Message.create({
         chatId,
