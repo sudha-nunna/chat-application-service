@@ -85,7 +85,7 @@ function generateContextualFallback(userMessage, history = []) {
 
   // 4. Follow-up / Short continuations ("anything is ok", "why?", "how?", "tell me more", "anything else?")
   const isFollowUp = /^(anything is ok|anything|why\??|how\??|anything else\??|tell me more|what else\??|go on|continue|sure|ok|okay)\b/i.test(msgLower);
-  
+
   if (isFollowUp && history.length > 0) {
     const lastMsg = [...history].reverse().find(m => m.content && !m.content.includes("I am ready to help"));
     const contextSnippet = lastMsg ? lastMsg.content : "";
@@ -93,7 +93,7 @@ function generateContextualFallback(userMessage, history = []) {
     if (/\b(joke|funny)\b/i.test(contextSnippet)) {
       return "Here's another one for you: Why did the computer take a nap? Because it needed to refresh its memory!";
     }
-    
+
     if (/\b(pain|health|headache|fever|doctor|symptom|stomach)\b/i.test(contextSnippet)) {
       return "Continuing on that health topic: Staying well-hydrated, getting adequate rest, and avoiding stress are key supportive steps. If symptoms persist or feel severe, it's always best to consult a medical professional for a proper checkup.";
     }
@@ -165,7 +165,7 @@ exports.deleteChat = async (req, res) => {
 };
 
 // -----------------------------------------------------------------------------
-// 2. UNRESTRICTED GENERAL CHAT ENGINE WITH FULL CONVERSATION MEMORY
+// 2. UNRESTRICTED GENERAL CHAT ENGINE WITH FULL CONVERSATION MEMORY (OLLAMA-NATIVE)
 // -----------------------------------------------------------------------------
 
 exports.sendMessage = async (req, res) => {
@@ -198,48 +198,41 @@ exports.sendMessage = async (req, res) => {
     // Update rolling summary if total messages >= 20
     const summaryText = await updateRollingSummaryIfNeeded(chat, chatId);
 
-    // Fetch last 10 messages for conversation memory context
-    const dbMessagesHistory = await Message.find({ chatId }).sort({ createdAt: -1 }).limit(10);
+    // Fetch last 16 messages (8 turns) for deep multi-turn conversation memory
+    const dbMessagesHistory = await Message.find({ chatId }).sort({ createdAt: -1 }).limit(16);
     dbMessagesHistory.reverse();
 
-    // Comprehensive System Prompt matching ChatGPT/Gemini behavior
-    const SYSTEM_PROMPT = `You are a helpful, intelligent, highly engaging conversational AI assistant (like ChatGPT and Gemini).
+    // Unified System Instruction Block merging Core Guidelines and Conversation Summary
+    let unifiedSystemPrompt = `You are a helpful, intelligent, highly capable conversational AI assistant like ChatGPT and Gemini.
 
-CORE CONVERSATIONAL GUIDELINES:
-1. ALWAYS answer the user's question directly, immediately, and naturally.
-2. NEVER use robotic framing phrases like "I understand you asked...", "Let me answer that directly...", or "Could you provide more details...".
-3. NEVER ask unnecessary clarification questions when the user's intent is clear.
-4. GREETINGS: Respond warmly and conversationally (e.g. "Hi! How's your day going?"). Do NOT list capabilities or introduce yourself.
-5. JOKES: When asked for a joke (e.g. "tell me a joke", "tell me one joke", "say something funny"), deliver an actual joke immediately.
-6. BOREDOM: When the user says "I'm bored", initiate an engaging topic, game, riddle, fun fact, or joke naturally.
-7. MULTI-TURN CONTEXT & FOLLOW-UPS:
-   - Use the conversation history and summary to maintain context.
-   - Treat short messages like "why?", "how?", "anything else?", "tell me more", "anything is ok", "what else?" as direct continuations of the previous topic discussed in history.
-8. EXPERTISE & DOMAINS:
-   - Provide direct, structured code explanations, health/medical information, science facts, and creative writing immediately.
-   - Prioritize answering over asking. Keep tone friendly, intelligent, and human.`;
+CRITICAL INSTRUCTIONS:
+- Directly, accurately, and naturally answer the user's latest question or prompt.
+- NEVER output generic filler like "That's an interesting topic..." or "There are a few different ways to approach this...".
+- Factual & Technical Queries: When asked direct questions (e.g. "What is React?", "What is Node.js?", coding, health, science), provide immediate, detailed, structured explanations.
+- Jokes: When asked for a joke, tell an actual funny joke immediately.
+- Follow-ups & Memory: Use the preceding conversation history and summary to maintain multi-turn context. When the user asks "why?", "how?", "any other reasons?", or short follow-ups, continue the previous topic seamlessly.
+- Tone: Natural, friendly, helpful, and concise.`;
 
-    // Build context window payload
+    if (summaryText && summaryText.trim()) {
+      unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
+    }
+
+    // Assemble clean, single-system-prompt context window payload for Ollama
     const historyPayload = [
       {
         role: "system",
-        content: SYSTEM_PROMPT
+        content: unifiedSystemPrompt
       }
     ];
 
-    if (summaryText && summaryText.trim()) {
-      historyPayload.push({
-        role: "system",
-        content: `Conversation Summary:\n${summaryText}`
-      });
-    }
-
     dbMessagesHistory.forEach((msg) => {
-      // Exclude hardcoded legacy fallbacks from context window to prevent model contamination
+      // Exclude legacy connection error fallbacks to prevent LLM context contamination
       if (
         msg.role === "assistant" &&
         typeof msg.content === "string" &&
-        (msg.content.includes("I am ready to help") || msg.content.includes("Please ensure your local Ollama service is running"))
+        (msg.content.includes("I am ready to help") ||
+         msg.content.includes("interesting topic") ||
+         msg.content.includes("Please check that your Ollama service is running"))
       ) {
         return;
       }
@@ -258,15 +251,15 @@ CORE CONVERSATIONAL GUIDELINES:
     const OLLAMA_BASE_URL = getOllamaBaseUrl();
     const resolvedModel = await getAvailableOllamaModel(OLLAMA_BASE_URL, process.env.OLLAMA_MODEL);
 
-    // Detailed Logging: Request Payload
-    console.log(`\n=================== [GENERAL CHAT REQUEST] ===================`);
+    // Logging: Ollama Request Payload
+    console.log(`\n=================== [OLLAMA CHAT REQUEST] ===================`);
     console.log(`Target URL: ${OLLAMA_BASE_URL}/api/chat`);
     console.log(`Configured Model: ${process.env.OLLAMA_MODEL || "none"}`);
     console.log(`Resolved Ollama Model: ${resolvedModel}`);
     console.log(`Chat ID: ${chatId}`);
-    console.log(`Total Messages In Payload: ${historyPayload.length}`);
+    console.log(`Payload Message Count: ${historyPayload.length}`);
     console.log(`Current User Prompt: "${message}"`);
-    console.log(`===============================================================\n`);
+    console.log(`=============================================================\n`);
 
     let accumulatedResponseText = "";
     let streamedSuccessfully = false;
@@ -284,7 +277,11 @@ CORE CONVERSATIONAL GUIDELINES:
         body: JSON.stringify({
           model: resolvedModel,
           messages: historyPayload,
-          stream: true
+          stream: true,
+          options: {
+            temperature: 0.7,
+            top_p: 0.9
+          }
         })
       });
 
@@ -355,18 +352,13 @@ CORE CONVERSATIONAL GUIDELINES:
         console.error(`❌ [OLLAMA REJECTED REQUEST] HTTP ${response.status}: ${errorText}`);
       }
     } catch (ollamaErr) {
-      console.warn("⚠️ [GENERAL CHAT LLM] Local Ollama service offline or error:", ollamaErr.message);
+      console.warn("⚠️ [GENERAL CHAT LLM] Ollama service offline or error:", ollamaErr.message);
     }
 
     if (!streamedSuccessfully) {
-      console.warn("⚠️ [DYNAMIC FALLBACK EXECUTED] Ollama request failed or returned empty content. Generating contextual response.");
-      const fallbackText = generateContextualFallback(message, dbMessagesHistory);
+      console.warn("⚠️ [OLLAMA OFFLINE NOTICE] Ollama request failed or returned empty content.");
+      const fallbackText = "I'm unable to connect to the local AI model right now. Please check that your Ollama service is running and accessible.";
       await streamTextInChunks(res, fallbackText, 15);
-      await Message.create({
-        chatId,
-        role: "assistant",
-        content: fallbackText,
-      });
       res.write("data: [DONE]\n\n");
       return res.end();
     }

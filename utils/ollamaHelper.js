@@ -34,8 +34,16 @@ async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = nu
         );
         if (exactMatch) return exactMatch;
 
-        // 2. Priority check for standard models
-        const priorityList = ["qwen2.5:1.5b", "qwen3:4b", "qwen2.5:7b"];
+        // 2. Priority check for standard models (preferring higher parameter models when available)
+        const priorityList = [
+          "qwen2.5:7b",
+          "llama3.2:3b",
+          "llama3:8b",
+          "mistral:7b",
+          "qwen2.5:3b",
+          "qwen3:4b",
+          "qwen2.5:1.5b"
+        ];
         for (const candidate of priorityList) {
           const match = installedModels.find(
             (m) => m === candidate || m.startsWith(`${candidate}:`)
