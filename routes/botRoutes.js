@@ -2,10 +2,11 @@ const express = require("express");
 const router = express.Router();
 const authMiddleware = require("../middleware/auth");
 const protect = typeof authMiddleware === "function" ? authMiddleware : authMiddleware.protect;
+const { checkAgentLimit } = require("../middleware/limitMiddleware");
 const botController = require("../controllers/botController");
 
 // Bot CRUD
-router.post("/", protect, botController.createBot);
+router.post("/", protect, checkAgentLimit, botController.createBot);
 router.get("/", protect, botController.getBots);
 router.get("/:botId", protect, botController.getBotById);
 router.put("/:botId", protect, botController.updateBot);

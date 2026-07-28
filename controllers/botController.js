@@ -546,8 +546,12 @@ exports.sendBotChatMessage = async (req, res) => {
         botId,
         ownerId: req.user.id,
         userId: req.user.id,
-        title: message.substring(0, 30) || "New Bot Conversation"
+        title: message.trim().substring(0, 35) || "New Conversation"
       });
+    } else if (!conversation.title || conversation.title === "New Conversation" || conversation.title === "New Bot Conversation") {
+      // Persist the first meaningful user message as conversation title for future sessions
+      conversation.title = message.trim().substring(0, 35) || "New Conversation";
+      await conversation.save();
     }
 
     res.setHeader("Content-Type", "text/event-stream");
@@ -578,7 +582,7 @@ exports.sendBotChatMessage = async (req, res) => {
       console.log("🚀 [CONTACT AUTOMATION] Contact payload captured:", extracted);
       const savedContact = await triggerBotContactAutomation(req.user.id, botId, conversation._id, extracted);
 
-      const successResponse = `Thank you! Your contact details have been successfully verified and registered into our database and CRM workflow:\n\n• **First Name**: ${extracted.firstName}\n• **Last Name**: ${extracted.lastName}\n• **Email**: ${extracted.email}\n• **Phone**: ${extracted.phone}\n• **Company**: ${extracted.companyName || "Not provided"}\n\nCRM Sync Status: **${savedContact.crmSyncStatus}** (Contact ID: ${savedContact.crmContactId})`;
+      const successResponse = `Thank you! Your contact details have been verified and registered into our database:\n\n• **First Name**: ${extracted.firstName}\n• **Last Name**: ${extracted.lastName}\n• **Email**: ${extracted.email}\n• **Phone**: ${extracted.phone}\n• **Company**: ${extracted.companyName || "Not provided"}\n\nCRM Sync Status: **${savedContact.crmSyncStatus}** (Contact ID: ${savedContact.crmContactId})`;
 
       await streamTextInChunks(res, successResponse, 15);
 
@@ -602,6 +606,150 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
+    // Bot Identity & Role Check
+    if (/^\s*(who\s+are\s+you|what\s+is\s+your\s+(role|purpose)|tell\s+me\s+about\s+yourself|what\s+can\s+you\s+do|identify\s+yourself)\s*$/i.test(message.trim())) {
+      const identityResponse = `I am ${bot.name}, a specialized assistant trained only on the uploaded knowledge base and configured APIs.`;
+      await streamTextInChunks(res, identityResponse, 15);
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "user",
+        content: message
+      });
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "assistant",
+        content: identityResponse
+      });
+
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // Team Escalation Pipeline Check (Grounding Matrix Mandate)
+    if (/\b(platform\s+setup|pricing\s+matrix|custom\s+automation|deep\s+explanation|complex\s+setup)\b/i.test(message.trim())) {
+      const escalationResponse = "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough.";
+      await streamTextInChunks(res, escalationResponse, 15);
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "user",
+        content: message
+      });
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "assistant",
+        content: escalationResponse
+      });
+
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // -----------------------------------------------------------------------------
+    // TOOL CALLING ENGINE & ACTION INTENT EXECUTION
+    // -----------------------------------------------------------------------------
+    const { detectActionIntent, extractPayloadFromMessage, executeToolApi } = require("../services/toolCallingEngine");
+    const configuredApis = await BotApi.find({ botId, enabled: true });
+    const detectedAction = detectActionIntent(message);
+
+    // If an action intent is requested by the user
+    if (detectedAction || /\b(create|add|register|update|modify|delete|remove)\s+(a\s+)?(contact|lead|ticket|account|record|email)\b/i.test(message)) {
+      const matchedApi = configuredApis.find(a => a.actionType === detectedAction || (detectedAction && a.actionType === "GENERIC"));
+
+      // 1. Missing API Integration Case
+      if (!matchedApi) {
+        const missingApiMsg = "I cannot perform this action because no API integration is currently configured for this operation.\n\nTo enable this capability, please add the required API in the API Integrations section and reconnect the bot.";
+        await streamTextInChunks(res, missingApiMsg, 15);
+
+        await BotMessage.create({
+          conversationId: conversation._id,
+          botId,
+          userId: req.user.id,
+          role: "user",
+          content: message
+        });
+
+        await BotMessage.create({
+          conversationId: conversation._id,
+          botId,
+          userId: req.user.id,
+          role: "assistant",
+          content: missingApiMsg
+        });
+
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+
+      // 2. Parameter Validation Case
+      const payload = extractPayloadFromMessage(message);
+      if (detectedAction === "CREATE_CONTACT" && (!payload.name && !payload.firstName) && !payload.email && !payload.phone) {
+        const missingParamsMsg = "I can perform this action. Please provide the required fields: Name, Email, and Phone Number.";
+        await streamTextInChunks(res, missingParamsMsg, 15);
+
+        await BotMessage.create({
+          conversationId: conversation._id,
+          botId,
+          userId: req.user.id,
+          role: "user",
+          content: message
+        });
+
+        await BotMessage.create({
+          conversationId: conversation._id,
+          botId,
+          userId: req.user.id,
+          role: "assistant",
+          content: missingParamsMsg
+        });
+
+        res.write("data: [DONE]\n\n");
+        return res.end();
+      }
+
+      // 3. Execute Tool API
+      const toolResult = await executeToolApi(matchedApi, payload);
+
+      let actionResponseText = "";
+      if (toolResult.success) {
+        actionResponseText = `⚡ **Action Executed Successfully** via tool **${matchedApi.name}** (${matchedApi.method} ${toolResult.endpoint}):\n\n\`\`\`json\n${JSON.stringify(toolResult.data, null, 2)}\n\`\`\``;
+      } else {
+        actionResponseText = `⚠️ **Tool Action Failed** via **${matchedApi.name}**: ${toolResult.error || `HTTP Status ${toolResult.statusCode}`}`;
+      }
+
+      await streamTextInChunks(res, actionResponseText, 15);
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "user",
+        content: message
+      });
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "assistant",
+        content: actionResponseText
+      });
+
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
     // Multi-tenant Isolated Knowledge Retrieval
     const ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory);
 
@@ -613,8 +761,33 @@ exports.sendBotChatMessage = async (req, res) => {
       res.write(`data: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
     }
 
-    // Build grounded RAG system prompt (System Identity + Grounded Knowledge)
-    const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks);
+    // Strict Out-of-Scope Fallback Rule using Bot Name
+    if (!ragResult.isFound) {
+      const outOfScopeMsg = `I am ${bot.name}, a specialized assistant for the configured knowledge base. Your question is outside my available knowledge scope. Please ask a question related to the uploaded documents or configured tools.`;
+      await streamTextInChunks(res, outOfScopeMsg, 15);
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "user",
+        content: message
+      });
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "assistant",
+        content: outOfScopeMsg
+      });
+
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // Build grounded RAG system prompt
+    const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis);
 
     const OLLAMA_BASE_URL = process.env.OLLAMA_HOST_URL 
       ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "") 

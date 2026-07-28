@@ -7,7 +7,7 @@ const OLLAMA_BASE_URL = getOllamaBaseUrl();
 
 const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text";
 
-// STOPWORDS for keyword indexing
+// STOPWORDS for keyword indexing and topic validation
 const STOPWORDS = new Set([
   "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
   "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
@@ -28,7 +28,7 @@ const STOPWORDS = new Set([
   "weren't", "what's", "when's", "where's", "which",
   "while", "who's", "whom", "why's", "with", "won't", "would",
   "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
-  "yourself", "yourselves"
+  "yourself", "yourselves", "tell", "show", "give", "use", "what", "how", "why", "is"
 ]);
 
 /**
@@ -204,15 +204,12 @@ function detectBotIntent(message, historyMessages = []) {
     return "GREETING";
   }
 
-  if (/\b(create\s+contact|add\s+contact|register\s+profile|save\s+my\s+details)\b/i.test(trimmed)) {
-    return "CONTACT_CREATION";
-  }
-
   return "KNOWLEDGE_QUESTION";
 }
 
 /**
- * Performs Multi-Tenant Semantic Search strictly isolated by userId and botId using vector embeddings.
+ * Performs Multi-Tenant Semantic Search strictly isolated by userId and botId.
+ * Validates that key query terms literally exist within the document text.
  */
 async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 3, historyMessages = []) {
   let targetUserId = userId;
@@ -239,9 +236,31 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 3, his
     };
   }
 
+  const combinedDocText = chunks.map(c => c.text.toLowerCase()).join(" ");
   const queryTokens = tokenize(queryText);
-  const queryVector = await generateEmbeddingVectorAsync(queryText);
 
+  // Validate topic grounding:
+  // If user question has key non-stopword tokens (e.g., "phone pay", "react", "weather", "crypto"),
+  // at least ONE key token must be explicitly present in the document text.
+  // For queries with multiple key tokens (e.g. "phone pay"), ALL key tokens must exist in the document text!
+  if (queryTokens.length > 0) {
+    const missingTokens = queryTokens.filter(token => {
+      // Check if token or stem exists in combined document text
+      const stem = token.length > 4 ? token.substring(0, token.length - 2) : token;
+      return !combinedDocText.includes(token) && !combinedDocText.includes(stem);
+    });
+
+    // If any key token in a specific query (like "pay" in "phone pay", or "react") is missing from document text:
+    if (missingTokens.length > 0) {
+      return {
+        isFound: false,
+        chunks: [],
+        reason: "UNGROUNDED_TOPIC_MISSING_KEYWORDS"
+      };
+    }
+  }
+
+  const queryVector = await generateEmbeddingVectorAsync(queryText);
   const scoredChunks = [];
 
   for (const chunk of chunks) {
@@ -250,17 +269,19 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 3, his
 
     for (const token of queryTokens) {
       if (chunkTextLower.includes(token)) {
-        score += 1.0;
+        score += 2.0;
       }
     }
 
     const chunkEmbedding = await BotEmbedding.findOne({ chunkId: chunk._id });
     if (chunkEmbedding && chunkEmbedding.embedding && chunkEmbedding.embedding.length > 0) {
       const cosSim = cosineSimilarity(queryVector, chunkEmbedding.embedding);
-      score += cosSim * 4.0;
+      if (cosSim > 0.15) {
+        score += cosSim * 5.0;
+      }
     }
 
-    if (score > 0) {
+    if (score >= 1.5) {
       const fileName = chunk.fileId ? chunk.fileId.fileName : "Document";
       scoredChunks.push({
         chunk,
@@ -289,9 +310,9 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 3, his
 }
 
 /**
- * Builds grounded RAG System Prompt for LLM execution without duplicating conversation history.
+ * Builds strictly grounded RAG system prompt.
  */
-function buildRagSystemPrompt(botName, botDescription, retrievedChunks) {
+function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availableApis = []) {
   let contextBlocks = "No knowledge documents available for this query.";
   if (retrievedChunks && retrievedChunks.length > 0) {
     contextBlocks = retrievedChunks
@@ -299,16 +320,31 @@ function buildRagSystemPrompt(botName, botDescription, retrievedChunks) {
       .join("\n\n");
   }
 
-  return `You are an intelligent, natural conversational AI assistant named '${botName}', designed to deliver helpful, human-like answers like ChatGPT and Gemini.
-${botDescription ? `Bot Purpose & Scope: ${botDescription}\n` : ""}
-GROUNDED KNOWLEDGE BASE:
+  let apiDescriptions = "No executable API tools configured.";
+  if (availableApis && availableApis.length > 0) {
+    apiDescriptions = availableApis
+      .map(api => `- ${api.name} (${api.actionType || "GENERIC"}): ${api.method} ${api.url}`)
+      .join("\n");
+  }
+
+  return `You are a STRICTLY GROUNDED knowledge-base product agent named '${botName}'.
+${botDescription ? `Purpose & Scope: ${botDescription}\n` : ""}
+
+## GROUNDED KNOWLEDGE BASE:
 ${contextBlocks}
 
-INSTRUCTIONS & RULES:
-1. Synthesize a natural, human-like answer strictly from the Grounded Knowledge Base above.
-2. Use the Grounded Knowledge Base as your strict source of truth.
-3. If the user's question cannot be answered from the provided Grounded Knowledge Base, state clearly: "I couldn't find information about that in the uploaded knowledge base."
-4. Do NOT hallucinate or use external general knowledge not present in the uploaded files.`;
+## AVAILABLE ACTION TOOLS:
+${apiDescriptions}
+
+## CRITICAL STRICT GROUNDING INSTRUCTIONS:
+1. You are ONLY allowed to answer questions using information directly found in the GROUNDED KNOWLEDGE BASE or AVAILABLE ACTION TOOLS above.
+2. You are ABSOLUTELY FORBIDDEN from using your pre-trained memory to answer questions about topics not explicitly stated in the GROUNDED KNOWLEDGE BASE (such as Phone Pay, React, JavaScript, programming concepts, jokes, sports, politics, weather, movies).
+3. If the user's question cannot be answered directly from the GROUNDED KNOWLEDGE BASE above, respond EXACTLY with:
+   "I am ${botName}, a specialized assistant for the configured knowledge base. Your question is outside my available knowledge scope. Please ask a question related to the uploaded documents or configured tools."
+4. Always identify yourself as '${botName}'. When asked "Who are you?", respond EXACTLY with:
+   "I am ${botName}, a specialized assistant trained only on the uploaded knowledge base and configured APIs."
+5. If the user asks for a deep, complex, or detailed explanation regarding platform setups, pricing matrix adjustments, or custom system automations, reply EXACTLY with:
+   "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough."`;
 }
 
 module.exports = {

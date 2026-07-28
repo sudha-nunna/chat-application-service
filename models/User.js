@@ -17,6 +17,18 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+
+    plan: {
+      type: String,
+      enum: ["free", "pro", "enterprise"],
+      default: "free",
+    },
+
+    activeSubscriptionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Subscription",
+      default: null,
+    },
   },
   {
     timestamps: true,

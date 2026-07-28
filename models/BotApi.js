@@ -24,6 +24,18 @@ const botApiSchema = new mongoose.Schema(
       type: String,
       required: true
     },
+    description: {
+      type: String,
+      default: ""
+    },
+    baseUrl: {
+      type: String,
+      default: ""
+    },
+    endpoint: {
+      type: String,
+      default: ""
+    },
     url: {
       type: String,
       required: true
@@ -32,6 +44,21 @@ const botApiSchema = new mongoose.Schema(
       type: String,
       enum: ["GET", "POST", "PUT", "PATCH", "DELETE"],
       default: "GET"
+    },
+    actionType: {
+      type: String,
+      enum: [
+        "CREATE_CONTACT",
+        "UPDATE_CONTACT",
+        "DELETE_CONTACT",
+        "SEARCH_CONTACT",
+        "CREATE_TICKET",
+        "UPDATE_TICKET",
+        "CREATE_LEAD",
+        "UPDATE_LEAD",
+        "GENERIC"
+      ],
+      default: "GENERIC"
     },
     headers: {
       type: Map,
@@ -51,9 +78,17 @@ const botApiSchema = new mongoose.Schema(
       type: String,
       default: null
     },
-    requestMapping: {
-      type: String,
-      default: ""
+    requestSchema: {
+      type: Object,
+      default: {}
+    },
+    responseSchema: {
+      type: Object,
+      default: {}
+    },
+    enabled: {
+      type: Boolean,
+      default: true
     }
   },
   {

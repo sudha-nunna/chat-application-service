@@ -9,7 +9,14 @@ const chatRoutes = require("./routes/chatRoutes");
 const ollamaRoutes = require("./routes/aiRoutes");
 const authRoutes = require("./routes/authRoutes");
 const botRoutes = require("./routes/botRoutes");
-connectDB();
+const subscriptionRoutes = require("./routes/subscriptionRoutes");
+const planRoutes = require("./routes/planRoutes");
+const seedPlans = require("./utils/planSeeder");
+
+connectDB().then(() => {
+  seedPlans();
+});
+
 const app = express();
 
 const allowedOrigins = [
@@ -30,6 +37,8 @@ app.use("/chats", chatRoutes);
 app.use("/auth", authRoutes);
 app.use("/ollama", ollamaRoutes);
 app.use("/bots", botRoutes);
+app.use("/subscription", subscriptionRoutes);
+app.use("/plans", planRoutes);
 
 app.get("/", (req, res) => {
   res.send("Server Running");

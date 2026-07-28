@@ -125,7 +125,7 @@ exports.createChat = async (req, res) => {
   try {
     const chat = await Chat.create({
       userId: req.user.id,
-      title: "New Chat",
+      title: "New Conversation",
     });
     res.status(201).json(chat);
   } catch (error) {
@@ -181,7 +181,7 @@ exports.sendMessage = async (req, res) => {
     if (!chatId || chatId === "new" || chatId === "undefined" || chatId === "null") {
       chat = await Chat.create({
         userId: req.user.id,
-        title: message.substring(0, 30) || "General Chat",
+        title: message.trim().substring(0, 35) || "New Conversation",
       });
       chatId = chat._id;
     } else {
@@ -190,6 +190,12 @@ exports.sendMessage = async (req, res) => {
 
     if (!chat) {
       return res.status(404).json({ success: false, message: "Chat session not found." });
+    }
+
+    // Persist first user message as title for future sessions
+    if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
+      chat.title = message.trim().substring(0, 35) || "New Conversation";
+      await chat.save();
     }
 
     // Save User message
