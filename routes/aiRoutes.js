@@ -10,8 +10,20 @@ if (!protect) {
   console.error("CRITICAL ERROR: 'protect' middleware configuration missing!");
 }
 
+const { clusterState, checkClusterHealth } = require("../utils/ollamaHelper");
+
 // Calls the correct streaming method that handles "text/event-stream"
 router.post("/message/:chatId", protect, chatController.sendMessage);
+
+// Live Cluster Node Health & Load Diagnostics Route
+router.get("/cluster-status", protect, async (req, res) => {
+  await checkClusterHealth();
+  return res.json({
+    success: true,
+    totalNodes: clusterState.length,
+    nodes: clusterState
+  });
+});
 
 // NEW CRM PROXY ROUTE: Captures AI payload and pushes safely to codegene.io using backend .env variables
 router.post("/crm/forward-contact", protect, async (req, res) => {

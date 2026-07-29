@@ -265,20 +265,25 @@ CRITICAL INSTRUCTIONS:
 
     res.write(`data: ${JSON.stringify({ type: "meta", chatId, title: chat.title })}\n\n`);
 
+    const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
     const tModelStart = performance.now();
-    const OLLAMA_BASE_URL = getOllamaBaseUrl();
-    const resolvedModel = await getAvailableOllamaModel(OLLAMA_BASE_URL, process.env.OLLAMA_MODEL);
+    const selectedNode = selectBestClusterNode();
+    selectedNode.activeRequests++;
+
+    const OLLAMA_BASE_URL = selectedNode.url;
+    const targetModel = selectedNode.defaultModel;
     modelResolveTime = performance.now() - tModelStart;
 
     // Logging: Ollama Request Payload
-    console.log(`\n=================== [OLLAMA GENERAL CHAT REQUEST] ===================`);
-    console.log(`Target URL: ${OLLAMA_BASE_URL}/api/chat`);
-    console.log(`Configured Model: ${process.env.OLLAMA_MODEL || "none"}`);
-    console.log(`Resolved Ollama Model: ${resolvedModel}`);
+    console.log(`\n=================== [OLLAMA CLUSTER DISPATCH REQUEST] ===================`);
+    console.log(`Dispatched Node: ${selectedNode.id} (${selectedNode.name})`);
+    console.log(`Target URL: ${selectedNode.url} (${selectedNode.format.toUpperCase()} API)`);
+    console.log(`Active Requests on Node: ${selectedNode.activeRequests}`);
+    console.log(`Target Model: ${targetModel}`);
     console.log(`Chat ID: ${chatId}`);
     console.log(`Payload Message Count: ${historyPayload.length}`);
     console.log(`Current User Prompt: "${message}"`);
-    console.log(`=============================================================\n`);
+    console.log(`========================================================================\n`);
 
     let accumulatedResponseText = "";
     let streamedSuccessfully = false;
@@ -286,26 +291,44 @@ CRITICAL INSTRUCTIONS:
     llmRequestStartTime = performance.now();
 
     try {
-      const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      const endpointPath = selectedNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
+      const requestPayload = {
+        model: targetModel,
+        messages: historyPayload,
+        stream: true
+      };
+      if (selectedNode.format === "ollama") {
+        requestPayload.keep_alive = "24h";
+      }
+
+      let response = await fetch(`${selectedNode.url}${endpointPath}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "User-Agent": "Mozilla/5.0",
           "X-Requested-With": "XMLHttpRequest",
-          "Accept": "application/json, text/event-stream",
-          "Accept-Encoding": "identity"
+          "Accept": "application/json, text/event-stream"
         },
-        body: JSON.stringify({
-          model: resolvedModel,
-          messages: historyPayload,
-          stream: true,
-          keep_alive: "24h",
-          options: {
-            temperature: 0.7,
-            top_p: 0.9
-          }
-        })
+        body: JSON.stringify(requestPayload)
       });
+
+      // FALLBACK FAILOVER ROUTING IF PRIMARY NODE IS BUSY/OFFLINE
+      if (!response.ok) {
+        console.warn(`⚠️ [CLUSTER FAILOVER] ${selectedNode.id} HTTP ${response.status}. Attempting secondary node failover...`);
+        const fallbackNode = clusterState.find(n => n.id !== selectedNode.id);
+        if (fallbackNode) {
+          const fallbackPath = fallbackNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
+          response = await fetch(`${fallbackNode.url}${fallbackPath}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: fallbackNode.defaultModel,
+              messages: historyPayload,
+              stream: true
+            })
+          });
+        }
+      }
 
       console.log(`[OLLAMA HTTP RESPONSE] Status: ${response.status} ${response.statusText}`);
 
@@ -323,15 +346,18 @@ CRITICAL INSTRUCTIONS:
           lineBuffer += chunkStr;
 
           const lines = lineBuffer.split("\n");
-          lineBuffer = lines.pop(); // Retain unfinished line segment across stream reads
+          lineBuffer = lines.pop();
 
           for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed) continue;
 
+            const jsonStr = trimmed.startsWith("data: ") ? trimmed.replace("data: ", "").trim() : trimmed;
+            if (jsonStr === "[DONE]") continue;
+
             try {
-              const parsed = JSON.parse(trimmed);
-              const chunkText = parsed.message?.content || parsed.response || "";
+              const parsed = JSON.parse(jsonStr);
+              const chunkText = parsed.message?.content || parsed.response || parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
               if (chunkText) {
                 if (!firstTokenTimestamp) {
                   firstTokenTimestamp = performance.now();
@@ -341,27 +367,8 @@ CRITICAL INSTRUCTIONS:
                 chunkCount++;
                 res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
               }
-            } catch (parseErr) {
-              console.warn("⚠️ [OLLAMA STREAM PARSE NOTICE] Partial line skipped:", parseErr.message);
-            }
+            } catch (parseErr) {}
           }
-        }
-
-        // Flush any trailing line left in buffer
-        if (lineBuffer && lineBuffer.trim()) {
-          try {
-            const parsed = JSON.parse(lineBuffer.trim());
-            const chunkText = parsed.message?.content || parsed.response || "";
-            if (chunkText) {
-              if (!firstTokenTimestamp) {
-                firstTokenTimestamp = performance.now();
-                ttft = firstTokenTimestamp - llmRequestStartTime;
-              }
-              accumulatedResponseText += chunkText;
-              chunkCount++;
-              res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
-            }
-          } catch (e) { }
         }
 
         const totalDuration = performance.now() - reqStartTime;
@@ -372,15 +379,14 @@ CRITICAL INSTRUCTIONS:
         console.log(`
 ⏱️  =================== [GENERAL CHAT LATENCY DIAGNOSTICS] ===================
   📌 Route: General Chat Stream (/chats/${chatId}/messages)
+  ├── 🌐 Dispatched Cluster Node:       ${selectedNode.id} (${selectedNode.name})
   ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
-  ├── 🔎 Model Discovery:               ${modelResolveTime.toFixed(2)} ms
-  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A (Ollama Delay/Error)'} <-- [AI Model Load & Prompt Eval Lag]
+  ├── 🔎 Model & Node Discovery:        ${modelResolveTime.toFixed(2)} ms
+  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A (Ollama Delay/Error)'}
   ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
   └── 🏁 TOTAL REQUEST DURATION:        ${totalDuration.toFixed(2)} ms
 ========================================================================\n
 `);
-
-        console.log(`[OLLAMA STREAM COMPLETED] Chunks received: ${chunkCount}, Total chars: ${accumulatedResponseText.length}`);
 
         if (accumulatedResponseText.trim()) {
           streamedSuccessfully = true;
@@ -393,12 +399,11 @@ CRITICAL INSTRUCTIONS:
           res.write("data: [DONE]\n\n");
           return res.end();
         }
-      } else {
-        const errorText = await response.text();
-        console.error(`❌ [OLLAMA REJECTED REQUEST] HTTP ${response.status}: ${errorText}`);
       }
     } catch (ollamaErr) {
-      console.error("CRITICAL: Local Ollama connection failed during streaming:", ollamaErr.message);
+      console.error("CRITICAL: Ollama cluster connection error:", ollamaErr.message);
+    } finally {
+      selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
     }
 
     if (!streamedSuccessfully) {
