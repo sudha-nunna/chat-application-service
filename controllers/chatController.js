@@ -169,6 +169,14 @@ exports.deleteChat = async (req, res) => {
 // -----------------------------------------------------------------------------
 
 exports.sendMessage = async (req, res) => {
+  const reqStartTime = performance.now();
+  let dbFetchTime = 0;
+  let modelResolveTime = 0;
+  let ttft = null;
+  let streamDuration = 0;
+  let firstTokenTimestamp = null;
+  let llmRequestStartTime = null;
+
   try {
     const { message } = req.body;
     let chatId = req.params.chatId;
@@ -177,6 +185,7 @@ exports.sendMessage = async (req, res) => {
       return res.status(400).json({ success: false, message: "Message text is required." });
     }
 
+    const tDbStart = performance.now();
     let chat;
     if (!chatId || chatId === "new" || chatId === "undefined" || chatId === "null") {
       chat = await Chat.create({
@@ -208,6 +217,8 @@ exports.sendMessage = async (req, res) => {
     const dbMessagesHistory = await Message.find({ chatId }).sort({ createdAt: -1 }).limit(16);
     dbMessagesHistory.reverse();
 
+    dbFetchTime = performance.now() - tDbStart;
+
     // Unified System Instruction Block merging Core Guidelines and Conversation Summary
     let unifiedSystemPrompt = `You are a helpful, intelligent, highly capable conversational AI assistant like ChatGPT and Gemini.
 
@@ -237,8 +248,8 @@ CRITICAL INSTRUCTIONS:
         msg.role === "assistant" &&
         typeof msg.content === "string" &&
         (msg.content.includes("I am ready to help") ||
-         msg.content.includes("interesting topic") ||
-         msg.content.includes("Please check that your Ollama service is running"))
+          msg.content.includes("interesting topic") ||
+          msg.content.includes("Please check that your Ollama service is running"))
       ) {
         return;
       }
@@ -254,11 +265,13 @@ CRITICAL INSTRUCTIONS:
 
     res.write(`data: ${JSON.stringify({ type: "meta", chatId, title: chat.title })}\n\n`);
 
+    const tModelStart = performance.now();
     const OLLAMA_BASE_URL = getOllamaBaseUrl();
     const resolvedModel = await getAvailableOllamaModel(OLLAMA_BASE_URL, process.env.OLLAMA_MODEL);
+    modelResolveTime = performance.now() - tModelStart;
 
     // Logging: Ollama Request Payload
-    console.log(`\n=================== [OLLAMA CHAT REQUEST] ===================`);
+    console.log(`\n=================== [OLLAMA GENERAL CHAT REQUEST] ===================`);
     console.log(`Target URL: ${OLLAMA_BASE_URL}/api/chat`);
     console.log(`Configured Model: ${process.env.OLLAMA_MODEL || "none"}`);
     console.log(`Resolved Ollama Model: ${resolvedModel}`);
@@ -269,6 +282,8 @@ CRITICAL INSTRUCTIONS:
 
     let accumulatedResponseText = "";
     let streamedSuccessfully = false;
+
+    llmRequestStartTime = performance.now();
 
     try {
       const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
@@ -284,6 +299,7 @@ CRITICAL INSTRUCTIONS:
           model: resolvedModel,
           messages: historyPayload,
           stream: true,
+          keep_alive: "24h",
           options: {
             temperature: 0.7,
             top_p: 0.9
@@ -317,6 +333,10 @@ CRITICAL INSTRUCTIONS:
               const parsed = JSON.parse(trimmed);
               const chunkText = parsed.message?.content || parsed.response || "";
               if (chunkText) {
+                if (!firstTokenTimestamp) {
+                  firstTokenTimestamp = performance.now();
+                  ttft = firstTokenTimestamp - llmRequestStartTime;
+                }
                 accumulatedResponseText += chunkText;
                 chunkCount++;
                 res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
@@ -333,12 +353,32 @@ CRITICAL INSTRUCTIONS:
             const parsed = JSON.parse(lineBuffer.trim());
             const chunkText = parsed.message?.content || parsed.response || "";
             if (chunkText) {
+              if (!firstTokenTimestamp) {
+                firstTokenTimestamp = performance.now();
+                ttft = firstTokenTimestamp - llmRequestStartTime;
+              }
               accumulatedResponseText += chunkText;
               chunkCount++;
               res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
             }
-          } catch (e) {}
+          } catch (e) { }
         }
+
+        const totalDuration = performance.now() - reqStartTime;
+        if (firstTokenTimestamp) {
+          streamDuration = performance.now() - firstTokenTimestamp;
+        }
+
+        console.log(`
+⏱️  =================== [GENERAL CHAT LATENCY DIAGNOSTICS] ===================
+  📌 Route: General Chat Stream (/chats/${chatId}/messages)
+  ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
+  ├── 🔎 Model Discovery:               ${modelResolveTime.toFixed(2)} ms
+  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A (Ollama Delay/Error)'} <-- [AI Model Load & Prompt Eval Lag]
+  ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
+  └── 🏁 TOTAL REQUEST DURATION:        ${totalDuration.toFixed(2)} ms
+========================================================================\n
+`);
 
         console.log(`[OLLAMA STREAM COMPLETED] Chunks received: ${chunkCount}, Total chars: ${accumulatedResponseText.length}`);
 
@@ -358,7 +398,7 @@ CRITICAL INSTRUCTIONS:
         console.error(`❌ [OLLAMA REJECTED REQUEST] HTTP ${response.status}: ${errorText}`);
       }
     } catch (ollamaErr) {
-      console.warn("⚠️ [GENERAL CHAT LLM] Ollama service offline or error:", ollamaErr.message);
+      console.error("CRITICAL: Local Ollama connection failed during streaming:", ollamaErr.message);
     }
 
     if (!streamedSuccessfully) {

@@ -13,9 +13,18 @@ const getOllamaBaseUrl = () => {
  * Dynamically resolves an available Ollama model from the Ollama host tags API.
  * Ensures compatibility across qwen2.5:1.5b, qwen3:4b, qwen2.5:7b, and other installed models.
  */
+let cachedModelName = null;
+let lastModelCheckTime = 0;
+const MODEL_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes cache
+
 async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = null) {
   const baseUrl = customBaseUrl || getOllamaBaseUrl();
   const requested = preferredModel || process.env.OLLAMA_MODEL || "qwen2.5:1.5b";
+
+  const now = Date.now();
+  if (cachedModelName && (now - lastModelCheckTime) < MODEL_CACHE_TTL_MS) {
+    return cachedModelName;
+  }
 
   try {
     const response = await fetch(`${baseUrl}/api/tags`, {
@@ -28,37 +37,42 @@ async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = nu
       const installedModels = (data.models || []).map((m) => m.name || m.model);
 
       if (installedModels.length > 0) {
-        // 1. Direct match or model name without tag match
-        const exactMatch = installedModels.find(
+        let resolved = installedModels.find(
           (m) => m === requested || m.startsWith(`${requested}:`)
         );
-        if (exactMatch) return exactMatch;
 
-        // 2. Priority check for standard models (preferring higher parameter models when available)
-        const priorityList = [
-          "qwen2.5:7b",
-          "llama3.2:3b",
-          "llama3:8b",
-          "mistral:7b",
-          "qwen2.5:3b",
-          "qwen3:4b",
-          "qwen2.5:1.5b"
-        ];
-        for (const candidate of priorityList) {
-          const match = installedModels.find(
-            (m) => m === candidate || m.startsWith(`${candidate}:`)
-          );
-          if (match) return match;
+        if (!resolved) {
+          const priorityList = [
+            "qwen2.5:7b",
+            "llama3.2:3b",
+            "llama3:8b",
+            "mistral:7b",
+            "qwen2.5:3b",
+            "qwen3:4b",
+            "qwen2.5:1.5b"
+          ];
+          for (const candidate of priorityList) {
+            const match = installedModels.find(
+              (m) => m === candidate || m.startsWith(`${candidate}:`)
+            );
+            if (match) {
+              resolved = match;
+              break;
+            }
+          }
         }
 
-        // 3. Fallback to first available model on Ollama instance
-        return installedModels[0];
+        cachedModelName = resolved || installedModels[0];
+        lastModelCheckTime = now;
+        return cachedModelName;
       }
     }
   } catch (err) {
     console.warn("⚠️ [OLLAMA MODEL RESOLUTION] Unable to query /api/tags:", err.message);
   }
 
+  cachedModelName = requested;
+  lastModelCheckTime = now;
   return requested;
 }
 

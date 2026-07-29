@@ -1,3 +1,4 @@
+const { performance } = require("perf_hooks");
 const Bot = require("../models/Bot");
 const BotFile = require("../models/BotFile");
 const BotChunk = require("../models/BotChunk");
@@ -541,6 +542,15 @@ exports.testBotApi = async (req, res) => {
 // -----------------------------------------------------------------------------
 
 exports.sendBotChatMessage = async (req, res) => {
+  const reqStartTime = performance.now();
+  let dbFetchTime = 0;
+  let entityExtractTime = 0;
+  let ragSearchTime = 0;
+  let ttft = null;
+  let streamDuration = 0;
+  let firstTokenTimestamp = null;
+  let llmRequestStartTime = null;
+
   try {
     const { botId } = req.params;
     const { message, conversationId } = req.body;
@@ -549,6 +559,7 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.status(400).json({ error: "Message content is required." });
     }
 
+    const tDbStart = performance.now();
     const bot = await Bot.findOne({
       _id: botId,
       $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
@@ -599,9 +610,13 @@ exports.sendBotChatMessage = async (req, res) => {
       await conversation.save();
     }
 
+    dbFetchTime = performance.now() - tDbStart;
+
     // Contact Entity Extraction & Automation Check
+    const tExtractStart = performance.now();
     const extractionResult = extractEntities(message, {});
     const extracted = extractionResult.extracted || {};
+    entityExtractTime = performance.now() - tExtractStart;
 
     if (extracted.firstName && extracted.lastName && extracted.email && extracted.phone) {
       console.log("🚀 [CONTACT AUTOMATION] Contact payload captured:", extracted);
@@ -781,7 +796,9 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     // Multi-tenant Isolated Knowledge Retrieval
+    const tRagStart = performance.now();
     const ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
+    ragSearchTime = performance.now() - tRagStart;
 
     if (ragResult.debug) {
       console.log("🧠 [RAG DEBUG]", {
@@ -862,6 +879,8 @@ exports.sendBotChatMessage = async (req, res) => {
     let accumulatedResponseText = "";
     let streamedSuccessfully = false;
 
+    llmRequestStartTime = performance.now();
+
     try {
       const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
         method: "POST",
@@ -873,7 +892,8 @@ exports.sendBotChatMessage = async (req, res) => {
         body: JSON.stringify({
           model: targetModel,
           messages: ollamaMessages,
-          stream: true
+          stream: true,
+          keep_alive: "24h"
         })
       });
 
@@ -893,10 +913,14 @@ exports.sendBotChatMessage = async (req, res) => {
               const parsed = JSON.parse(line);
               const chunkText = parsed.message?.content || "";
               if (chunkText) {
+                if (!firstTokenTimestamp) {
+                  firstTokenTimestamp = performance.now();
+                  ttft = firstTokenTimestamp - llmRequestStartTime;
+                }
                 accumulatedResponseText += chunkText;
                 res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
               }
-            } catch (e) {}
+            } catch (e) { }
           }
         }
         streamedSuccessfully = true;
@@ -930,6 +954,23 @@ exports.sendBotChatMessage = async (req, res) => {
       content: accumulatedResponseText,
       sources: sourcesMeta
     });
+
+    const totalDuration = performance.now() - reqStartTime;
+    if (firstTokenTimestamp) {
+      streamDuration = performance.now() - firstTokenTimestamp;
+    }
+
+    console.log(`
+⏱️  =================== [LATENCY DIAGNOSTICS BREAKDOWN] ===================
+  📌 Route: Bot Chat Stream (/api/v1/bots/${botId}/chat)
+  ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
+  ├── 🔍 Entity Extraction:             ${entityExtractTime.toFixed(2)} ms
+  ├── 🧠 RAG & Vector Search:           ${ragSearchTime.toFixed(2)} ms
+  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A (Ollama Delay/Error)'} <-- [AI Model Load & Prompt Eval Lag]
+  ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
+  └── 🏁 TOTAL REQUEST DURATION:        ${totalDuration.toFixed(2)} ms
+========================================================================\n
+`);
 
     res.write("data: [DONE]\n\n");
     return res.end();
