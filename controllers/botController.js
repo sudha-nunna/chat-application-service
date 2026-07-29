@@ -13,6 +13,8 @@ const {
   generateEmbeddingVector,
   generateEmbeddingVectorAsync,
   generateLLMSummary,
+  extractKnowledgeMetadataFromText,
+  buildKnowledgeOverviewResponse,
   retrieveRelevantChunks,
   buildRagSystemPrompt,
   detectBotIntent
@@ -112,9 +114,14 @@ async function triggerBotContactAutomation(userId, botId, conversationId, contac
 
 exports.createBot = async (req, res) => {
   try {
-    const { name, description, model, systemPrompt, initialApis } = req.body;
-    if (!name) {
+    const { name, description, model, systemPrompt, initialApis, stagedFiles } = req.body;
+    if (!name || !name.trim()) {
       return res.status(400).json({ error: "Bot name is required." });
+    }
+
+    const uploadedFiles = Array.isArray(stagedFiles) ? stagedFiles : [];
+    if (uploadedFiles.length === 0) {
+      return res.status(400).json({ error: "Please upload at least one knowledge file before creating the bot." });
     }
 
     const bot = await Bot.create({
@@ -330,6 +337,24 @@ exports.uploadBotFile = async (req, res) => {
 
     botFile.chunkCount = chunkDocs.length;
     await botFile.save();
+
+    const knowledgeMetadata = extractKnowledgeMetadataFromText(parsedContent);
+    await Bot.findByIdAndUpdate(botId, {
+      $set: {
+        knowledgeSummary: {
+          titles: Array.from(new Set([...(bot.knowledgeSummary?.titles || []), ...knowledgeMetadata.titles])),
+          products: Array.from(new Set([...(bot.knowledgeSummary?.products || []), ...knowledgeMetadata.products])),
+          modules: Array.from(new Set([...(bot.knowledgeSummary?.modules || []), ...knowledgeMetadata.modules])),
+          topics: Array.from(new Set([...(bot.knowledgeSummary?.topics || []), ...knowledgeMetadata.topics])),
+          features: Array.from(new Set([...(bot.knowledgeSummary?.features || []), ...knowledgeMetadata.features])),
+          services: Array.from(new Set([...(bot.knowledgeSummary?.services || []), ...knowledgeMetadata.services])),
+          headings: Array.from(new Set([...(bot.knowledgeSummary?.headings || []), ...knowledgeMetadata.headings])),
+          rawSummary: knowledgeMetadata.rawSummary || (bot.knowledgeSummary?.rawSummary || "")
+        },
+        knowledgeTopics: Array.from(new Set([...(bot.knowledgeTopics || []), ...knowledgeMetadata.topics])),
+        knowledgeModules: Array.from(new Set([...(bot.knowledgeModules || []), ...knowledgeMetadata.modules]))
+      }
+    });
 
     return res.status(201).json(botFile);
   } catch (err) {
@@ -606,31 +631,6 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
-    // Bot Identity & Role Check
-    if (/^\s*(who\s+are\s+you|what\s+is\s+your\s+(role|purpose)|tell\s+me\s+about\s+yourself|what\s+can\s+you\s+do|identify\s+yourself)\s*$/i.test(message.trim())) {
-      const identityResponse = `I am ${bot.name}, a specialized assistant trained only on the uploaded knowledge base and configured APIs.`;
-      await streamTextInChunks(res, identityResponse, 15);
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "user",
-        content: message
-      });
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "assistant",
-        content: identityResponse
-      });
-
-      res.write("data: [DONE]\n\n");
-      return res.end();
-    }
-
     // Team Escalation Pipeline Check (Grounding Matrix Mandate)
     if (/\b(platform\s+setup|pricing\s+matrix|custom\s+automation|deep\s+explanation|complex\s+setup)\b/i.test(message.trim())) {
       const escalationResponse = "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough.";
@@ -650,6 +650,36 @@ exports.sendBotChatMessage = async (req, res) => {
         userId: req.user.id,
         role: "assistant",
         content: escalationResponse
+      });
+
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // Knowledge overview questions answered from stored metadata before vector search
+    const botFiles = await BotFile.find({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] })
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .select("fileName");
+
+    const overviewResponse = buildKnowledgeOverviewResponse(bot, botFiles.map(f => f.fileName), message);
+    if (overviewResponse) {
+      await streamTextInChunks(res, overviewResponse, 15);
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "user",
+        content: message
+      });
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "assistant",
+        content: overviewResponse
       });
 
       res.write("data: [DONE]\n\n");
@@ -751,7 +781,18 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     // Multi-tenant Isolated Knowledge Retrieval
-    const ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory);
+    const ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
+
+    if (ragResult.debug) {
+      console.log("🧠 [RAG DEBUG]", {
+        userId: req.user.id,
+        botId,
+        message,
+        reason: ragResult.reason || "ACCEPTED",
+        metadataMatch: ragResult.metadataMatch || false,
+        debug: ragResult.debug
+      });
+    }
 
     const sourcesMeta = ragResult.isFound
       ? ragResult.chunks.map(c => ({ fileName: c.fileName, snippet: c.snippet.substring(0, 100) + "..." }))
@@ -763,7 +804,7 @@ exports.sendBotChatMessage = async (req, res) => {
 
     // Strict Out-of-Scope Fallback Rule using Bot Name
     if (!ragResult.isFound) {
-      const outOfScopeMsg = `I am ${bot.name}, a specialized assistant for the configured knowledge base. Your question is outside my available knowledge scope. Please ask a question related to the uploaded documents or configured tools.`;
+      const outOfScopeMsg = "I couldn't find information about that topic in the available documentation. My strongest answers come from the uploaded knowledge base. If your question relates to the documented topics, I'll be happy to help.";
       await streamTextInChunks(res, outOfScopeMsg, 15);
 
       await BotMessage.create({
@@ -787,7 +828,7 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     // Build grounded RAG system prompt
-    const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis);
+    const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
 
     const OLLAMA_BASE_URL = process.env.OLLAMA_HOST_URL 
       ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "") 

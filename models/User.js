@@ -15,7 +15,18 @@ const userSchema = new mongoose.Schema(
 
     password: {
       type: String,
-      required: true,
+      required: false,
+    },
+
+    profilePic: {
+      type: String,
+      default: "",
+    },
+
+    authType: {
+      type: String,
+      enum: ["local", "google"],
+      default: "local",
     },
 
     plan: {

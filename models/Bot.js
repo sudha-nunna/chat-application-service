@@ -31,6 +31,24 @@ const botSchema = new mongoose.Schema(
       type: String,
       default: "You are a specialized AI assistant. You answer questions strictly based on the provided knowledge base and integrated APIs."
     },
+    knowledgeSummary: {
+      titles: { type: [String], default: [] },
+      products: { type: [String], default: [] },
+      modules: { type: [String], default: [] },
+      topics: { type: [String], default: [] },
+      features: { type: [String], default: [] },
+      services: { type: [String], default: [] },
+      headings: { type: [String], default: [] },
+      rawSummary: { type: String, default: "" }
+    },
+    knowledgeTopics: {
+      type: [String],
+      default: []
+    },
+    knowledgeModules: {
+      type: [String],
+      default: []
+    },
     status: {
       type: String,
       enum: ["ACTIVE", "INACTIVE"],

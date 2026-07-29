@@ -62,7 +62,36 @@ async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = nu
   return requested;
 }
 
+async function warmOllamaConnection() {
+  const baseUrl = getOllamaBaseUrl();
+  const targetModel = await getAvailableOllamaModel(baseUrl, process.env.OLLAMA_MODEL);
+
+  try {
+    const response = await fetch(`${baseUrl}/api/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text",
+        prompt: "Warmup ping"
+      })
+    });
+
+    if (response.ok) {
+      console.log(`✅ [OLLAMA WARMUP] Connected to Ollama model ${targetModel}`);
+      return true;
+    }
+
+    const errorText = await response.text();
+    console.warn(`⚠️ [OLLAMA WARMUP] Ollama responded with status ${response.status}: ${errorText}`);
+  } catch (err) {
+    console.warn(`⚠️ [OLLAMA WARMUP] Failed to warm Ollama connection: ${err.message}`);
+  }
+
+  return false;
+}
+
 module.exports = {
   getOllamaBaseUrl,
-  getAvailableOllamaModel
+  getAvailableOllamaModel,
+  warmOllamaConnection
 };

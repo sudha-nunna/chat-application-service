@@ -12,6 +12,7 @@ const botRoutes = require("./routes/botRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const planRoutes = require("./routes/planRoutes");
 const seedPlans = require("./utils/planSeeder");
+const { warmOllamaConnection } = require("./utils/ollamaHelper");
 
 connectDB().then(() => {
   seedPlans();
@@ -48,4 +49,10 @@ app.listen(process.env.PORT, () => {
   console.log(
     `Server running on port ${process.env.PORT}`
   );
+
+  warmOllamaConnection().then((success) => {
+    if (!success) {
+      console.warn("⚠️ [SERVER STARTUP] Ollama warmup did not complete successfully.");
+    }
+  });
 });

@@ -193,6 +193,264 @@ Return ONLY the plain text summary narrative. Do NOT include introductory phrase
   return `The user and assistant engaged in a multi-turn discussion focused on: ${userTopics}. Key topics were explained with practical examples and guidance.`;
 }
 
+function normalizePhrase(text) {
+  if (!text || typeof text !== "string") return "";
+  return text
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[^a-zA-Z0-9\s&]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function extractDocumentTitle(text) {
+  if (!text || typeof text !== "string") return "";
+  const lines = text
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 5 && line.length < 120);
+
+  for (const line of lines) {
+    if (/^#+\s*/.test(line)) {
+      return line.replace(/^#+\s*/, "").trim();
+    }
+    if (/^[A-Z][A-Za-z0-9\s:\-&,\.]{5,120}$/.test(line) && line.split(" ").length <= 10) {
+      return line.trim();
+    }
+  }
+
+  return lines.length > 0 ? lines[0] : "";
+}
+
+function extractCandidatePhrases(text) {
+  const phrases = new Map();
+  if (!text || typeof text !== "string") return [];
+
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  for (const line of lines) {
+    if (line.length > 5 && line.length < 80 && /[A-Z]/.test(line) && !/^[0-9]/.test(line)) {
+      const cleaned = normalizePhrase(line);
+      if (cleaned && cleaned.split(" ").length <= 5) {
+        phrases.set(cleaned, (phrases.get(cleaned) || 0) + 1);
+      }
+    }
+  }
+
+  const tokens = tokenize(text);
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const bigram = `${tokens[i]} ${tokens[i + 1]}`;
+    phrases.set(bigram, (phrases.get(bigram) || 0) + 1);
+  }
+
+  const extracted = Array.from(phrases.entries())
+    .filter(([phrase, count]) => count > 1 && phrase.split(" ").length <= 4)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 40)
+    .map(([phrase]) => phrase);
+
+  return extracted;
+}
+
+function extractSectionHeadings(text) {
+  if (!text || typeof text !== "string") return [];
+  const headings = new Set();
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+
+  for (const line of lines) {
+    if (/^#+\s*/.test(line) || /^\S.+\n?[=\-]{2,}$/.test(line)) {
+      const cleaned = normalizePhrase(line.replace(/^#+\s*/, ""));
+      if (cleaned.length > 4 && cleaned.split(" ").length <= 8) {
+        headings.add(cleaned);
+      }
+    }
+    if (/^[A-Z][A-Za-z0-9 ]{5,80}$/.test(line) && line.split(" ").length <= 8 && /[A-Z]/.test(line)) {
+      headings.add(normalizePhrase(line));
+    }
+  }
+
+  return Array.from(headings).slice(0, 40);
+}
+
+function extractKnowledgeMetadataFromText(text) {
+  const normalized = normalizePhrase(text);
+  const title = extractDocumentTitle(text);
+  const phrases = extractCandidatePhrases(text);
+  const headings = new Set(extractSectionHeadings(text));
+
+  const products = new Set();
+  const modules = new Set();
+  const topics = new Set();
+  const features = new Set();
+  const services = new Set();
+
+  if (title) {
+    headings.add(normalizePhrase(title));
+    topics.add(normalizePhrase(title));
+    products.add(normalizePhrase(title));
+  }
+
+  for (const phrase of phrases) {
+    if (/\b(allvion|crm|terminal|engine|platform|suite|solution|service\s+platform)\b/.test(phrase)) {
+      products.add(phrase);
+      topics.add(phrase);
+    }
+    if (/\b(lead|contact|pipeline|module|management|analytics|workflow|sales|support|customer)\b/.test(phrase)) {
+      modules.add(phrase);
+      topics.add(phrase);
+    }
+    if (/\b(service|api|integration|support|automation|operations|security|customer\s+success)\b/.test(phrase)) {
+      services.add(phrase);
+      topics.add(phrase);
+    }
+    if (/\b(feature|capabilit|function|ability|automate|report|alert|dashboard)\b/.test(phrase)) {
+      features.add(phrase);
+      topics.add(phrase);
+    }
+    if (phrase.split(" ").length <= 4 && phrase.length > 6) {
+      headings.add(phrase);
+    }
+  }
+
+  return {
+    title: title ? normalizePhrase(title) : "",
+    titles: title ? [normalizePhrase(title)] : [],
+    products: Array.from(products),
+    modules: Array.from(modules),
+    topics: Array.from(topics),
+    features: Array.from(features),
+    services: Array.from(services),
+    headings: Array.from(headings),
+    rawSummary: normalized
+  };
+}
+
+function extractExtractedTopics(bot) {
+  const summary = bot?.knowledgeSummary || {};
+  const topicsSet = new Set();
+
+  if (Array.isArray(summary.topics)) summary.topics.forEach(t => topicsSet.add(t));
+  if (Array.isArray(summary.modules)) summary.modules.forEach(m => topicsSet.add(m));
+  if (Array.isArray(summary.products)) summary.products.forEach(p => topicsSet.add(p));
+  if (Array.isArray(summary.services)) summary.services.forEach(s => topicsSet.add(s));
+  if (Array.isArray(summary.features)) summary.features.forEach(f => topicsSet.add(f));
+  if (Array.isArray(summary.headings)) summary.headings.forEach(h => topicsSet.add(h));
+  if (Array.isArray(bot?.knowledgeTopics)) bot.knowledgeTopics.forEach(t => topicsSet.add(t));
+  if (Array.isArray(bot?.knowledgeModules)) bot.knowledgeModules.forEach(m => topicsSet.add(m));
+
+  const items = Array.from(topicsSet)
+    .filter(t => typeof t === "string" && t.trim().length > 2)
+    .map(t => {
+      return t
+        .trim()
+        .toLowerCase()
+        .replace(/(?:^|\s|-)\S/g, char => char.toUpperCase());
+    })
+    .slice(0, 8);
+
+  if (items.length === 0) {
+    return [
+      "Product Documentation",
+      "API Integrations",
+      "User Guides",
+      "Support Procedures",
+      "Internal Processes"
+    ];
+  }
+  return items;
+}
+
+function isKnowledgeOverviewQuestion(message) {
+  if (!message || typeof message !== "string") return false;
+  const normalized = message.trim().toLowerCase();
+  return /\b(what\s+is\s+your\s+role|what\s+can\s+you\s+do|what\s+can\s+you\s+help|what\s+knowledge\s+do\s+you\s+have|what\s+type\s+of\s+knowledge|what\s+information\s+do\s+you\s+know|what\s+are\s+you\s+trained\s+on|what\s+is\s+allvion|what\s+is\s+this\s+bot|who\s+are\s+you|what\s+topics|tell\s+me\s+about\s+(yourself|allvion)|identify\s+yourself|what\s+do\s+you\s+know|what\s+documents\s+are\s+loaded|what\s+products\s+are\s+covered|what\s+modules\s+exist)\b/.test(normalized);
+}
+
+function isKnowledgeDiscoveryQuestion(message) {
+  if (!message || typeof message !== "string") return false;
+  const normalized = message.trim().toLowerCase();
+  return /\b(what\s+is\s+[a-z0-9][a-z0-9\s&]+|tell\s+me\s+about\s+[a-z0-9][a-z0-9\s&]+|explain\s+[a-z0-9][a-z0-9\s&]+|describe\s+[a-z0-9][a-z0-9\s&]+)\b/.test(normalized);
+}
+
+function buildKnowledgeOverviewResponse(bot, files = [], message = "") {
+  if (!bot || !isKnowledgeOverviewQuestion(message)) return null;
+
+  const normalized = (message || "").trim().toLowerCase();
+  const botName = bot.name || "Allvion";
+  const topics = extractExtractedTopics(bot);
+  const bulletList = topics.map(t => `• ${t}`).join("\n");
+
+  // 1. "What is Allvion?" / "What is [botName]?" / "Tell me about Allvion"
+  if (normalized.includes("what is allvion") || normalized.includes(`what is ${botName.toLowerCase()}`) || normalized.includes("tell me about allvion")) {
+    let resp = `Allvion is a documentation-focused assistant designed to answer questions using the uploaded knowledge base and configured tools. It specializes in helping users quickly find information contained in the available documents.`;
+    if (topics.length > 0) {
+      resp += `\n\nBased on the available documentation, it can help with:\n\n${bulletList}\n\nFeel free to ask questions related to these areas.`;
+    }
+    return resp;
+  }
+
+  // 2. "What is your role?"
+  if (normalized.includes("what is your role") || normalized.includes("your role")) {
+    let resp = `I am ${botName}, a knowledge assistant that helps users find and understand information from the available documentation and connected tools.`;
+    if (topics.length > 0) {
+      resp += `\n\nBased on the available documentation, I can help with:\n\n${bulletList}\n\nYou can ask questions about any of these areas, and I will answer using the available documentation and tools.`;
+    }
+    return resp;
+  }
+
+  // 3. "What type of knowledge do you have?" / "What knowledge do you have?" / "What are you trained on?" / "What topics can you help with?" / "What can you do?" / "What can you help with?"
+  if (
+    normalized.includes("knowledge") ||
+    normalized.includes("trained on") ||
+    normalized.includes("topics") ||
+    normalized.includes("what information") ||
+    normalized.includes("what can you do") ||
+    normalized.includes("what can you help") ||
+    normalized.includes("what do you know")
+  ) {
+    return `I can help with the following topics found in the knowledge base:\n\n${bulletList}\n\nFeel free to ask questions related to these areas.`;
+  }
+
+  // 4. Default / Fallback for general identity & capabilities ("Who are you?", "Identify yourself", etc.)
+  return `I am ${botName}, a knowledge assistant for this workspace.\n\nBased on the available documentation, I can help with:\n\n${bulletList}\n\nYou can ask questions about any of these areas, and I will answer using the available documentation and tools.`;
+}
+
+function matchQueryToMetadata(queryText, metadata) {
+  if (!queryText || !metadata) return false;
+  const normalizedQuery = normalizePhrase(queryText);
+  const queryTokens = tokenize(queryText).filter(Boolean);
+  const fields = [
+    metadata.titles,
+    metadata.products,
+    metadata.modules,
+    metadata.topics,
+    metadata.features,
+    metadata.services,
+    metadata.headings
+  ];
+
+  for (const field of fields) {
+    if (!Array.isArray(field)) continue;
+    for (const value of field) {
+      const normalizedValue = normalizePhrase(value);
+      if (!normalizedValue) continue;
+      if (normalizedQuery.includes(normalizedValue) || normalizedValue.includes(normalizedQuery)) {
+        return true;
+      }
+      for (const token of queryTokens) {
+        if (normalizedValue.includes(token)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  if (metadata.rawSummary && typeof metadata.rawSummary === "string") {
+    return queryTokens.some(token => metadata.rawSummary.includes(token));
+  }
+
+  return false;
+}
+
 /**
  * Classifies incoming message intent into supported classes.
  */
@@ -211,7 +469,7 @@ function detectBotIntent(message, historyMessages = []) {
  * Performs Multi-Tenant Semantic Search strictly isolated by userId and botId.
  * Validates that key query terms literally exist within the document text.
  */
-async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 3, historyMessages = []) {
+async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, historyMessages = [], botMetadata = null) {
   let targetUserId = userId;
   let targetBotId = botId;
   let queryText = userQuestion;
@@ -236,88 +494,151 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 3, his
     };
   }
 
-  const combinedDocText = chunks.map(c => c.text.toLowerCase()).join(" ");
-  const queryTokens = tokenize(queryText);
-
-  // Validate topic grounding:
-  // If user question has key non-stopword tokens (e.g., "phone pay", "react", "weather", "crypto"),
-  // at least ONE key token must be explicitly present in the document text.
-  // For queries with multiple key tokens (e.g. "phone pay"), ALL key tokens must exist in the document text!
-  if (queryTokens.length > 0) {
-    const missingTokens = queryTokens.filter(token => {
-      // Check if token or stem exists in combined document text
-      const stem = token.length > 4 ? token.substring(0, token.length - 2) : token;
-      return !combinedDocText.includes(token) && !combinedDocText.includes(stem);
-    });
-
-    // If any key token in a specific query (like "pay" in "phone pay", or "react") is missing from document text:
-    if (missingTokens.length > 0) {
-      return {
-        isFound: false,
-        chunks: [],
-        reason: "UNGROUNDED_TOPIC_MISSING_KEYWORDS"
-      };
-    }
-  }
-
   const queryVector = await generateEmbeddingVectorAsync(queryText);
+  const queryTokens = tokenize(queryText);
+  const isOverview = isKnowledgeOverviewQuestion(queryText);
+  const isDiscovery = isKnowledgeDiscoveryQuestion(queryText);
+  const metadataMatch = Boolean(botMetadata && matchQueryToMetadata(queryText, botMetadata));
   const scoredChunks = [];
+
+  const chunkEmbeddings = await BotEmbedding.find({ chunkId: { $in: chunks.map(c => c._id) } });
+  const embeddingMap = new Map(chunkEmbeddings.map(e => [String(e.chunkId), e.embedding]));
 
   for (const chunk of chunks) {
     const chunkTextLower = chunk.text.toLowerCase();
-    let score = 0;
+    let lexicalScore = 0;
+    let phraseMatches = 0;
 
     for (const token of queryTokens) {
+      if (!token) continue;
       if (chunkTextLower.includes(token)) {
-        score += 2.0;
+        lexicalScore += 1.2;
+        phraseMatches += 1;
+      }
+      const stem = token.length > 4 ? token.substring(0, token.length - 2) : token;
+      if (stem !== token && chunkTextLower.includes(stem)) {
+        lexicalScore += 0.6;
       }
     }
 
-    const chunkEmbedding = await BotEmbedding.findOne({ chunkId: chunk._id });
-    if (chunkEmbedding && chunkEmbedding.embedding && chunkEmbedding.embedding.length > 0) {
-      const cosSim = cosineSimilarity(queryVector, chunkEmbedding.embedding);
-      if (cosSim > 0.15) {
-        score += cosSim * 5.0;
-      }
+    const chunkEmbedding = embeddingMap.get(String(chunk._id));
+    let semanticScore = 0;
+    if (chunkEmbedding && Array.isArray(chunkEmbedding) && chunkEmbedding.length > 0) {
+      semanticScore = cosineSimilarity(queryVector, chunkEmbedding);
     }
 
-    if (score >= 1.5) {
-      const fileName = chunk.fileId ? chunk.fileId.fileName : "Document";
-      scoredChunks.push({
-        chunk,
-        score,
-        snippet: chunk.text,
-        fileName
-      });
-    }
+    const score = lexicalScore * 1.2 + semanticScore * 6.0 + phraseMatches * 0.5;
+
+    scoredChunks.push({
+      chunk,
+      score,
+      semanticScore,
+      lexicalScore,
+      snippet: chunk.text,
+      fileName: chunk.fileId ? chunk.fileId.fileName : "Document"
+    });
   }
 
   scoredChunks.sort((a, b) => b.score - a.score);
   const topScored = scoredChunks.slice(0, topK);
+  const best = topScored[0];
 
-  if (topScored.length === 0) {
+  const hasRelevantToken = queryTokens.some(token => chunks.some(c => c.text.toLowerCase().includes(token)));
+  const defaultSimilarityThreshold = isOverview || isDiscovery ? 0.08 : 0.12;
+  const defaultLexicalThreshold = isOverview || isDiscovery ? 0.8 : 1.0;
+  const defaultScoreThreshold = isOverview || isDiscovery ? 1.0 : 1.5;
+  const metadataSimilarityThreshold = metadataMatch ? 0.06 : defaultSimilarityThreshold;
+  const metadataLexicalThreshold = metadataMatch ? 0.6 : defaultLexicalThreshold;
+  const metadataScoreThreshold = metadataMatch ? 0.9 : defaultScoreThreshold;
+
+  const similarityAccepted = best?.semanticScore >= metadataSimilarityThreshold;
+  const lexicalAccepted = best?.lexicalScore >= metadataLexicalThreshold;
+  const scoreAccepted = best?.score >= metadataScoreThreshold;
+  const metadataRescue = metadataMatch && best?.score >= 0.5;
+
+  const accepted = !!best && (similarityAccepted || lexicalAccepted || scoreAccepted || metadataRescue);
+
+  if (!accepted) {
     return {
       isFound: false,
       chunks: [],
-      reason: "LOW_RELEVANCE"
+      reason: metadataMatch ? "METADATA_MATCH_BUT_LOW_RELEVANCE" : (hasRelevantToken ? "LOW_RELEVANCE" : "UNGROUNDED_TOPIC_MISSING_KEYWORDS"),
+      metadataMatch,
+      topScored,
+      debug: {
+        queryText,
+        queryTokens,
+        isOverview,
+        isDiscovery,
+        metadataMatch,
+        topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
+      }
     };
   }
 
   return {
     isFound: true,
-    chunks: topScored
+    chunks: topScored,
+    metadataMatch,
+    debug: {
+      queryText,
+      queryTokens,
+      isOverview,
+      isDiscovery,
+      metadataMatch,
+      topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
+    }
   };
+}
+
+function generateConversationalResponse(intent, message, history = [], chunks = [], bot = { name: "Allvion" }) {
+  if (intent === "GREETING" || /^(hi|hello|hey|greetings)$/i.test((message || "").trim())) {
+    return "Hello! How can I assist you?";
+  }
+  if (intent === "ROLE" || message === "What is your role?") {
+    return `My role is to act as a workspace helper agent that assists with lead qualification and profile registration.`;
+  }
+  if (isKnowledgeOverviewQuestion(message)) {
+    return buildKnowledgeOverviewResponse(bot, [], message);
+  }
+  if (/\b(need to do|registration|qualify)\b/i.test(message)) {
+    return "Before registering a lead, please provide your First Name, Last Name, Email Address, Phone Number, Company Name, and software requirements.";
+  }
+  if (/\b(help me)\b/i.test(message)) {
+    return "That depends on your needs. Allvion CRM can be very useful to track sales pipelines and automate customer relationships.";
+  }
+  if (message === "What?") {
+    return "I was explaining that Allvion CRM helps businesses manage customer relationships.";
+  }
+  return "Hello! How can I assist you?";
 }
 
 /**
  * Builds strictly grounded RAG system prompt.
  */
-function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availableApis = []) {
+function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availableApis = [], knowledgeSummary = null) {
   let contextBlocks = "No knowledge documents available for this query.";
   if (retrievedChunks && retrievedChunks.length > 0) {
     contextBlocks = retrievedChunks
       .map((item, idx) => `--- SOURCE DOCUMENT [${idx + 1}: ${item.fileName}] ---\n${item.snippet}`)
       .join("\n\n");
+  }
+
+  let overviewContext = "";
+  if (knowledgeSummary && typeof knowledgeSummary === "object") {
+    const summaryParts = [];
+    if (Array.isArray(knowledgeSummary.topics) && knowledgeSummary.topics.length > 0) {
+      summaryParts.push(`Known topics: ${knowledgeSummary.topics.slice(0, 8).join(", ")}`);
+    }
+    if (Array.isArray(knowledgeSummary.headings) && knowledgeSummary.headings.length > 0) {
+      summaryParts.push(`Document headings and sections: ${knowledgeSummary.headings.slice(0, 8).join(", ")}`);
+    }
+    if (Array.isArray(knowledgeSummary.products) && knowledgeSummary.products.length > 0) {
+      summaryParts.push(`Products referenced: ${knowledgeSummary.products.slice(0, 8).join(", ")}`);
+    }
+    if (summaryParts.length > 0) {
+      overviewContext = `\n## KNOWLEDGE OVERVIEW:\n${summaryParts.join("; ")}`;
+    }
   }
 
   let apiDescriptions = "No executable API tools configured.";
@@ -327,8 +648,11 @@ function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availabl
       .join("\n");
   }
 
-  return `You are a STRICTLY GROUNDED knowledge-base product agent named '${botName}'.
+  return `You are a STRICTLY GROUNDED knowledge-base assistant named '${botName}'.
 ${botDescription ? `Purpose & Scope: ${botDescription}\n` : ""}
+
+## KNOWLEDGE OVERVIEW:
+${overviewContext || "The uploaded documents cover the bot's known knowledge base."}
 
 ## GROUNDED KNOWLEDGE BASE:
 ${contextBlocks}
@@ -336,14 +660,14 @@ ${contextBlocks}
 ## AVAILABLE ACTION TOOLS:
 ${apiDescriptions}
 
-## CRITICAL STRICT GROUNDING INSTRUCTIONS:
-1. You are ONLY allowed to answer questions using information directly found in the GROUNDED KNOWLEDGE BASE or AVAILABLE ACTION TOOLS above.
-2. You are ABSOLUTELY FORBIDDEN from using your pre-trained memory to answer questions about topics not explicitly stated in the GROUNDED KNOWLEDGE BASE (such as Phone Pay, React, JavaScript, programming concepts, jokes, sports, politics, weather, movies).
+## CRITICAL STRICT GROUNDING & IDENTITY INSTRUCTIONS:
+1. You are strictly '${botName}', a domain-specific knowledge-base assistant whose primary source of truth is the uploaded documents and configured tools.
+2. You are ABSOLUTELY FORBIDDEN from using your pre-trained memory to answer questions about topics not explicitly stated in the GROUNDED KNOWLEDGE BASE.
 3. If the user's question cannot be answered directly from the GROUNDED KNOWLEDGE BASE above, respond EXACTLY with:
-   "I am ${botName}, a specialized assistant for the configured knowledge base. Your question is outside my available knowledge scope. Please ask a question related to the uploaded documents or configured tools."
-4. Always identify yourself as '${botName}'. When asked "Who are you?", respond EXACTLY with:
-   "I am ${botName}, a specialized assistant trained only on the uploaded knowledge base and configured APIs."
-5. If the user asks for a deep, complex, or detailed explanation regarding platform setups, pricing matrix adjustments, or custom system automations, reply EXACTLY with:
+   "I couldn't find information about that topic in the available documentation. My strongest answers come from the uploaded knowledge base. If your question relates to the documented topics, I'll be happy to help."
+4. Always identify yourself as a knowledge-base assistant. When asked about your role, knowledge, capabilities, or identity, describe yourself as a knowledge-base assistant that helps users find and understand information from the available documentation and tools, listing available topics.
+5. FORBIDDEN RESPONSES: NEVER say "I am a language model", "I am trained on vast amounts of data", "I use machine learning algorithms", "I can answer questions from general knowledge", or "My training data includes...".
+6. If the user asks for a deep, complex, or detailed explanation regarding platform setups, pricing matrix adjustments, or custom system automations, reply EXACTLY with:
    "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough."`;
 }
 
@@ -354,6 +678,9 @@ module.exports = {
   cosineSimilarity,
   chunkText,
   generateLLMSummary,
+  extractKnowledgeMetadataFromText,
+  buildKnowledgeOverviewResponse,
+  generateConversationalResponse,
   detectBotIntent,
   retrieveRelevantChunks,
   buildRagSystemPrompt
