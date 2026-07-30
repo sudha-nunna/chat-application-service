@@ -15,7 +15,7 @@ const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
 function getClusterNodes() {
   const node1Url = process.env.OLLAMA_HOST_URL
     ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "")
-    : "https://linux-exclude-avon-garlic.trycloudflare.com";
+    : "https://budgets-before-isolation-tours.trycloudflare.com";
 
   const node2Url = process.env.OLLAMA_NODE_2
     ? process.env.OLLAMA_NODE_2.trim().replace(/\/$/, "")
@@ -100,32 +100,21 @@ async function checkClusterHealth() {
   console.log("========================================================================\n");
 }
 
+const { selectBestClusterNodeWithPreemption } = require("./priorityDispatcher");
+
 /**
  * Smart Load Balancer: Selects the healthiest, least-busy node.
- * If Node 1 is currently processing a request (activeRequests > 0) or offline,
- * dispatches immediately to Node 2 without blocking!
+ * Integrates In-Flight Priority Preemption (Free < Pro < Enterprise).
  */
-function selectBestClusterNode() {
-  // 1. Try healthy node with 0 active requests
-  const idleNode = clusterState.find(n => n.status.startsWith("HEALTHY") && n.activeRequests === 0);
-  if (idleNode) return idleNode;
-
-  // 2. Otherwise pick healthy node with lowest active requests count
-  const healthyNodes = clusterState.filter(n => !n.status.startsWith("OFFLINE"));
-  if (healthyNodes.length > 0) {
-    healthyNodes.sort((a, b) => a.activeRequests - b.activeRequests);
-    return healthyNodes[0];
-  }
-
-  // 3. Fallback to Primary Node
-  return clusterState[0];
+function selectBestClusterNode(userPriority = 10) {
+  return selectBestClusterNodeWithPreemption(userPriority, clusterState);
 }
 
 /**
  * Model resolution helper
  */
 async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = null) {
-  const node = selectBestClusterNode();
+  const node = selectBestClusterNode(10);
   const baseUrl = customBaseUrl || node.url;
   const requested = preferredModel || node.defaultModel;
 
@@ -153,7 +142,7 @@ async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = nu
         return cachedModelName;
       }
     }
-  } catch (err) {}
+  } catch (err) { }
 
   cachedModelName = requested;
   lastModelCheckTime = now;

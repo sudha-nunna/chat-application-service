@@ -266,9 +266,26 @@ CRITICAL INSTRUCTIONS:
     res.write(`data: ${JSON.stringify({ type: "meta", chatId, title: chat.title })}\n\n`);
 
     const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
+    const { calculatePriority } = require("../utils/priorityCalculator");
+    const { registerActiveJob, unregisterActiveJob } = require("../utils/priorityDispatcher");
+    const User = require("../models/User");
+
+    const userDoc = await User.findById(req.user.id).select("plan");
+    const userPriority = await calculatePriority(userDoc ? userDoc.plan : "free");
+
     const tModelStart = performance.now();
-    const selectedNode = selectBestClusterNode();
+    const selectedNode = selectBestClusterNode(userPriority);
     selectedNode.activeRequests++;
+
+    const abortController = new AbortController();
+    const jobId = `general_${chatId}_${Date.now()}`;
+    registerActiveJob(jobId, {
+      userId: req.user.id,
+      userPriority,
+      nodeId: selectedNode.id,
+      res,
+      abortController
+    });
 
     const OLLAMA_BASE_URL = selectedNode.url;
     const targetModel = selectedNode.defaultModel;
@@ -279,6 +296,7 @@ CRITICAL INSTRUCTIONS:
     console.log(`Dispatched Node: ${selectedNode.id} (${selectedNode.name})`);
     console.log(`Target URL: ${selectedNode.url} (${selectedNode.format.toUpperCase()} API)`);
     console.log(`Active Requests on Node: ${selectedNode.activeRequests}`);
+    console.log(`Target User Tier Priority: ${userPriority}`);
     console.log(`Target Model: ${targetModel}`);
     console.log(`Chat ID: ${chatId}`);
     console.log(`Payload Message Count: ${historyPayload.length}`);
@@ -309,7 +327,8 @@ CRITICAL INSTRUCTIONS:
           "X-Requested-With": "XMLHttpRequest",
           "Accept": "application/json, text/event-stream"
         },
-        body: JSON.stringify(requestPayload)
+        body: JSON.stringify(requestPayload),
+        signal: abortController.signal
       });
 
       // FALLBACK FAILOVER ROUTING IF PRIMARY NODE IS BUSY/OFFLINE
@@ -403,6 +422,7 @@ CRITICAL INSTRUCTIONS:
     } catch (ollamaErr) {
       console.error("CRITICAL: Ollama cluster connection error:", ollamaErr.message);
     } finally {
+      unregisterActiveJob(jobId);
       selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
     }
 

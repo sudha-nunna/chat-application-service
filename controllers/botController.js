@@ -981,8 +981,25 @@ exports.sendBotChatMessage = async (req, res) => {
     const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
 
     const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
-    const selectedNode = selectBestClusterNode();
+    const { calculatePriority } = require("../utils/priorityCalculator");
+    const { registerActiveJob, unregisterActiveJob } = require("../utils/priorityDispatcher");
+    const User = require("../models/User");
+
+    const userDoc = await User.findById(req.user.id).select("plan");
+    const userPriority = await calculatePriority(userDoc ? userDoc.plan : "free");
+
+    const selectedNode = selectBestClusterNode(userPriority);
     selectedNode.activeRequests++;
+
+    const abortController = new AbortController();
+    const jobId = `bot_${botId}_${Date.now()}`;
+    registerActiveJob(jobId, {
+      userId: req.user.id,
+      userPriority,
+      nodeId: selectedNode.id,
+      res,
+      abortController
+    });
 
     const targetModel = (bot.model && !/^(gpt-4|gpt-3|claude)/i.test(bot.model)) 
       ? bot.model 
@@ -1032,7 +1049,8 @@ exports.sendBotChatMessage = async (req, res) => {
           "User-Agent": "Mozilla/5.0",
           "X-Requested-With": "XMLHttpRequest"
         },
-        body: JSON.stringify(requestPayload)
+        body: JSON.stringify(requestPayload),
+        signal: abortController.signal
       });
 
       // Failover to secondary node if primary node request fails
@@ -1048,7 +1066,8 @@ exports.sendBotChatMessage = async (req, res) => {
               model: fallbackNode.defaultModel,
               messages: ollamaMessages,
               stream: true
-            })
+            }),
+            signal: abortController.signal
           });
         }
       }
@@ -1094,6 +1113,7 @@ exports.sendBotChatMessage = async (req, res) => {
     } catch (ollamaErr) {
       console.warn("⚠️ [BOT CHAT OLLAMA] Ollama service error:", ollamaErr.message);
     } finally {
+      unregisterActiveJob(jobId);
       selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
     }
 
