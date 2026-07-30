@@ -10,24 +10,30 @@ const DEFAULT_PRIORITY_MAP = {
 };
 
 /**
- * Calculates quantitative priority score dynamically from the Plan collection.
- * Prepared for future BullMQ priority queues.
+ * Calculates quantitative priority score dynamically from the Plan collection or static map.
  */
 const calculatePriority = async (planKey = "free", status = "active") => {
+  const normalizedKey = (planKey || "free").toString().toLowerCase();
+
   if (status !== "active" && status !== "trialing") {
     return DEFAULT_PRIORITY_MAP.free;
   }
 
+  // Quick synchronous map return for standard plans
+  if (DEFAULT_PRIORITY_MAP[normalizedKey] !== undefined) {
+    return DEFAULT_PRIORITY_MAP[normalizedKey];
+  }
+
   try {
-    const plan = await Plan.findOne({ key: planKey.toLowerCase(), active: true });
+    const plan = await Plan.findOne({ key: normalizedKey, active: true }).maxTimeMS(1500);
     if (plan && plan.priorityScore !== undefined) {
       return plan.priorityScore;
     }
   } catch (error) {
-    console.error("Error calculating priority score from DB:", error);
+    // Graceful fallback to static map
   }
 
-  return DEFAULT_PRIORITY_MAP[planKey] || DEFAULT_PRIORITY_MAP.free;
+  return DEFAULT_PRIORITY_MAP[normalizedKey] || DEFAULT_PRIORITY_MAP.free;
 };
 
 module.exports = {

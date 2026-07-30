@@ -270,12 +270,25 @@ CRITICAL INSTRUCTIONS:
     const { registerActiveJob, unregisterActiveJob } = require("../utils/priorityDispatcher");
     const User = require("../models/User");
 
-    const userDoc = await User.findById(req.user.id).select("plan");
-    const userPriority = await calculatePriority(userDoc ? userDoc.plan : "free");
+    const userId = req.user?.id || req.user?._id;
+    const userDoc = userId ? await User.findById(userId).select("plan") : null;
+    const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
+    const userPriority = await calculatePriority(userPlan);
 
     const tModelStart = performance.now();
     const selectedNode = selectBestClusterNode(userPriority);
     selectedNode.activeRequests++;
+
+    let accumulatedResponseText = req.body.accumulatedText || "";
+    let streamedSuccessfully = false;
+
+    // Handle Stream Continuation Resumption if request was paused
+    if (req.body.isResume && req.body.accumulatedText) {
+      historyPayload.push({
+        role: "system",
+        content: `Resumption Directive: You were previously generating a response that was paused mid-sentence. Continue generating seamlessly starting AFTER the text below. DO NOT repeat any text already written.\n\nAlready Written:\n"${req.body.accumulatedText}"`
+      });
+    }
 
     const abortController = new AbortController();
     const jobId = `general_${chatId}_${Date.now()}`;
@@ -284,7 +297,8 @@ CRITICAL INSTRUCTIONS:
       userPriority,
       nodeId: selectedNode.id,
       res,
-      abortController
+      abortController,
+      getAccumulatedText: () => accumulatedResponseText
     });
 
     const OLLAMA_BASE_URL = selectedNode.url;
@@ -299,12 +313,10 @@ CRITICAL INSTRUCTIONS:
     console.log(`Target User Tier Priority: ${userPriority}`);
     console.log(`Target Model: ${targetModel}`);
     console.log(`Chat ID: ${chatId}`);
+    console.log(`Is Continuation Resume: ${!!req.body.isResume}`);
     console.log(`Payload Message Count: ${historyPayload.length}`);
     console.log(`Current User Prompt: "${message}"`);
     console.log(`========================================================================\n`);
-
-    let accumulatedResponseText = "";
-    let streamedSuccessfully = false;
 
     llmRequestStartTime = performance.now();
 

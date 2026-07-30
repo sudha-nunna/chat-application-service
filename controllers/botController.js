@@ -985,11 +985,16 @@ exports.sendBotChatMessage = async (req, res) => {
     const { registerActiveJob, unregisterActiveJob } = require("../utils/priorityDispatcher");
     const User = require("../models/User");
 
-    const userDoc = await User.findById(req.user.id).select("plan");
-    const userPriority = await calculatePriority(userDoc ? userDoc.plan : "free");
+    const userId = req.user?.id || req.user?._id;
+    const userDoc = userId ? await User.findById(userId).select("plan") : null;
+    const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
+    const userPriority = await calculatePriority(userPlan);
 
     const selectedNode = selectBestClusterNode(userPriority);
     selectedNode.activeRequests++;
+
+    let accumulatedResponseText = req.body.accumulatedText || "";
+    let streamedSuccessfully = false;
 
     const abortController = new AbortController();
     const jobId = `bot_${botId}_${Date.now()}`;
@@ -998,7 +1003,8 @@ exports.sendBotChatMessage = async (req, res) => {
       userPriority,
       nodeId: selectedNode.id,
       res,
-      abortController
+      abortController,
+      getAccumulatedText: () => accumulatedResponseText
     });
 
     const targetModel = (bot.model && !/^(gpt-4|gpt-3|claude)/i.test(bot.model)) 
@@ -1009,6 +1015,13 @@ exports.sendBotChatMessage = async (req, res) => {
     const ollamaMessages = [
       { role: "system", content: systemPrompt }
     ];
+
+    if (req.body.isResume && req.body.accumulatedText) {
+      ollamaMessages.push({
+        role: "system",
+        content: `Resumption Directive: You were previously generating a response that was paused mid-sentence. Continue generating seamlessly starting AFTER the text below. DO NOT repeat any text already written.\n\nAlready Written:\n"${req.body.accumulatedText}"`
+      });
+    }
 
     if (conversation.conversationSummary && conversation.conversationSummary.trim()) {
       ollamaMessages.push({
@@ -1025,9 +1038,6 @@ exports.sendBotChatMessage = async (req, res) => {
     });
 
     ollamaMessages.push({ role: "user", content: message });
-
-    let accumulatedResponseText = "";
-    let streamedSuccessfully = false;
 
     llmRequestStartTime = performance.now();
 

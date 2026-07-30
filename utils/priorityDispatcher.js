@@ -10,7 +10,7 @@
 
 const { performance } = require("perf_hooks");
 
-// Active Jobs Registry: jobId -> { jobId, userId, userPriority, nodeId, res, abortController, startTime }
+// Active Jobs Registry: jobId -> { jobId, userId, userPriority, nodeId, res, abortController, getAccumulatedText, startTime }
 const activeJobs = new Map();
 
 /**
@@ -24,6 +24,7 @@ function registerActiveJob(jobId, jobData) {
     nodeId: jobData.nodeId,
     res: jobData.res,
     abortController: jobData.abortController,
+    getAccumulatedText: jobData.getAccumulatedText || (() => ""),
     startTime: performance.now()
   });
 }
@@ -60,22 +61,29 @@ function preemptLowerPriorityJob(incomingPriority, clusterState) {
   });
 
   const victim = candidates[0];
+  const accumulatedSoFar = typeof victim.getAccumulatedText === "function" ? victim.getAccumulatedText() : "";
 
   // Execute Preemption
   try {
     console.log(`\n⚡ =================== [PRIORITY PREEMPTION DISPATCH] ===================`);
     console.log(`  ├── 🚨 Preempted Victim Stream: User ${victim.userId} (Priority: ${victim.userPriority}) on ${victim.nodeId}`);
     console.log(`  ├── 👑 Target Incoming Request: Priority ${reqPriority}`);
-    console.log(`  └── ⚡ Aborting lower-priority fetch stream & releasing node slot...`);
+    console.log(`  └── ⚠️ Emitting Pause Notice & releasing node slot...`);
     console.log(`========================================================================\n`);
 
-    // 1. Abort the downstream LLM fetch stream
+    // 1. Abort downstream LLM fetch stream
     victim.abortController.abort();
 
-    // 2. Write graceful SSE preemption notice to victim client
+    // 2. Write structured SSE pause notice & accumulated text to victim client
     if (victim.res && !victim.res.writableEnded) {
-      const noticeText = "\n\n⚡ [SYSTEM NOTICE]: Your request stream yielded server resources to a higher-priority subscription tier (Pro/Enterprise). Please retry in a moment.";
-      victim.res.write(`data: ${JSON.stringify({ type: "chunk", chunk: noticeText, text: noticeText })}\n\n`);
+      const pauseText = "\n\n⚠️ Stream paused due to higher-priority request. Click Resume.";
+      victim.res.write(`data: ${JSON.stringify({
+        type: "pause",
+        paused: true,
+        chunk: pauseText,
+        text: pauseText,
+        accumulatedText: accumulatedSoFar
+      })}\n\n`);
       victim.res.write("data: [DONE]\n\n");
       victim.res.end();
     }
