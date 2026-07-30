@@ -10,7 +10,7 @@ const { getOllamaBaseUrl, getAvailableOllamaModel } = require("../utils/ollamaHe
 async function streamTextInChunks(res, text, delayMs = 15) {
   const tokens = text.match(/\s+|\S+/g) || [text];
   for (const token of tokens) {
-    res.write(`data: ${JSON.stringify({ type: "chunk", text: token })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: "chunk", chunk: token, text: token })}\n\n`);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
@@ -365,7 +365,7 @@ CRITICAL INSTRUCTIONS:
                 }
                 accumulatedResponseText += chunkText;
                 chunkCount++;
-                res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
+                res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
               }
             } catch (parseErr) {}
           }

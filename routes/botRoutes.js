@@ -26,6 +26,7 @@ router.post("/:botId/apis/:apiId/test", protect, botController.testBotApi);
 
 // RAG Bot Chat & Conversations
 router.post("/:botId/chat", protect, botController.sendBotChatMessage);
+router.post("/:botId/chat/stream", protect, botController.sendBotChatMessage);
 router.get("/:botId/conversations", protect, botController.getBotConversations);
 router.post("/:botId/conversations", protect, botController.createBotConversation);
 router.delete("/:botId/conversations/:conversationId", protect, botController.deleteBotConversation);

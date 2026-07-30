@@ -25,7 +25,7 @@ const {
 async function streamTextInChunks(res, text, delayMs = 15) {
   const tokens = text.match(/\s+|\S+/g) || [text];
   for (const token of tokens) {
-    res.write(`data: ${JSON.stringify({ type: "chunk", text: token })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: "chunk", chunk: token, text: token })}\n\n`);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
@@ -903,6 +903,31 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
+    // Greeting & Conversational Quick Handler
+    if (/^(hi|hello|hey|greetings|howdy|good morning|good evening|hi there|hello there)$/i.test(message.trim())) {
+      const greetingMsg = `Hello! I am ${bot.name}. How can I assist you today?`;
+      await streamTextInChunks(res, greetingMsg, 15);
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "user",
+        content: message
+      });
+
+      await BotMessage.create({
+        conversationId: conversation._id,
+        botId,
+        userId: req.user.id,
+        role: "assistant",
+        content: greetingMsg
+      });
+
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
     // Multi-tenant Isolated Knowledge Retrieval
     const tRagStart = performance.now();
     const ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
@@ -1059,7 +1084,7 @@ exports.sendBotChatMessage = async (req, res) => {
                   ttft = firstTokenTimestamp - llmRequestStartTime;
                 }
                 accumulatedResponseText += chunkText;
-                res.write(`data: ${JSON.stringify({ type: "chunk", text: chunkText })}\n\n`);
+                res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
               }
             } catch (e) { }
           }
