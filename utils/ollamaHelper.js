@@ -15,7 +15,7 @@ const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
 function getClusterNodes() {
   const node1Url = process.env.OLLAMA_HOST_URL
     ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "")
-    : "https://antibody-java-unfortunately-cad.trycloudflare.com";
+    : "https://queen-syndication-reputation-leg.trycloudflare.com";
 
   const node2Url = process.env.OLLAMA_NODE_2
     ? process.env.OLLAMA_NODE_2.trim().replace(/\/$/, "")
