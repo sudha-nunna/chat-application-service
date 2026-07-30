@@ -15,11 +15,11 @@ const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
 function getClusterNodes() {
   const node1Url = process.env.OLLAMA_HOST_URL
     ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "")
-    : "http://127.0.0.1:11434";
+    : "https://linux-exclude-avon-garlic.trycloudflare.com";
 
   const node2Url = process.env.OLLAMA_NODE_2
     ? process.env.OLLAMA_NODE_2.trim().replace(/\/$/, "")
-    : "https://size-resource-breakdown-null.trycloudflare.com";
+    : "https://protecting-andale-june-butterfly.trycloudflare.com";
 
   return [
     {
@@ -36,7 +36,7 @@ function getClusterNodes() {
       id: "Node-2",
       name: "Secondary Cluster Node",
       url: node2Url,
-      defaultModel: process.env.OLLAMA_NODE_2_MODEL || "models--ggml-org--gemma-3-4b-it-qat-G",
+      defaultModel: process.env.OLLAMA_NODE_2_MODEL || "ggml-org/gemma-3-4b-it-qat-GGUF",
       format: "openai", // /v1/chat/completions
       status: "HEALTHY",
       activeRequests: 0,
@@ -49,13 +49,31 @@ function getClusterNodes() {
 const clusterState = getClusterNodes();
 
 const getOllamaBaseUrl = () => {
+  if (process.env.OLLAMA_HOST_URL) {
+    return process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "");
+  }
   return clusterState[0].url;
 };
 
 /**
- * Checks health of all cluster nodes
+ * Checks health of all cluster nodes and dynamically updates URLs/models from process.env
  */
 async function checkClusterHealth() {
+  // Sync node URLs and default models from process.env dynamically
+  if (process.env.OLLAMA_HOST_URL) {
+    clusterState[0].url = process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "");
+  }
+  if (process.env.OLLAMA_MODEL) {
+    clusterState[0].defaultModel = process.env.OLLAMA_MODEL.trim();
+  }
+
+  if (process.env.OLLAMA_NODE_2) {
+    clusterState[1].url = process.env.OLLAMA_NODE_2.trim().replace(/\/$/, "");
+  }
+  if (process.env.OLLAMA_NODE_2_MODEL) {
+    clusterState[1].defaultModel = process.env.OLLAMA_NODE_2_MODEL.trim();
+  }
+
   console.log("\n🌐 =================== [OLLAMA CLUSTER HEALTH MONITOR] ===================");
 
   for (const node of clusterState) {
@@ -66,7 +84,7 @@ async function checkClusterHealth() {
         node.lastLatencyMs = Number((performance.now() - tStart).toFixed(2));
         node.status = res.ok ? "HEALTHY" : `UNHEALTHY (HTTP ${res.status})`;
       } else {
-        const res = await fetch(`${node.url}/`, { headers: { "Accept": "text/html,application/json" } });
+        const res = await fetch(`${node.url}/v1/models`, { headers: { "Accept": "application/json" } });
         node.lastLatencyMs = Number((performance.now() - tStart).toFixed(2));
         node.status = res.ok ? "HEALTHY" : `UNHEALTHY (HTTP ${res.status})`;
       }

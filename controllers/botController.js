@@ -379,6 +379,114 @@ exports.getBotFiles = async (req, res) => {
   }
 };
 
+exports.replaceBotFile = async (req, res) => {
+  try {
+    const { botId, fileId } = req.params;
+    const { fileName, fileType, fileContentBase64, rawText } = req.body;
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+    if (!bot) {
+      return res.status(404).json({ error: "Bot not found or unauthorized." });
+    }
+
+    const existingFile = await BotFile.findOne({
+      _id: fileId,
+      botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+    if (!existingFile) {
+      return res.status(404).json({ error: "File to replace was not found." });
+    }
+
+    let parsedContent = rawText || "";
+    if (!parsedContent && fileContentBase64) {
+      const buffer = Buffer.from(fileContentBase64, "base64");
+      parsedContent = buffer.toString("utf-8");
+    }
+
+    if (!parsedContent || typeof parsedContent !== "string") {
+      return res.status(400).json({ error: "Replacement file content could not be read or parsed." });
+    }
+
+    const cleanName = fileName || existingFile.fileName;
+    const detectedType = (fileType || cleanName.split(".").pop() || "txt").toLowerCase();
+
+    // 1. Purge all previous chunks & embeddings for this file
+    await BotChunk.deleteMany({ fileId });
+    await BotEmbedding.deleteMany({ fileId });
+
+    // 2. Update BotFile record with new document content & size
+    existingFile.fileName = cleanName;
+    existingFile.fileType = detectedType;
+    existingFile.fileSize = Buffer.byteLength(parsedContent, "utf-8");
+    existingFile.originalContent = parsedContent;
+    existingFile.parsedText = parsedContent;
+
+    // 3. Chunk new content & generate vector embeddings
+    const chunkSnippets = chunkText(parsedContent, 200, 30);
+    const chunkDocs = [];
+
+    for (let i = 0; i < chunkSnippets.length; i++) {
+      chunkDocs.push({
+        botId,
+        userId: req.user.id,
+        fileId: existingFile._id,
+        chunkIndex: i,
+        text: chunkSnippets[i].text,
+        keywords: chunkSnippets[i].keywords
+      });
+    }
+
+    if (chunkDocs.length > 0) {
+      const insertedChunks = await BotChunk.insertMany(chunkDocs);
+
+      const embeddingDocs = await Promise.all(
+        insertedChunks.map(async (chunk) => ({
+          userId: req.user.id,
+          botId,
+          fileId: existingFile._id,
+          chunkId: chunk._id,
+          text: chunk.text,
+          embedding: await generateEmbeddingVectorAsync(chunk.text)
+        }))
+      );
+
+      await BotEmbedding.insertMany(embeddingDocs);
+    }
+
+    existingFile.chunkCount = chunkDocs.length;
+    await existingFile.save();
+
+    // 4. Update knowledge metadata summary
+    const knowledgeMetadata = extractKnowledgeMetadataFromText(parsedContent);
+    await Bot.findByIdAndUpdate(botId, {
+      $set: {
+        knowledgeSummary: {
+          titles: Array.from(new Set([...(bot.knowledgeSummary?.titles || []), ...knowledgeMetadata.titles])),
+          products: Array.from(new Set([...(bot.knowledgeSummary?.products || []), ...knowledgeMetadata.products])),
+          modules: Array.from(new Set([...(bot.knowledgeSummary?.modules || []), ...knowledgeMetadata.modules])),
+          topics: Array.from(new Set([...(bot.knowledgeSummary?.topics || []), ...knowledgeMetadata.topics])),
+          features: Array.from(new Set([...(bot.knowledgeSummary?.features || []), ...knowledgeMetadata.features])),
+          services: Array.from(new Set([...(bot.knowledgeSummary?.services || []), ...knowledgeMetadata.services])),
+          headings: Array.from(new Set([...(bot.knowledgeSummary?.headings || []), ...knowledgeMetadata.headings])),
+          rawSummary: knowledgeMetadata.rawSummary || (bot.knowledgeSummary?.rawSummary || "")
+        },
+        knowledgeTopics: Array.from(new Set([...(bot.knowledgeTopics || []), ...knowledgeMetadata.topics])),
+        knowledgeModules: Array.from(new Set([...(bot.knowledgeModules || []), ...knowledgeMetadata.modules]))
+      }
+    });
+
+    console.log(`📁 [AUDIT LOG] Knowledge File Replaced Successfully: ${cleanName}, New Size: ${existingFile.fileSize} bytes, Chunks: ${chunkDocs.length}`);
+    return res.json(existingFile);
+  } catch (err) {
+    console.error("Replace Bot File error:", err);
+    return res.status(500).json({ error: "Failed to replace knowledge file." });
+  }
+};
+
 exports.deleteBotFile = async (req, res) => {
   try {
     const { botId, fileId } = req.params;
@@ -847,13 +955,13 @@ exports.sendBotChatMessage = async (req, res) => {
     // Build grounded RAG system prompt
     const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
 
-    const OLLAMA_BASE_URL = process.env.OLLAMA_HOST_URL 
-      ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "") 
-      : "http://127.0.0.1:11434";
+    const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
+    const selectedNode = selectBestClusterNode();
+    selectedNode.activeRequests++;
 
     const targetModel = (bot.model && !/^(gpt-4|gpt-3|claude)/i.test(bot.model)) 
       ? bot.model 
-      : (process.env.OLLAMA_MODEL || "qwen3:4b");
+      : selectedNode.defaultModel;
 
     // Construct clean, non-duplicative messages array for Ollama Chat API
     const ollamaMessages = [
@@ -882,36 +990,69 @@ exports.sendBotChatMessage = async (req, res) => {
     llmRequestStartTime = performance.now();
 
     try {
-      const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      const endpointPath = selectedNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
+      const requestPayload = {
+        model: targetModel,
+        messages: ollamaMessages,
+        stream: true
+      };
+      if (selectedNode.format === "ollama") {
+        requestPayload.keep_alive = "24h";
+      }
+
+      let ollamaRes = await fetch(`${selectedNode.url}${endpointPath}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "User-Agent": "Mozilla/5.0",
           "X-Requested-With": "XMLHttpRequest"
         },
-        body: JSON.stringify({
-          model: targetModel,
-          messages: ollamaMessages,
-          stream: true,
-          keep_alive: "24h"
-        })
+        body: JSON.stringify(requestPayload)
       });
+
+      // Failover to secondary node if primary node request fails
+      if (!ollamaRes.ok) {
+        console.warn(`⚠️ [BOT CLUSTER FAILOVER] ${selectedNode.id} HTTP ${ollamaRes.status}. Attempting secondary node failover...`);
+        const fallbackNode = clusterState.find(n => n.id !== selectedNode.id);
+        if (fallbackNode) {
+          const fallbackPath = fallbackNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
+          ollamaRes = await fetch(`${fallbackNode.url}${fallbackPath}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: fallbackNode.defaultModel,
+              messages: ollamaMessages,
+              stream: true
+            })
+          });
+        }
+      }
 
       if (ollamaRes.ok && ollamaRes.body) {
         const reader = ollamaRes.body.getReader();
-        const decoder = new TextDecoder();
+        const decoder = new TextDecoder("utf-8");
+        let lineBuffer = "";
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
           const chunkStr = decoder.decode(value, { stream: true });
-          const lines = chunkStr.split("\n").filter(line => line.trim() !== "");
+          lineBuffer += chunkStr;
+
+          const lines = lineBuffer.split("\n");
+          lineBuffer = lines.pop();
 
           for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+
+            const jsonStr = trimmed.startsWith("data: ") ? trimmed.replace("data: ", "").trim() : trimmed;
+            if (jsonStr === "[DONE]") continue;
+
             try {
-              const parsed = JSON.parse(line);
-              const chunkText = parsed.message?.content || "";
+              const parsed = JSON.parse(jsonStr);
+              const chunkText = parsed.message?.content || parsed.response || parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
               if (chunkText) {
                 if (!firstTokenTimestamp) {
                   firstTokenTimestamp = performance.now();
@@ -926,7 +1067,9 @@ exports.sendBotChatMessage = async (req, res) => {
         streamedSuccessfully = true;
       }
     } catch (ollamaErr) {
-      console.warn("⚠️ [BOT CHAT OLLAMA] Local Ollama service offline or error:", ollamaErr.message);
+      console.warn("⚠️ [BOT CHAT OLLAMA] Ollama service error:", ollamaErr.message);
+    } finally {
+      selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
     }
 
     if (!streamedSuccessfully || !accumulatedResponseText.trim()) {

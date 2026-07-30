@@ -15,6 +15,7 @@ router.delete("/:botId", protect, botController.deleteBot);
 // Knowledge Upload & Files
 router.post("/:botId/upload", protect, botController.uploadBotFile);
 router.get("/:botId/files", protect, botController.getBotFiles);
+router.put("/:botId/files/:fileId", protect, botController.replaceBotFile);
 router.delete("/:botId/files/:fileId", protect, botController.deleteBotFile);
 
 // API Integrations
