@@ -10,7 +10,7 @@
 
 const { performance } = require("perf_hooks");
 
-// Active Jobs Registry: jobId -> { jobId, userId, userPriority, nodeId, res, abortController, getAccumulatedText, startTime }
+// Active Jobs Registry: jobId -> { jobId, userId, userPriority, nodeId, res, abortController, startTime }
 const activeJobs = new Map();
 
 /**
@@ -24,7 +24,6 @@ function registerActiveJob(jobId, jobData) {
     nodeId: jobData.nodeId,
     res: jobData.res,
     abortController: jobData.abortController,
-    getAccumulatedText: jobData.getAccumulatedText || (() => ""),
     startTime: performance.now()
   });
 }
@@ -61,29 +60,23 @@ function preemptLowerPriorityJob(incomingPriority, clusterState) {
   });
 
   const victim = candidates[0];
-  const accumulatedSoFar = typeof victim.getAccumulatedText === "function" ? victim.getAccumulatedText() : "";
 
   // Execute Preemption
   try {
     console.log(`\n⚡ =================== [PRIORITY PREEMPTION DISPATCH] ===================`);
     console.log(`  ├── 🚨 Preempted Victim Stream: User ${victim.userId} (Priority: ${victim.userPriority}) on ${victim.nodeId}`);
     console.log(`  ├── 👑 Target Incoming Request: Priority ${reqPriority}`);
-    console.log(`  └── ⚠️ Emitting Pause Notice & releasing node slot...`);
+    console.log(`  └── ⚡ Aborting lower-priority fetch stream & releasing node slot...`);
     console.log(`========================================================================\n`);
 
     // 1. Abort downstream LLM fetch stream
     victim.abortController.abort();
 
-    // 2. Write structured SSE pause notice & accumulated text to victim client
+    // 2. Write SSE pause notice to victim client
     if (victim.res && !victim.res.writableEnded) {
-      const pauseText = "\n\n⚠️ Stream paused due to higher-priority request. Click Resume.";
-      victim.res.write(`data: ${JSON.stringify({
-        type: "pause",
-        paused: true,
-        chunk: pauseText,
-        text: pauseText,
-        accumulatedText: accumulatedSoFar
-      })}\n\n`);
+      const noticeText = "\n\n⚠️ Stream paused due to higher-priority request. Click Resume.";
+      victim.res.write(`data: ${JSON.stringify({ type: "chunk", chunk: noticeText, text: noticeText, paused: true })}\n\n`);
+      victim.res.write(`data: ${JSON.stringify({ type: "pause", paused: true })}\n\n`);
       victim.res.write("data: [DONE]\n\n");
       victim.res.end();
     }
@@ -106,7 +99,7 @@ function preemptLowerPriorityJob(incomingPriority, clusterState) {
  * Attempts to find an idle node. If none are idle and an incoming high-priority request arrives,
  * preempts a lower-priority active stream to free up node capacity immediately.
  */
-function selectBestClusterNodeWithPreemption(userPriority, clusterState) {
+function selectBestClusterNodeWithPreemption(userPriority, clusterState, isFailover = false) {
   const reqPriority = Number(userPriority) || 10;
 
   // 1. Check for completely idle healthy node
@@ -115,12 +108,14 @@ function selectBestClusterNodeWithPreemption(userPriority, clusterState) {
     return idleNode;
   }
 
-  // 2. If server nodes are busy, attempt preemption of lower-priority jobs
-  const preemptedVictim = preemptLowerPriorityJob(reqPriority, clusterState);
-  if (preemptedVictim) {
-    const freedNode = clusterState.find(n => n.id === preemptedVictim.nodeId && !n.status.startsWith("OFFLINE"));
-    if (freedNode) {
-      return freedNode;
+  // 2. If server nodes are busy and NOT in failover mode, attempt preemption of lower-priority jobs
+  if (!isFailover) {
+    const preemptedVictim = preemptLowerPriorityJob(reqPriority, clusterState);
+    if (preemptedVictim) {
+      const freedNode = clusterState.find(n => n.id === preemptedVictim.nodeId && !n.status.startsWith("OFFLINE"));
+      if (freedNode) {
+        return freedNode;
+      }
     }
   }
 

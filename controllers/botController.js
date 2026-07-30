@@ -993,9 +993,6 @@ exports.sendBotChatMessage = async (req, res) => {
     const selectedNode = selectBestClusterNode(userPriority);
     selectedNode.activeRequests++;
 
-    let accumulatedResponseText = req.body.accumulatedText || "";
-    let streamedSuccessfully = false;
-
     const abortController = new AbortController();
     const jobId = `bot_${botId}_${Date.now()}`;
     registerActiveJob(jobId, {
@@ -1003,8 +1000,7 @@ exports.sendBotChatMessage = async (req, res) => {
       userPriority,
       nodeId: selectedNode.id,
       res,
-      abortController,
-      getAccumulatedText: () => accumulatedResponseText
+      abortController
     });
 
     const targetModel = (bot.model && !/^(gpt-4|gpt-3|claude)/i.test(bot.model)) 
@@ -1015,13 +1011,6 @@ exports.sendBotChatMessage = async (req, res) => {
     const ollamaMessages = [
       { role: "system", content: systemPrompt }
     ];
-
-    if (req.body.isResume && req.body.accumulatedText) {
-      ollamaMessages.push({
-        role: "system",
-        content: `Resumption Directive: You were previously generating a response that was paused mid-sentence. Continue generating seamlessly starting AFTER the text below. DO NOT repeat any text already written.\n\nAlready Written:\n"${req.body.accumulatedText}"`
-      });
-    }
 
     if (conversation.conversationSummary && conversation.conversationSummary.trim()) {
       ollamaMessages.push({
@@ -1038,6 +1027,9 @@ exports.sendBotChatMessage = async (req, res) => {
     });
 
     ollamaMessages.push({ role: "user", content: message });
+
+    let accumulatedResponseText = "";
+    let streamedSuccessfully = false;
 
     llmRequestStartTime = performance.now();
 
@@ -1065,13 +1057,17 @@ exports.sendBotChatMessage = async (req, res) => {
 
       // Failover to secondary node if primary node request fails
       if (!ollamaRes.ok) {
-        console.warn(`⚠️ [BOT CLUSTER FAILOVER] ${selectedNode.id} HTTP ${ollamaRes.status}. Attempting secondary node failover...`);
-        const fallbackNode = clusterState.find(n => n.id !== selectedNode.id);
-        if (fallbackNode) {
+        console.warn(`⚠️ [BOT CLUSTER FAILOVER] ${selectedNode.id} HTTP ${ollamaRes.status}. Attempting preemption-aware fallback node resolution...`);
+        const fallbackNode = selectBestClusterNodeWithPreemption(userPriority, clusterState, true);
+        if (fallbackNode && fallbackNode.id !== selectedNode.id) {
           const fallbackPath = fallbackNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
           ollamaRes = await fetch(`${fallbackNode.url}${fallbackPath}`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": "Mozilla/5.0",
+              "X-Requested-With": "XMLHttpRequest"
+            },
             body: JSON.stringify({
               model: fallbackNode.defaultModel,
               messages: ollamaMessages,
@@ -1128,6 +1124,9 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     if (!streamedSuccessfully || !accumulatedResponseText.trim()) {
+      if (abortController.signal.aborted || res.writableEnded) {
+        return;
+      }
       if (!ragResult.isFound) {
         accumulatedResponseText = "I couldn't find information about that in the uploaded knowledge base.";
       } else {

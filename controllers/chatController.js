@@ -279,17 +279,6 @@ CRITICAL INSTRUCTIONS:
     const selectedNode = selectBestClusterNode(userPriority);
     selectedNode.activeRequests++;
 
-    let accumulatedResponseText = req.body.accumulatedText || "";
-    let streamedSuccessfully = false;
-
-    // Handle Stream Continuation Resumption if request was paused
-    if (req.body.isResume && req.body.accumulatedText) {
-      historyPayload.push({
-        role: "system",
-        content: `Resumption Directive: You were previously generating a response that was paused mid-sentence. Continue generating seamlessly starting AFTER the text below. DO NOT repeat any text already written.\n\nAlready Written:\n"${req.body.accumulatedText}"`
-      });
-    }
-
     const abortController = new AbortController();
     const jobId = `general_${chatId}_${Date.now()}`;
     registerActiveJob(jobId, {
@@ -297,8 +286,7 @@ CRITICAL INSTRUCTIONS:
       userPriority,
       nodeId: selectedNode.id,
       res,
-      abortController,
-      getAccumulatedText: () => accumulatedResponseText
+      abortController
     });
 
     const OLLAMA_BASE_URL = selectedNode.url;
@@ -313,10 +301,12 @@ CRITICAL INSTRUCTIONS:
     console.log(`Target User Tier Priority: ${userPriority}`);
     console.log(`Target Model: ${targetModel}`);
     console.log(`Chat ID: ${chatId}`);
-    console.log(`Is Continuation Resume: ${!!req.body.isResume}`);
     console.log(`Payload Message Count: ${historyPayload.length}`);
     console.log(`Current User Prompt: "${message}"`);
     console.log(`========================================================================\n`);
+
+    let accumulatedResponseText = "";
+    let streamedSuccessfully = false;
 
     llmRequestStartTime = performance.now();
 
@@ -345,18 +335,24 @@ CRITICAL INSTRUCTIONS:
 
       // FALLBACK FAILOVER ROUTING IF PRIMARY NODE IS BUSY/OFFLINE
       if (!response.ok) {
-        console.warn(`⚠️ [CLUSTER FAILOVER] ${selectedNode.id} HTTP ${response.status}. Attempting secondary node failover...`);
-        const fallbackNode = clusterState.find(n => n.id !== selectedNode.id);
-        if (fallbackNode) {
+        console.warn(`⚠️ [CLUSTER FAILOVER] ${selectedNode.id} HTTP ${response.status}. Attempting preemption-aware fallback node resolution...`);
+        const fallbackNode = selectBestClusterNodeWithPreemption(userPriority, clusterState, true);
+        if (fallbackNode && fallbackNode.id !== selectedNode.id) {
           const fallbackPath = fallbackNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
           response = await fetch(`${fallbackNode.url}${fallbackPath}`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": "Mozilla/5.0",
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "application/json, text/event-stream"
+            },
             body: JSON.stringify({
               model: fallbackNode.defaultModel,
               messages: historyPayload,
               stream: true
-            })
+            }),
+            signal: abortController.signal
           });
         }
       }
@@ -439,6 +435,9 @@ CRITICAL INSTRUCTIONS:
     }
 
     if (!streamedSuccessfully) {
+      if (abortController.signal.aborted || res.writableEnded) {
+        return;
+      }
       console.warn("⚠️ [OLLAMA OFFLINE NOTICE] Ollama request failed or returned empty content.");
       const fallbackText = "I'm unable to connect to the local AI model right now. Please check that your Ollama service is running and accessible.";
       await streamTextInChunks(res, fallbackText, 15);
