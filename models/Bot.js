@@ -65,8 +65,7 @@ const botSchema = new mongoose.Schema(
       sparse: true
     },
     keyCreatedAt: {
-      type: Date,
-      default: Date.now
+      type: Date
     },
     keyLastUsedAt: {
       type: Date
@@ -76,18 +75,5 @@ const botSchema = new mongoose.Schema(
     timestamps: true
   }
 );
-
-botSchema.pre("save", function (next) {
-  const crypto = require("crypto");
-  if (!this.apiKey) {
-    this.apiKey = `bot_pk_${crypto.randomBytes(16).toString("hex")}`;
-  }
-  if (!this.secretKey) {
-    this.secretKey = `bot_sk_${crypto.randomBytes(24).toString("hex")}`;
-  }
-  if (typeof next === "function") {
-    next();
-  }
-});
 
 module.exports = mongoose.model("Bot", botSchema);

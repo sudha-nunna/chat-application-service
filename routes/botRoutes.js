@@ -12,13 +12,9 @@ router.get("/:botId", protect, botController.getBotById);
 router.put("/:botId", protect, botController.updateBot);
 router.delete("/:botId", protect, botController.deleteBot);
 
-// Bot API Key & Secret Key Routes
-router.post("/:botId/keys/generate", protect, botController.generateBotKeys);
-router.post("/:botId/keys", protect, botController.generateBotKeys);
-router.get("/:botId/keys", protect, botController.getBotKeys);
-router.get("/:botId/keys/generate", protect, botController.getBotKeys);
-router.delete("/:botId/keys", protect, botController.revokeBotKeys);
-router.post("/:botId/keys/rotate", protect, botController.rotateBotKeys);
+// Bot API Key & Secret Key Management (Production Standard)
+router.get("/:botId/keys", protect, botController.getBotKeys);                // GET Bot Keys
+router.post("/:botId/keys/generate", protect, botController.generateBotKeys);  // POST Generate & Regenerate Keys
 
 // Knowledge Upload & Files
 router.post("/:botId/upload", protect, botController.uploadBotFile);
