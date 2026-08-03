@@ -13,84 +13,130 @@ const MODEL_CACHE_TTL_MS = 10 * 60 * 1000;
  * Returns array of configured cluster nodes with active state tracking
  */
 function getClusterNodes() {
-  const node1Url = process.env.OLLAMA_HOST_URL
-    ? process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "")
-    : "https://queen-syndication-reputation-leg.trycloudflare.com";
-
-  const node2Url = process.env.OLLAMA_NODE_2
-    ? process.env.OLLAMA_NODE_2.trim().replace(/\/$/, "")
-    : "https://protecting-andale-june-butterfly.trycloudflare.com";
-
-  return [
-    {
-      id: "Node-1",
-      name: "Primary Cluster Node",
-      url: node1Url,
-      defaultModel: process.env.OLLAMA_MODEL || "qwen2.5:1.5b",
-      format: "ollama", // /api/chat
-      status: "HEALTHY",
-      activeRequests: 0,
-      lastLatencyMs: 0
-    },
-    {
-      id: "Node-2",
-      name: "Secondary Cluster Node",
-      url: node2Url,
-      defaultModel: process.env.OLLAMA_NODE_2_MODEL || "ggml-org/gemma-3-4b-it-qat-GGUF",
-      format: "openai", // /v1/chat/completions
-      status: "HEALTHY",
-      activeRequests: 0,
-      lastLatencyMs: 0
-    }
-  ];
+  return [];
 }
 
 // In-memory persistent state across requests
-const clusterState = getClusterNodes();
+let clusterState = [];
+
+/**
+ * Fetches active AI server nodes strictly from MongoDB (ServerNode collection).
+ */
+async function refreshClusterNodesFromDB() {
+  try {
+    const ServerNode = require("../models/ServerNode");
+    const { decrypt } = require("./encryption");
+    const dbNodes = await ServerNode.find({ isActive: true }).sort({ priority: -1, createdAt: 1 });
+
+    if (dbNodes && dbNodes.length > 0) {
+      const activeMap = new Map(clusterState.map(n => [n.id, n.activeRequests]));
+
+      const freshNodes = dbNodes.map((n) => {
+        const rawSecretKey = n.secretKey ? decrypt(n.secretKey) : "";
+        let nodeUrl = n.url.trim().replace(/\/$/, "");
+        let nodeFormat = (n.format || "openai").toLowerCase();
+        let defaultModel = n.defaultModel || "llama3.2:3b";
+
+        // Auto-fix Gemini node properties if URL or model or key indicates Google Gemini
+        const isGeminiNode = nodeUrl.includes("googleapis.com") || nodeFormat === "gemini" || defaultModel.includes("gemini") || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
+
+        if (isGeminiNode) {
+          nodeFormat = "gemini";
+          nodeUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-1.5-flash") {
+            defaultModel = "gemini-2.5-flash";
+          }
+          // Self-heal MongoDB record if it was saved with ollama format or old model by mistake
+          if (n.format !== "gemini" || n.url !== nodeUrl || n.defaultModel !== defaultModel) {
+            ServerNode.findByIdAndUpdate(n._id, { format: "gemini", url: nodeUrl, defaultModel }).catch(() => { });
+          }
+        }
+
+        return {
+          id: String(n._id),
+          name: n.name,
+          url: nodeUrl,
+          secretKey: rawSecretKey,
+          defaultModel,
+          format: nodeFormat,
+          status: n.status || "UNTESTED",
+          activeRequests: activeMap.get(String(n._id)) || 0,
+          lastLatencyMs: n.lastLatencyMs || 0
+        };
+      });
+
+      clusterState.length = 0;
+      freshNodes.forEach(fn => clusterState.push(fn));
+      return clusterState;
+    } else {
+      clusterState.length = 0;
+    }
+  } catch (err) {
+    console.warn("⚠️ [OLLAMA HELPER] Error loading server nodes from DB:", err.message);
+  }
+  return clusterState;
+}
 
 const getOllamaBaseUrl = () => {
-  if (process.env.OLLAMA_HOST_URL) {
-    return process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "");
+  if (clusterState.length > 0) {
+    return clusterState[0].url;
   }
-  return clusterState[0].url;
+  return "";
 };
 
 /**
- * Checks health of all cluster nodes and dynamically updates URLs/models from process.env
+ * Checks health of all cluster nodes with AbortSignal timeout and syncs status to DB
  */
 async function checkClusterHealth() {
-  // Sync node URLs and default models from process.env dynamically
-  if (process.env.OLLAMA_HOST_URL) {
-    clusterState[0].url = process.env.OLLAMA_HOST_URL.trim().replace(/\/$/, "");
-  }
-  if (process.env.OLLAMA_MODEL) {
-    clusterState[0].defaultModel = process.env.OLLAMA_MODEL.trim();
-  }
+  await refreshClusterNodesFromDB();
 
-  if (process.env.OLLAMA_NODE_2) {
-    clusterState[1].url = process.env.OLLAMA_NODE_2.trim().replace(/\/$/, "");
-  }
-  if (process.env.OLLAMA_NODE_2_MODEL) {
-    clusterState[1].defaultModel = process.env.OLLAMA_NODE_2_MODEL.trim();
-  }
+  console.log("\n🌐 =================== [AI CLUSTER HEALTH MONITOR] ===================");
 
-  console.log("\n🌐 =================== [OLLAMA CLUSTER HEALTH MONITOR] ===================");
+  const ServerNode = require("../models/ServerNode");
 
   for (const node of clusterState) {
     const tStart = performance.now();
     try {
-      if (node.format === "ollama") {
-        const res = await fetch(`${node.url}/api/tags`, { headers: { "Accept": "application/json" } });
-        node.lastLatencyMs = Number((performance.now() - tStart).toFixed(2));
-        node.status = res.ok ? "HEALTHY" : `UNHEALTHY (HTTP ${res.status})`;
+      let pingUrl;
+      const headers = { "Accept": "application/json" };
+      const rawSecretKey = node.secretKey || "";
+
+      if (node.format === "gemini" || node.url.includes("googleapis.com")) {
+        const apiKey = rawSecretKey || process.env.GEMINI_API_KEY || "";
+        pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+      } else if (node.format === "openai" || node.url.includes("trycloudflare.com") || node.url.includes("openai.com")) {
+        pingUrl = `${node.url}/v1/models`;
+        if (rawSecretKey) {
+          headers["Authorization"] = `Bearer ${rawSecretKey}`;
+          headers["X-Internal-Secret"] = rawSecretKey;
+        }
       } else {
-        const res = await fetch(`${node.url}/v1/models`, { headers: { "Accept": "application/json" } });
-        node.lastLatencyMs = Number((performance.now() - tStart).toFixed(2));
-        node.status = res.ok ? "HEALTHY" : `UNHEALTHY (HTTP ${res.status})`;
+        pingUrl = `${node.url}/api/tags`;
+        if (rawSecretKey) {
+          headers["Authorization"] = `Bearer ${rawSecretKey}`;
+          headers["X-Internal-Secret"] = rawSecretKey;
+        }
       }
+
+      const res = await fetch(pingUrl, {
+        headers,
+        signal: AbortSignal.timeout(3500)
+      });
+      node.lastLatencyMs = Number((performance.now() - tStart).toFixed(2));
+      node.status = res.ok ? "HEALTHY" : `UNHEALTHY (HTTP ${res.status})`;
     } catch (err) {
       node.lastLatencyMs = Number((performance.now() - tStart).toFixed(2));
       node.status = `OFFLINE (${err.message})`;
+    }
+
+    // Persist live status and latency back to MongoDB if it's a DB node
+    if (node.id && node.id.length === 24) {
+      try {
+        await ServerNode.findByIdAndUpdate(node.id, {
+          status: node.status,
+          lastLatencyMs: node.lastLatencyMs
+        });
+      } catch (e) { }
     }
 
     const icon = node.status.startsWith("HEALTHY") ? "🟢" : "⚠️";
@@ -163,5 +209,6 @@ module.exports = {
   warmOllamaConnection,
   clusterState,
   selectBestClusterNode,
-  checkClusterHealth
+  checkClusterHealth,
+  refreshClusterNodesFromDB
 };

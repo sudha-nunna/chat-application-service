@@ -18,11 +18,16 @@ router.get("/:botId/files", protect, botController.getBotFiles);
 router.put("/:botId/files/:fileId", protect, botController.replaceBotFile);
 router.delete("/:botId/files/:fileId", protect, botController.deleteBotFile);
 
-// API Integrations
+// API Integrations & Postman Collections
 router.post("/:botId/apis", protect, botController.createBotApi);
 router.get("/:botId/apis", protect, botController.getBotApis);
+router.put("/:botId/apis/:apiId", protect, botController.updateBotApi);
 router.delete("/:botId/apis/:apiId", protect, botController.deleteBotApi);
 router.post("/:botId/apis/:apiId/test", protect, botController.testBotApi);
+router.post("/:botId/postman-import", protect, botController.importPostmanCollection);
+router.get("/:botId/postman-apis", protect, botController.getPostmanApis);
+router.put("/:botId/postman-apis/:apiId", protect, botController.updatePostmanApi);
+router.delete("/:botId/postman-apis/:apiId", protect, botController.deletePostmanApi);
 
 // RAG Bot Chat & Conversations
 router.post("/:botId/chat", protect, botController.sendBotChatMessage);

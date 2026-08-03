@@ -602,6 +602,34 @@ exports.deleteBotApi = async (req, res) => {
   }
 };
 
+exports.updateBotApi = async (req, res) => {
+  try {
+    const { botId, apiId } = req.params;
+    const { name, url, method, authType, apiKey } = req.body;
+
+    const apiItem = await BotApi.findOne({
+      _id: apiId,
+      botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+    if (!apiItem) {
+      return res.status(404).json({ error: "API integration not found or unauthorized." });
+    }
+
+    if (name) apiItem.name = name.trim();
+    if (url) apiItem.url = url.trim();
+    if (method) apiItem.method = method;
+    if (authType) apiItem.authType = authType;
+    if (apiKey) apiItem.encryptedApiKey = encrypt(apiKey);
+
+    await apiItem.save();
+    return res.json({ success: true, message: "API integration updated successfully.", api: apiItem });
+  } catch (err) {
+    console.error("Update Bot API error:", err);
+    return res.status(500).json({ error: "Failed to update API integration." });
+  }
+};
+
 exports.testBotApi = async (req, res) => {
   try {
     const { botId, apiId } = req.params;
@@ -904,8 +932,12 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     // Greeting & Conversational Quick Handler
-    if (/^(hi|hello|hey|greetings|howdy|good morning|good evening|hi there|hello there)$/i.test(message.trim())) {
-      const greetingMsg = `Hello! I am ${bot.name}. How can I assist you today?`;
+    // Intent classification via Smart Intent Router
+    const intent = detectBotIntent(message, bot.knowledgeSummary);
+
+    if (intent === "GREETING") {
+      const botName = bot.name || "AI Assistant";
+      const greetingMsg = `Hello! I'm ${botName}. How can I assist you today? Feel free to ask general questions or inquiries related to our documentation and connected APIs.`;
       await streamTextInChunks(res, greetingMsg, 15);
 
       await BotMessage.create({
@@ -928,23 +960,28 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
-    // Multi-tenant Isolated Knowledge Retrieval
-    const tRagStart = performance.now();
-    const ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
-    ragSearchTime = performance.now() - tRagStart;
+    const isGeneralQuery = (intent === "GENERAL_QUERY");
+    let ragResult = { isFound: true, chunks: [] };
 
-    if (ragResult.debug) {
-      console.log("🧠 [RAG DEBUG]", {
-        userId: req.user.id,
-        botId,
-        message,
-        reason: ragResult.reason || "ACCEPTED",
-        metadataMatch: ragResult.metadataMatch || false,
-        debug: ragResult.debug
-      });
+    if (!isGeneralQuery) {
+      // Multi-tenant Isolated Knowledge Retrieval for Document / API questions
+      const tRagStart = performance.now();
+      ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
+      ragSearchTime = performance.now() - tRagStart;
+
+      if (ragResult.debug) {
+        console.log("🧠 [RAG DEBUG]", {
+          userId: req.user.id,
+          botId,
+          message,
+          reason: ragResult.reason || "ACCEPTED",
+          metadataMatch: ragResult.metadataMatch || false,
+          debug: ragResult.debug
+        });
+      }
     }
 
-    const sourcesMeta = ragResult.isFound
+    const sourcesMeta = ragResult.isFound && ragResult.chunks.length > 0
       ? ragResult.chunks.map(c => ({ fileName: c.fileName, snippet: c.snippet.substring(0, 100) + "..." }))
       : [];
 
@@ -952,8 +989,8 @@ exports.sendBotChatMessage = async (req, res) => {
       res.write(`data: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
     }
 
-    // Strict Out-of-Scope Fallback Rule using Bot Name
-    if (!ragResult.isFound) {
+    // Strict Out-of-Scope Fallback Rule for document queries when no chunks match
+    if (!isGeneralQuery && !ragResult.isFound) {
       const outOfScopeMsg = "I couldn't find information about that topic in the available documentation. My strongest answers come from the uploaded knowledge base. If your question relates to the documented topics, I'll be happy to help.";
       await streamTextInChunks(res, outOfScopeMsg, 15);
 
@@ -980,9 +1017,8 @@ exports.sendBotChatMessage = async (req, res) => {
     // Build grounded RAG system prompt
     const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
 
-    const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
+    const aiGateway = require("../utils/aiGateway");
     const { calculatePriority } = require("../utils/priorityCalculator");
-    const { registerActiveJob, unregisterActiveJob } = require("../utils/priorityDispatcher");
     const User = require("../models/User");
 
     const userId = req.user?.id || req.user?._id;
@@ -990,24 +1026,10 @@ exports.sendBotChatMessage = async (req, res) => {
     const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
     const userPriority = await calculatePriority(userPlan);
 
-    const selectedNode = selectBestClusterNode(userPriority);
-    selectedNode.activeRequests++;
-
-    const abortController = new AbortController();
     const jobId = `bot_${botId}_${Date.now()}`;
-    registerActiveJob(jobId, {
-      userId: req.user.id,
-      userPriority,
-      nodeId: selectedNode.id,
-      res,
-      abortController
-    });
+    const targetModel = bot.model || "best";
 
-    const targetModel = (bot.model && !/^(gpt-4|gpt-3|claude)/i.test(bot.model)) 
-      ? bot.model 
-      : selectedNode.defaultModel;
-
-    // Construct clean, non-duplicative messages array for Ollama Chat API
+    // Construct clean, non-duplicative messages array for AI Gateway
     const ollamaMessages = [
       { role: "system", content: systemPrompt }
     ];
@@ -1028,103 +1050,29 @@ exports.sendBotChatMessage = async (req, res) => {
 
     ollamaMessages.push({ role: "user", content: message });
 
-    let accumulatedResponseText = "";
-    let streamedSuccessfully = false;
-
     llmRequestStartTime = performance.now();
 
-    try {
-      const endpointPath = selectedNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
-      const requestPayload = {
-        model: targetModel,
-        messages: ollamaMessages,
-        stream: true
-      };
-      if (selectedNode.format === "ollama") {
-        requestPayload.keep_alive = "24h";
-      }
-
-      let ollamaRes = await fetch(`${selectedNode.url}${endpointPath}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0",
-          "X-Requested-With": "XMLHttpRequest"
-        },
-        body: JSON.stringify(requestPayload),
-        signal: abortController.signal
-      });
-
-      // Failover to secondary node if primary node request fails
-      if (!ollamaRes.ok) {
-        console.warn(`⚠️ [BOT CLUSTER FAILOVER] ${selectedNode.id} HTTP ${ollamaRes.status}. Attempting preemption-aware fallback node resolution...`);
-        const fallbackNode = selectBestClusterNodeWithPreemption(userPriority, clusterState, true);
-        if (fallbackNode && fallbackNode.id !== selectedNode.id) {
-          const fallbackPath = fallbackNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
-          ollamaRes = await fetch(`${fallbackNode.url}${fallbackPath}`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0",
-              "X-Requested-With": "XMLHttpRequest"
-            },
-            body: JSON.stringify({
-              model: fallbackNode.defaultModel,
-              messages: ollamaMessages,
-              stream: true
-            }),
-            signal: abortController.signal
-          });
+    const gatewayResult = await aiGateway.generateStream({
+      provider: "auto",
+      model: targetModel,
+      messages: ollamaMessages,
+      res,
+      userPriority,
+      jobId,
+      userId: req.user.id,
+      onToken: () => {
+        if (!firstTokenTimestamp) {
+          firstTokenTimestamp = performance.now();
+          ttft = firstTokenTimestamp - llmRequestStartTime;
         }
       }
+    });
 
-      if (ollamaRes.ok && ollamaRes.body) {
-        const reader = ollamaRes.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let lineBuffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunkStr = decoder.decode(value, { stream: true });
-          lineBuffer += chunkStr;
-
-          const lines = lineBuffer.split("\n");
-          lineBuffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            const jsonStr = trimmed.startsWith("data: ") ? trimmed.replace("data: ", "").trim() : trimmed;
-            if (jsonStr === "[DONE]") continue;
-
-            try {
-              const parsed = JSON.parse(jsonStr);
-              const chunkText = parsed.message?.content || parsed.response || parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
-              if (chunkText) {
-                if (!firstTokenTimestamp) {
-                  firstTokenTimestamp = performance.now();
-                  ttft = firstTokenTimestamp - llmRequestStartTime;
-                }
-                accumulatedResponseText += chunkText;
-                res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
-              }
-            } catch (e) { }
-          }
-        }
-        streamedSuccessfully = true;
-      }
-    } catch (ollamaErr) {
-      console.warn("⚠️ [BOT CHAT OLLAMA] Ollama service error:", ollamaErr.message);
-    } finally {
-      unregisterActiveJob(jobId);
-      selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
-    }
+    let accumulatedResponseText = gatewayResult.text || "";
+    let streamedSuccessfully = gatewayResult.success;
 
     if (!streamedSuccessfully || !accumulatedResponseText.trim()) {
-      if (abortController.signal.aborted || res.writableEnded) {
+      if (res.writableEnded) {
         return;
       }
       if (!ragResult.isFound) {
@@ -1236,5 +1184,119 @@ exports.getBotMessages = async (req, res) => {
     return res.json(messages);
   } catch (err) {
     return res.status(500).json({ error: "Failed to fetch bot messages." });
+  }
+};
+
+exports.importPostmanCollection = async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const { collectionJson, collectionName } = req.body;
+    const userId = req.user?.id || req.user?._id || req.user?.userId;
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId }, { ownerId: userId }]
+    }) || await Bot.findById(botId);
+
+    if (!bot) {
+      return res.status(404).json({ success: false, message: "Bot not found or unauthorized." });
+    }
+
+    const { parsePostmanCollection } = require("../utils/postmanParser");
+    const parseResult = parsePostmanCollection(collectionJson);
+
+    if (!parseResult.success || parseResult.endpoints.length === 0) {
+      return res.status(400).json({ success: false, message: parseResult.error || "Failed to parse Postman Collection JSON." });
+    }
+
+    const PostmanApi = require("../models/PostmanApi");
+    const savedApis = [];
+
+    for (const ep of parseResult.endpoints) {
+      const created = await PostmanApi.create({
+        botId,
+        ownerId: bot.ownerId || userId,
+        userId: userId || bot.userId,
+        collectionName: ep.collectionName || collectionName || parseResult.collectionName || "Postman Collection",
+        name: ep.name,
+        method: ep.method,
+        url: ep.url,
+        headers: ep.headers || [],
+        queryParams: ep.queryParams || [],
+        body: ep.body || {},
+        description: ep.description || "",
+        tags: ep.tags || []
+      });
+      savedApis.push(created);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Successfully imported ${savedApis.length} API endpoints from Postman collection "${parseResult.collectionName}".`,
+      count: savedApis.length,
+      endpoints: savedApis
+    });
+  } catch (err) {
+    console.error("Postman import error:", err);
+    return res.status(500).json({ success: false, message: "Failed to import Postman collection.", error: err.message });
+  }
+};
+
+exports.getPostmanApis = async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const PostmanApi = require("../models/PostmanApi");
+    const apis = await PostmanApi.find({ botId }).sort({ createdAt: -1 });
+
+    return res.json({ success: true, count: apis.length, apis });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: "Failed to fetch Postman APIs." });
+  }
+};
+
+exports.deletePostmanApi = async (req, res) => {
+  try {
+    const { botId, apiId } = req.params;
+    const PostmanApi = require("../models/PostmanApi");
+    const deleted = await PostmanApi.findOneAndDelete({
+      _id: apiId,
+      botId
+    });
+
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "Postman API not found." });
+    }
+
+    return res.json({ success: true, message: "Postman API deleted successfully." });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: "Failed to delete Postman API." });
+  }
+};
+
+exports.updatePostmanApi = async (req, res) => {
+  try {
+    const { botId, apiId } = req.params;
+    const { name, url, method, description } = req.body;
+
+    const PostmanApi = require("../models/PostmanApi");
+    const pApi = await PostmanApi.findOne({
+      _id: apiId,
+      botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!pApi) {
+      return res.status(404).json({ success: false, message: "Postman API not found or unauthorized." });
+    }
+
+    if (name) pApi.name = name.trim();
+    if (url) pApi.url = url.trim();
+    if (method) pApi.method = method.toUpperCase();
+    if (description !== undefined) pApi.description = description;
+
+    await pApi.save();
+    return res.json({ success: true, message: "Postman API updated successfully.", api: pApi });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: "Failed to update Postman API." });
   }
 };

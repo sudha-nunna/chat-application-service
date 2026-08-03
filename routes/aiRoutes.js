@@ -18,10 +18,21 @@ router.post("/message/:chatId", protect, chatController.sendMessage);
 // Live Cluster Node Health & Load Diagnostics Route
 router.get("/cluster-status", protect, async (req, res) => {
   await checkClusterHealth();
+
+  // Sanitize nodes for public user response (strictly omit url and secretKey)
+  const sanitizedNodes = clusterState.map((node) => ({
+    id: node.id,
+    name: node.name,
+    defaultModel: node.defaultModel,
+    status: node.status,
+    activeRequests: node.activeRequests,
+    lastLatencyMs: node.lastLatencyMs
+  }));
+
   return res.json({
     success: true,
-    totalNodes: clusterState.length,
-    nodes: clusterState
+    totalNodes: sanitizedNodes.length,
+    nodes: sanitizedNodes
   });
 });
 

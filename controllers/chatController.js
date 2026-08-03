@@ -220,15 +220,14 @@ exports.sendMessage = async (req, res) => {
     dbFetchTime = performance.now() - tDbStart;
 
     // Unified System Instruction Block merging Core Guidelines and Conversation Summary
-    let unifiedSystemPrompt = `You are a helpful, intelligent, highly capable conversational AI assistant like ChatGPT and Gemini.
+    let unifiedSystemPrompt = `You are Allvion AI, a highly capable, articulate, and helpful conversational AI assistant.
 
-CRITICAL INSTRUCTIONS:
-- Directly, accurately, and naturally answer the user's latest question or prompt.
-- NEVER output generic filler like "That's an interesting topic..." or "There are a few different ways to approach this...".
-- Factual & Technical Queries: When asked direct questions (e.g. "What is React?", "What is Node.js?", coding, health, science), provide immediate, detailed, structured explanations.
-- Jokes: When asked for a joke, tell an actual funny joke immediately.
-- Follow-ups & Memory: Use the preceding conversation history and summary to maintain multi-turn context. When the user asks "why?", "how?", "any other reasons?", or short follow-ups, continue the previous topic seamlessly.
-- Tone: Natural, friendly, helpful, and concise.`;
+CORE BEHAVIOR RULES:
+1. Be direct, natural, engaging, and articulate—just like ChatGPT.
+2. For casual, open-ended, or greeting prompts (e.g., "tell me something", "what's up", "tell me a story"), provide an interesting, engaging, or thought-provoking answer right away, and warmly ask how you can help them today.
+3. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
+4. For technical, coding, science, or factual queries, provide detailed, accurate, beautifully formatted markdown explanations with bullet points and code blocks.
+5. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
 
     if (summaryText && summaryText.trim()) {
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
@@ -243,12 +242,13 @@ CRITICAL INSTRUCTIONS:
     ];
 
     dbMessagesHistory.forEach((msg) => {
-      // Exclude legacy connection error fallbacks to prevent LLM context contamination
+      // Exclude legacy connection error or robotic filler fallbacks to prevent LLM context contamination
       if (
         msg.role === "assistant" &&
         typeof msg.content === "string" &&
         (msg.content.includes("I am ready to help") ||
-          msg.content.includes("interesting topic") ||
+          msg.content.includes("misinterpreted my previous response") ||
+          msg.content.includes("I'm here to help and provide information") ||
           msg.content.includes("Please check that your Ollama service is running"))
       ) {
         return;
@@ -265,9 +265,8 @@ CRITICAL INSTRUCTIONS:
 
     res.write(`data: ${JSON.stringify({ type: "meta", chatId, title: chat.title })}\n\n`);
 
-    const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
+    const aiGateway = require("../utils/aiGateway");
     const { calculatePriority } = require("../utils/priorityCalculator");
-    const { registerActiveJob, unregisterActiveJob } = require("../utils/priorityDispatcher");
     const User = require("../models/User");
 
     const userId = req.user?.id || req.user?._id;
@@ -275,167 +274,58 @@ CRITICAL INSTRUCTIONS:
     const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
     const userPriority = await calculatePriority(userPlan);
 
-    const tModelStart = performance.now();
-    const selectedNode = selectBestClusterNode(userPriority);
-    selectedNode.activeRequests++;
-
-    const abortController = new AbortController();
     const jobId = `general_${chatId}_${Date.now()}`;
-    registerActiveJob(jobId, {
-      userId: req.user.id,
-      userPriority,
-      nodeId: selectedNode.id,
-      res,
-      abortController
-    });
-
-    const OLLAMA_BASE_URL = selectedNode.url;
-    const targetModel = selectedNode.defaultModel;
-    modelResolveTime = performance.now() - tModelStart;
-
-    // Logging: Ollama Request Payload
-    console.log(`\n=================== [OLLAMA CLUSTER DISPATCH REQUEST] ===================`);
-    console.log(`Dispatched Node: ${selectedNode.id} (${selectedNode.name})`);
-    console.log(`Target URL: ${selectedNode.url} (${selectedNode.format.toUpperCase()} API)`);
-    console.log(`Active Requests on Node: ${selectedNode.activeRequests}`);
-    console.log(`Target User Tier Priority: ${userPriority}`);
-    console.log(`Target Model: ${targetModel}`);
-    console.log(`Chat ID: ${chatId}`);
-    console.log(`Payload Message Count: ${historyPayload.length}`);
-    console.log(`Current User Prompt: "${message}"`);
-    console.log(`========================================================================\n`);
-
-    let accumulatedResponseText = "";
-    let streamedSuccessfully = false;
-
     llmRequestStartTime = performance.now();
 
-    try {
-      const endpointPath = selectedNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
-      const requestPayload = {
-        model: targetModel,
-        messages: historyPayload,
-        stream: true
-      };
-      if (selectedNode.format === "ollama") {
-        requestPayload.keep_alive = "24h";
-      }
-
-      let response = await fetch(`${selectedNode.url}${endpointPath}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0",
-          "X-Requested-With": "XMLHttpRequest",
-          "Accept": "application/json, text/event-stream"
-        },
-        body: JSON.stringify(requestPayload),
-        signal: abortController.signal
-      });
-
-      // FALLBACK FAILOVER ROUTING IF PRIMARY NODE IS BUSY/OFFLINE
-      if (!response.ok) {
-        console.warn(`⚠️ [CLUSTER FAILOVER] ${selectedNode.id} HTTP ${response.status}. Attempting preemption-aware fallback node resolution...`);
-        const fallbackNode = selectBestClusterNodeWithPreemption(userPriority, clusterState, true);
-        if (fallbackNode && fallbackNode.id !== selectedNode.id) {
-          const fallbackPath = fallbackNode.format === "openai" ? "/v1/chat/completions" : "/api/chat";
-          response = await fetch(`${fallbackNode.url}${fallbackPath}`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "User-Agent": "Mozilla/5.0",
-              "X-Requested-With": "XMLHttpRequest",
-              "Accept": "application/json, text/event-stream"
-            },
-            body: JSON.stringify({
-              model: fallbackNode.defaultModel,
-              messages: historyPayload,
-              stream: true
-            }),
-            signal: abortController.signal
-          });
+    const gatewayResult = await aiGateway.generateStream({
+      provider: "auto",
+      model: "best",
+      messages: historyPayload,
+      res,
+      userPriority,
+      jobId,
+      userId: req.user.id,
+      onToken: () => {
+        if (!firstTokenTimestamp) {
+          firstTokenTimestamp = performance.now();
+          ttft = firstTokenTimestamp - llmRequestStartTime;
         }
       }
+    });
 
-      console.log(`[OLLAMA HTTP RESPONSE] Status: ${response.status} ${response.statusText}`);
+    let accumulatedResponseText = gatewayResult.text || "";
+    let streamedSuccessfully = gatewayResult.success;
 
-      if (response.ok && response.body) {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let lineBuffer = "";
-        let chunkCount = 0;
+    const totalDuration = performance.now() - reqStartTime;
+    if (firstTokenTimestamp) {
+      streamDuration = performance.now() - firstTokenTimestamp;
+    }
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunkStr = decoder.decode(value, { stream: true });
-          lineBuffer += chunkStr;
-
-          const lines = lineBuffer.split("\n");
-          lineBuffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            const jsonStr = trimmed.startsWith("data: ") ? trimmed.replace("data: ", "").trim() : trimmed;
-            if (jsonStr === "[DONE]") continue;
-
-            try {
-              const parsed = JSON.parse(jsonStr);
-              const chunkText = parsed.message?.content || parsed.response || parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
-              if (chunkText) {
-                if (!firstTokenTimestamp) {
-                  firstTokenTimestamp = performance.now();
-                  ttft = firstTokenTimestamp - llmRequestStartTime;
-                }
-                accumulatedResponseText += chunkText;
-                chunkCount++;
-                res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
-              }
-            } catch (parseErr) {}
-          }
-        }
-
-        const totalDuration = performance.now() - reqStartTime;
-        if (firstTokenTimestamp) {
-          streamDuration = performance.now() - firstTokenTimestamp;
-        }
-
-        console.log(`
+    console.log(`
 ⏱️  =================== [GENERAL CHAT LATENCY DIAGNOSTICS] ===================
   📌 Route: General Chat Stream (/chats/${chatId}/messages)
-  ├── 🌐 Dispatched Cluster Node:       ${selectedNode.id} (${selectedNode.name})
+  ├── 🌐 Dispatched Cluster Node:       ${gatewayResult.nodeId || "Auto"}
   ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
-  ├── 🔎 Model & Node Discovery:        ${modelResolveTime.toFixed(2)} ms
-  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A (Ollama Delay/Error)'}
+  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'}
   ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
   └── 🏁 TOTAL REQUEST DURATION:        ${totalDuration.toFixed(2)} ms
 ========================================================================\n
 `);
 
-        if (accumulatedResponseText.trim()) {
-          streamedSuccessfully = true;
-          await Message.create({
-            chatId,
-            role: "assistant",
-            content: accumulatedResponseText,
-          });
+    if (accumulatedResponseText.trim()) {
+      streamedSuccessfully = true;
+      await Message.create({
+        chatId,
+        role: "assistant",
+        content: accumulatedResponseText,
+      });
 
-          res.write("data: [DONE]\n\n");
-          return res.end();
-        }
-      }
-    } catch (ollamaErr) {
-      console.error("CRITICAL: Ollama cluster connection error:", ollamaErr.message);
-    } finally {
-      unregisterActiveJob(jobId);
-      selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
+      res.write("data: [DONE]\n\n");
+      return res.end();
     }
 
     if (!streamedSuccessfully) {
-      if (abortController.signal.aborted || res.writableEnded) {
+      if (res.writableEnded) {
         return;
       }
       console.warn("⚠️ [OLLAMA OFFLINE NOTICE] Ollama request failed or returned empty content.");

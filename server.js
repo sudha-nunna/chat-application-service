@@ -11,6 +11,7 @@ const authRoutes = require("./routes/authRoutes");
 const botRoutes = require("./routes/botRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const planRoutes = require("./routes/planRoutes");
+const adminRoutes = require("./routes/adminRoutes");
 const seedPlans = require("./utils/planSeeder");
 const { warmOllamaConnection } = require("./utils/ollamaHelper");
 
@@ -20,11 +21,10 @@ connectDB().then(() => {
 
 const app = express();
 
-const allowedOrigins = [
-  "http://localhost:5173",
-  "https://chat-application-app-gold.vercel.app",
-  process.env.CLIENT_URL
-].filter(Boolean);
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || "")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .filter(Boolean);
 
 app.use(cors({
   origin: allowedOrigins,
@@ -40,6 +40,7 @@ app.use("/ollama", ollamaRoutes);
 app.use("/bots", botRoutes);
 app.use("/subscription", subscriptionRoutes);
 app.use("/plans", planRoutes);
+app.use("/admin", adminRoutes);
 
 app.get("/", (req, res) => {
   res.send("Server Running");
