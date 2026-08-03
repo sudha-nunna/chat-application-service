@@ -73,11 +73,24 @@ class AIGateway {
    * Streams response from local Ollama Cluster with Load Balancing & Preemption Support
    */
   async _streamOllamaCluster({ model, customUrl, messages, res, userPriority, jobId, userId, onToken }) {
-    const selectedNode = selectBestClusterNode(userPriority);
-    selectedNode.activeRequests++;
+    let selectedNode = clusterState[0] || { id: "default", name: "Default Node", activeRequests: 0 };
+    const triedNodeIds = new Set();
+    let response = null;
+    let errorMessage = "";
+    let streamedSuccessfully = false;
+    let accumulatedResponseText = "";
+    let ttft = 0;
+    let firstTokenTimestamp = null;
+    const llmStartTime = performance.now();
 
     const abortController = new AbortController();
     const activeJobId = jobId || `job_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0",
+      "X-Requested-With": "XMLHttpRequest",
+      "Accept": "application/json, text/event-stream"
+    };
 
     registerActiveJob(activeJobId, {
       userId,
@@ -87,131 +100,128 @@ class AIGateway {
       abortController
     });
 
-    let targetModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model))
-      ? model
-      : selectedNode.defaultModel;
+    // Multi-Node Failover Loop: Tries candidate healthy nodes until HTTP 200 OK is received
+    while (triedNodeIds.size < clusterState.length) {
+      const candidateNodes = clusterState.filter(n => !triedNodeIds.has(n.id) && !n.status.startsWith("OFFLINE"));
+      if (candidateNodes.length === 0) break;
 
-    const isGeminiNode = selectedNode.format === "gemini" || selectedNode.url.includes("googleapis.com");
-    if (isGeminiNode) {
-      if (!targetModel || targetModel === "llama3.2:3b" || targetModel === "gemini-1.5-flash" || targetModel === "gemini-1.5") {
-        targetModel = "gemini-2.5-flash";
+      // Select candidate node with lowest active task count
+      candidateNodes.sort((a, b) => a.activeRequests - b.activeRequests);
+      const currentNode = candidateNodes[0];
+      triedNodeIds.add(currentNode.id);
+      currentNode.activeRequests++;
+
+      const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
+      let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
+      if (isCurrentGemini) {
+        currentModel = "gemini-2.0-flash";
+      }
+
+      const nodeUrl = customUrl ? customUrl.trim().replace(/\/$/, "") : currentNode.url;
+      const isCloudOrOpenAI = currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("trycloudflare.com");
+
+      let currentPath;
+      if (isCurrentGemini) {
+        currentPath = nodeUrl.endsWith("/openai") ? "/chat/completions" : "/v1/chat/completions";
+      } else if (isCloudOrOpenAI) {
+        currentPath = "/v1/chat/completions";
+      } else {
+        currentPath = "/api/chat";
+      }
+
+      const nodeHeaders = { ...headers };
+      if (currentNode.secretKey) {
+        nodeHeaders["Authorization"] = `Bearer ${currentNode.secretKey}`;
+        nodeHeaders["X-Internal-Secret"] = currentNode.secretKey;
+      }
+
+      const payload = { model: currentModel, messages, stream: true };
+      if (currentNode.format === "ollama") payload.keep_alive = "24h";
+
+      try {
+        console.log(`🚀 [AI GATEWAY DISPATCH] Attempting Node: ${currentNode.name} (${currentNode.id}) | Path: ${currentPath} | Model: ${currentModel}`);
+        response = await fetch(`${nodeUrl}${currentPath}`, {
+          method: "POST",
+          headers: nodeHeaders,
+          body: JSON.stringify(payload),
+          signal: abortController.signal
+        });
+
+        if (response.ok) {
+          selectedNode = currentNode;
+          break; // Success! Exit failover loop and stream response
+        } else {
+          console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} (${currentNode.id}) returned HTTP ${response.status}. Trying next available server node...`);
+          if (response.status === 429) {
+            errorMessage = "Google Gemini / Provider API rate limit or daily quota exceeded (HTTP 429).";
+          } else {
+            errorMessage = `AI Server Node ${currentNode.name} returned HTTP ${response.status}.`;
+          }
+        }
+      } catch (err) {
+        console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} network error: ${err.message}. Trying next available server node...`);
+        errorMessage = `Network error connecting to node ${currentNode.name}: ${err.message}`;
+      } finally {
+        currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
       }
     }
 
-    const targetUrl = customUrl ? customUrl.trim().replace(/\/$/, "") : selectedNode.url;
-
-    let accumulatedResponseText = "";
-    let streamedSuccessfully = false;
-    let ttft = 0;
-    let firstTokenTimestamp = null;
-    const llmStartTime = performance.now();
-
-    const headers = {
-      "Content-Type": "application/json",
-      "User-Agent": "Mozilla/5.0",
-      "X-Requested-With": "XMLHttpRequest",
-      "Accept": "application/json, text/event-stream"
-    };
-
-    const rawSecretKey = selectedNode.secretKey || "";
-    if (rawSecretKey) {
-      headers["Authorization"] = `Bearer ${rawSecretKey}`;
-      headers["X-Internal-Secret"] = rawSecretKey;
+    if (selectedNode) {
+      selectedNode.activeRequests++;
     }
 
     try {
-      const isCloudOrOpenAIFormat = selectedNode.format === "openai" || selectedNode.format === "gemini" || selectedNode.url.includes("googleapis.com") || selectedNode.url.includes("openai.com") || selectedNode.url.includes("trycloudflare.com");
-      const endpointPath = isCloudOrOpenAIFormat ? "/v1/chat/completions" : "/api/chat";
-
-      const requestPayload = {
-        model: targetModel,
-        messages,
-        stream: true
-      };
-
-      if (selectedNode.format === "ollama") {
-        requestPayload.keep_alive = "24h";
-      }
-
-      let response = await fetch(`${targetUrl}${endpointPath}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(requestPayload),
-        signal: abortController.signal
-      });
-
-      // Failover to secondary cluster node if primary node fails
-      if (!response.ok) {
-        console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${selectedNode.id} HTTP ${response.status}. Decrementing activeRequests and attempting fallback node...`);
-        selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
-
-        const fallbackNode = selectBestClusterNodeWithPreemption(userPriority, clusterState, true);
-
-        if (fallbackNode && fallbackNode.id !== selectedNode.id) {
-          fallbackNode.activeRequests++;
-          const isFallbackCloud = fallbackNode.format === "openai" || fallbackNode.format === "gemini" || fallbackNode.url.includes("googleapis.com") || fallbackNode.url.includes("trycloudflare.com");
-          const fallbackPath = isFallbackCloud ? "/v1/chat/completions" : "/api/chat";
-          const fallbackHeaders = { ...headers };
-          if (fallbackNode.secretKey) {
-            fallbackHeaders["Authorization"] = `Bearer ${fallbackNode.secretKey}`;
-            fallbackHeaders["X-Internal-Secret"] = fallbackNode.secretKey;
-          }
-
-          response = await fetch(`${fallbackNode.url}${fallbackPath}`, {
-            method: "POST",
-            headers: fallbackHeaders,
-            body: JSON.stringify({
-              model: fallbackNode.defaultModel,
-              messages,
-              stream: true
-            }),
-            signal: abortController.signal
-          });
-        }
-      }
-
-      if (response.ok && response.body) {
+      if (response && response.ok && response.body) {
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
-        let lineBuffer = "";
+        let rawBuffer = "";
 
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunkStr = decoder.decode(value, { stream: true });
-          lineBuffer += chunkStr;
-
-          const lines = lineBuffer.split("\n");
-          lineBuffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            const jsonStr = trimmed.startsWith("data: ") ? trimmed.replace("data: ", "").trim() : trimmed;
-            if (jsonStr === "[DONE]") continue;
-
-            try {
-              const parsed = JSON.parse(jsonStr);
-              const chunkText = parsed.message?.content || parsed.response || parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.message?.content || "";
-              if (chunkText) {
-                if (!firstTokenTimestamp) {
-                  firstTokenTimestamp = performance.now();
-                  ttft = firstTokenTimestamp - llmStartTime;
-                }
-                accumulatedResponseText += chunkText;
-
-                if (typeof onToken === "function") {
-                  onToken(chunkText);
-                }
-
-                if (res && !res.writableEnded) {
-                  res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
-                }
-              }
-            } catch (e) { }
+          if (value) {
+            rawBuffer += decoder.decode(value, { stream: true });
           }
+
+          const events = rawBuffer.split(/\n\n|\r\n\r\n/);
+          rawBuffer = events.pop() || "";
+
+          for (const event of events) {
+            const lines = event.split(/\r?\n/);
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              let jsonStr = trimmed;
+              if (trimmed.startsWith("data:")) {
+                jsonStr = trimmed.replace(/^data:\s*/, "").trim();
+              }
+              if (!jsonStr || jsonStr === "[DONE]") continue;
+
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const chunkText = parsed.choices?.[0]?.delta?.content || 
+                                  parsed.choices?.[0]?.message?.content || 
+                                  parsed.message?.content || 
+                                  parsed.response || "";
+                if (chunkText) {
+                  if (!firstTokenTimestamp) {
+                    firstTokenTimestamp = performance.now();
+                    ttft = firstTokenTimestamp - llmStartTime;
+                  }
+                  accumulatedResponseText += chunkText;
+
+                  if (typeof onToken === "function") {
+                    onToken(chunkText);
+                  }
+
+                  if (res && !res.writableEnded) {
+                    res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
+                  }
+                }
+              } catch (e) { }
+            }
+          }
+
+          if (done) break;
         }
         streamedSuccessfully = true;
       }
@@ -227,6 +237,7 @@ class AIGateway {
     return {
       success: streamedSuccessfully && accumulatedResponseText.trim().length > 0,
       text: accumulatedResponseText,
+      errorMessage,
       ttft,
       totalDurationMs,
       nodeId: selectedNode.id

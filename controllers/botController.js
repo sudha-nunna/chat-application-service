@@ -1300,3 +1300,165 @@ exports.updatePostmanApi = async (req, res) => {
     return res.status(500).json({ success: false, error: "Failed to update Postman API." });
   }
 };
+
+/**
+ * Dedicated Route to Generate / Issue API Key and Secret Key for a Bot
+ * Endpoint: POST /bots/:botId/keys/generate (or POST /bots/:botId/keys)
+ */
+exports.generateBotKeys = async (req, res) => {
+  try {
+    const crypto = require("crypto");
+    const mongoose = require("mongoose");
+    const { botId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(botId)) {
+      return res.status(400).json({ success: false, message: "Validation error: Invalid Bot ID format. Must be a 24-character hex string." });
+    }
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!bot) {
+      return res.status(404).json({ success: false, message: "Bot not found or unauthorized." });
+    }
+
+    bot.apiKey = `bot_pk_${crypto.randomBytes(16).toString("hex")}`;
+    bot.secretKey = `bot_sk_${crypto.randomBytes(24).toString("hex")}`;
+    bot.keyCreatedAt = new Date();
+    await bot.save();
+
+    return res.status(201).json({
+      success: true,
+      message: "Bot API Key and Secret Key generated successfully.",
+      botId: bot._id,
+      botName: bot.name,
+      apiKey: bot.apiKey,
+      secretKey: bot.secretKey,
+      keyCreatedAt: bot.keyCreatedAt
+    });
+  } catch (err) {
+    console.error("Generate Bot Keys Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to generate Bot keys.", error: err.message });
+  }
+};
+
+/**
+ * Get active API Key and Secret Key metadata for a Bot
+ * Endpoint: GET /bots/:botId/keys
+ */
+exports.getBotKeys = async (req, res) => {
+  try {
+    const mongoose = require("mongoose");
+    const { botId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(botId)) {
+      return res.status(400).json({ success: false, message: "Validation error: Invalid Bot ID format. Must be a 24-character hex string." });
+    }
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!bot) {
+      return res.status(404).json({ success: false, message: "Bot not found or unauthorized." });
+    }
+
+    if (!bot.apiKey || !bot.secretKey) {
+      return res.json({
+        success: true,
+        hasKeys: false,
+        message: "No API Key or Secret Key has been generated for this bot yet."
+      });
+    }
+
+    return res.json({
+      success: true,
+      hasKeys: true,
+      botId: bot._id,
+      botName: bot.name,
+      apiKey: bot.apiKey,
+      secretKey: bot.secretKey,
+      keyCreatedAt: bot.keyCreatedAt,
+      keyLastUsedAt: bot.keyLastUsedAt
+    });
+  } catch (err) {
+    console.error("Get Bot Keys Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch Bot keys.", error: err.message });
+  }
+};
+
+/**
+ * Revokes / Invalidates API Key and Secret Key for a Bot
+ * Endpoint: DELETE /bots/:botId/keys (or POST /bots/:botId/keys/revoke)
+ */
+exports.revokeBotKeys = async (req, res) => {
+  try {
+    const mongoose = require("mongoose");
+    const { botId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(botId)) {
+      return res.status(400).json({ success: false, message: "Validation error: Invalid Bot ID format. Must be a 24-character hex string." });
+    }
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!bot) {
+      return res.status(404).json({ success: false, message: "Bot not found or unauthorized." });
+    }
+
+    bot.apiKey = undefined;
+    bot.secretKey = undefined;
+    bot.keyCreatedAt = undefined;
+    await bot.save();
+
+    return res.json({
+      success: true,
+      message: "Bot API Key and Secret Key revoked successfully. External integrations using these keys will no longer work."
+    });
+  } catch (err) {
+    console.error("Revoke Bot Keys Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to revoke Bot keys.", error: err.message });
+  }
+};
+
+/**
+ * Regenerates / rotates API Key and Secret Key for a Bot
+ * Endpoint: POST /bots/:botId/keys/rotate
+ */
+exports.rotateBotKeys = async (req, res) => {
+  return exports.generateBotKeys(req, res);
+};
+
+/**
+ * Public External Chat Endpoint authenticated via Bot API Key & Secret Key
+ * Endpoint: POST /api/v1/external/bots/chat
+ */
+exports.externalBotChat = async (req, res) => {
+  try {
+    const bot = req.bot; // Attached by botKeyAuth middleware
+    const { message } = req.body;
+
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return res.status(400).json({ success: false, message: "Validation error: 'message' payload is required and must be a non-empty string." });
+    }
+
+    if (message.trim().length > 4000) {
+      return res.status(400).json({ success: false, message: "Validation error: 'message' payload exceeds maximum limit of 4000 characters." });
+    }
+
+    // Pass botId & owner user context
+    req.params.botId = bot._id.toString();
+    req.user = { id: (bot.ownerId || bot.userId).toString() };
+
+    return exports.sendBotChatMessage(req, res);
+  } catch (err) {
+    console.error("External Bot Chat Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to process external bot chat message.", error: err.message });
+  }
+};

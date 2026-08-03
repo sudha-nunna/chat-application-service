@@ -328,8 +328,8 @@ CORE BEHAVIOR RULES:
       if (res.writableEnded) {
         return;
       }
-      console.warn("⚠️ [OLLAMA OFFLINE NOTICE] Ollama request failed or returned empty content.");
-      const fallbackText = "I'm unable to connect to the local AI model right now. Please check that your Ollama service is running and accessible.";
+      console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content.");
+      const fallbackText = gatewayResult.errorMessage || "I'm unable to connect to the active AI server node right now. Please check that your server node is running and accessible.";
       await streamTextInChunks(res, fallbackText, 15);
       res.write("data: [DONE]\n\n");
       return res.end();

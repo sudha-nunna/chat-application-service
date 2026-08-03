@@ -53,6 +53,23 @@ const botSchema = new mongoose.Schema(
       type: String,
       enum: ["ACTIVE", "INACTIVE"],
       default: "ACTIVE"
+    },
+    apiKey: {
+      type: String,
+      unique: true,
+      sparse: true,
+      index: true
+    },
+    secretKey: {
+      type: String,
+      sparse: true
+    },
+    keyCreatedAt: {
+      type: Date,
+      default: Date.now
+    },
+    keyLastUsedAt: {
+      type: Date
     }
   },
   {
@@ -60,6 +77,17 @@ const botSchema = new mongoose.Schema(
   }
 );
 
-botSchema.index({ userId: 1 });
+botSchema.pre("save", function (next) {
+  const crypto = require("crypto");
+  if (!this.apiKey) {
+    this.apiKey = `bot_pk_${crypto.randomBytes(16).toString("hex")}`;
+  }
+  if (!this.secretKey) {
+    this.secretKey = `bot_sk_${crypto.randomBytes(24).toString("hex")}`;
+  }
+  if (typeof next === "function") {
+    next();
+  }
+});
 
 module.exports = mongoose.model("Bot", botSchema);
