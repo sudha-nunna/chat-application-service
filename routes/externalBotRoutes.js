@@ -8,8 +8,7 @@ const botController = require("../controllers/botController");
  * Authenticated via X-Bot-Api-Key and X-Bot-Secret-Key headers
  */
 
-// POST /api/v1/external/bots/chat - Chat with Bot (SSE streaming or JSON)
+// POST /api/v1/external/bots/chat - Chat with Bot (SSE streaming)
 router.post("/chat", botKeyAuth, botController.externalBotChat);
-router.post("/chat/stream", botKeyAuth, botController.externalBotChat);
 
 module.exports = router;
