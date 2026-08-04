@@ -489,19 +489,7 @@ function matchQueryToMetadata(queryText, metadata) {
   return false;
 }
 
-/**
- * Classifies incoming message intent into supported classes.
- */
-function detectBotIntent(message, historyMessages = []) {
-  if (!message || typeof message !== "string") return "GREETING";
-  const trimmed = message.trim().toLowerCase();
 
-  if (/^(hi|hello|hey|greetings|good\s+morning|good\s+afternoon|good\s+evening)$/i.test(trimmed)) {
-    return "GREETING";
-  }
-
-  return "KNOWLEDGE_QUESTION";
-}
 
 /**
  * Performs Multi-Tenant Semantic Search strictly isolated by userId and botId.
@@ -709,6 +697,42 @@ ${apiDescriptions}
    "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough."`;
 }
 
+/**
+ * System prompt for General Conversational mode (human-like conversational chat & voice agent ready).
+ * Adapts based on botMode ("small" | "medium" | "large")
+ */
+function buildGeneralSystemPrompt(botName = "AI Assistant", botDescription = "", mode = "medium") {
+  const modeLower = (mode || "medium").toLowerCase();
+
+  let modeGuidance = "";
+  if (modeLower === "small") {
+    modeGuidance = `
+MODE: STRICT KNOWLEDGE BOT (SMALL)
+1. You are strictly limited to the uploaded documentation.
+2. If the user asks a general question or topic not covered in the documents, state clearly and politely: "I am configured in Strict Document Mode (Small) and can only answer questions related to the uploaded documentation."`;
+  } else if (modeLower === "medium") {
+    modeGuidance = `
+MODE: BALANCED HYBRID ASSISTANT (MEDIUM)
+1. Answer document questions using the uploaded files as your primary source of truth.
+2. For casual chitchat or general inquiries, answer concisely and helpfully while politely reminding the user of your main document focus when appropriate.`;
+  } else {
+    modeGuidance = `
+MODE: OMNI AI ASSISTANT (LARGE)
+1. You have full unconstrained conversational capabilities (general Q&A, coding, math, reasoning, creative writing).
+2. Seamlessly combine deep general AI knowledge with document facts.`;
+  }
+
+  return `You are a warm, intelligent, articulate, and friendly AI Assistant named '${botName}'.
+${botDescription ? `Role & Scope: ${botDescription}\n` : ""}
+
+${modeGuidance}
+
+HUMAN CONVERSATIONAL RULES:
+1. Respond naturally, conversationally, and warmly—just like a helpful human assistant or voice agent.
+2. Keep responses articulate, engaging, and easy to understand when spoken aloud.
+3. If asked about your identity or role, introduce yourself warmly as '${botName}'.`;
+}
+
 module.exports = {
   tokenize,
   generateEmbeddingVector,
@@ -721,5 +745,6 @@ module.exports = {
   generateConversationalResponse,
   detectBotIntent,
   retrieveRelevantChunks,
-  buildRagSystemPrompt
+  buildRagSystemPrompt,
+  buildGeneralSystemPrompt
 };

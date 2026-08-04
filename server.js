@@ -22,13 +22,23 @@ connectDB().then(() => {
 
 const app = express();
 
+// 1. Public External Bot Widget CORS (Allows third-party websites/apps using API Keys)
+// Must be declared BEFORE global restricted CORS middleware
+app.use("/api/v1/external/bots", cors({
+  origin: "*",
+  credentials: false,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Bot-Api-Key", "X-Bot-Secret-Key", "x-auth-token"]
+}));
+
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || "")
   .split(",")
   .map((origin) => origin.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
+// 2. Restricted CORS for internal dashboard
 app.use(cors({
-  origin: allowedOrigins,
+  origin: allowedOrigins.length > 0 ? allowedOrigins : "*",
   credentials: true
 }));
 

@@ -48,6 +48,24 @@ async function authenticateBotKey(req, res, next) {
       });
     }
 
+    // Senior Security Origin Check: If bot owner configured allowedDomains, validate origin header
+    const rawOrigin = (req.headers.origin || req.headers.referer || "").toLowerCase();
+    if (bot.allowedDomains && Array.isArray(bot.allowedDomains) && bot.allowedDomains.length > 0) {
+      const isAllowedOrigin = bot.allowedDomains.some(domain => {
+        if (!domain || !domain.trim()) return false;
+        const cleanDomain = domain.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/$/, "");
+        return rawOrigin.includes(cleanDomain);
+      });
+
+      if (!isAllowedOrigin) {
+        console.warn(`🛡️ [CORS SECURITY BLOCK] Origin '${rawOrigin}' rejected for Bot '${bot.name}' (${bot._id}). Allowed:`, bot.allowedDomains);
+        return res.status(403).json({
+          success: false,
+          message: `Access denied. Origin domain '${rawOrigin || 'unknown'}' is not authorized to use this Bot API key.`
+        });
+      }
+    }
+
     // Update last used timestamp in background
     bot.keyLastUsedAt = new Date();
     bot.save().catch(err => console.warn("Failed to update bot keyLastUsedAt:", err.message));

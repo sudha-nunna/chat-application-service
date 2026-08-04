@@ -115,7 +115,7 @@ async function triggerBotContactAutomation(userId, botId, conversationId, contac
 
 exports.createBot = async (req, res) => {
   try {
-    const { name, description, model, systemPrompt, initialApis, stagedFiles } = req.body;
+    const { name, description, model, botMode, allowedDomains, systemPrompt, initialApis, stagedFiles } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Bot name is required." });
     }
@@ -125,12 +125,20 @@ exports.createBot = async (req, res) => {
       return res.status(400).json({ error: "Please upload at least one knowledge file before creating the bot." });
     }
 
+    // Determine botMode: small, medium, or large
+    const effectiveBotMode = (botMode || model || "medium").toLowerCase();
+    const finalBotMode = ["small", "medium", "large"].includes(effectiveBotMode) ? effectiveBotMode : "medium";
+    const finalModel = (model && !["small", "medium", "large"].includes(model.toLowerCase())) ? model : "gpt-4o";
+    const domainsList = Array.isArray(allowedDomains) ? allowedDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean) : [];
+
     const bot = await Bot.create({
       ownerId: req.user.id,
       userId: req.user.id,
       name: name.trim(),
       description: description ? description.trim() : "",
-      model: model || "gpt-4o",
+      model: finalModel,
+      botMode: finalBotMode,
+      allowedDomains: domainsList,
       systemPrompt: systemPrompt || "You are a specialized AI assistant."
     });
 
@@ -212,11 +220,31 @@ exports.getBotById = async (req, res) => {
 exports.updateBot = async (req, res) => {
   try {
     const { botId } = req.params;
-    const { name, description, model, systemPrompt } = req.body;
+    const { name, description, model, botMode, allowedDomains, systemPrompt } = req.body;
+
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    if (systemPrompt !== undefined) updateData.systemPrompt = systemPrompt;
+
+    if (Array.isArray(allowedDomains)) {
+      updateData.allowedDomains = allowedDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean);
+    }
+
+    if (botMode) {
+      updateData.botMode = ["small", "medium", "large"].includes(botMode.toLowerCase()) ? botMode.toLowerCase() : "medium";
+    }
+    if (model) {
+      if (["small", "medium", "large"].includes(model.toLowerCase())) {
+        updateData.botMode = model.toLowerCase();
+      } else {
+        updateData.model = model;
+      }
+    }
 
     const bot = await Bot.findOneAndUpdate(
       { _id: botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] },
-      { name, description, model, systemPrompt },
+      updateData,
       { new: true }
     );
 
@@ -673,8 +701,112 @@ exports.testBotApi = async (req, res) => {
   }
 };
 
+/**
+ * Helper to parse markdown text into structured UI Component payload:
+ * Components supported: "table" | "list" | "card" | "text"
+ */
+function parseStructuredUI(text) {
+  if (!text || typeof text !== "string") {
+    return { component: "text", title: "Response", data: { text: "" } };
+  }
+
+  const trimmed = text.trim();
+
+  // 1. Table Detection (| Col1 | Col2 |)
+  const tableRegex = /\|(.+)\|[\r\n]+\|[-:\s|]+\|[\r\n]+((?:\|.+\|[\r\n]*)+)/;
+  const tableMatch = trimmed.match(tableRegex);
+
+  if (tableMatch) {
+    const rawHeaders = tableMatch[1].split("|").map(h => h.trim()).filter(Boolean);
+    const rawRows = tableMatch[2]
+      .trim()
+      .split(/\r?\n/)
+      .filter(line => line.includes("|") && !/^\|?\s*[-:\s|]+\s*\|?$/.test(line))
+      .map(row => {
+        const cells = row.split("|").map(cell => cell.trim());
+        // Handle optional leading/trailing pipe empty cells
+        if (cells.length > 2 && cells[0] === "" && cells[cells.length - 1] === "") {
+          return cells.slice(1, -1);
+        }
+        return cells.filter(Boolean);
+      })
+      .filter(row => row.length > 0);
+
+    return {
+      component: "table",
+      title: "Structured Data Table",
+      data: {
+        headers: rawHeaders,
+        rows: rawRows,
+        rawMarkdown: text
+      }
+    };
+  }
+
+  // 2. List Detection (- Item or 1. Item)
+  const listItems = trimmed
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => /^[-*•]\s+/.test(line) || /^\d+\.\s+/.test(line))
+    .map(line => line.replace(/^([-*•]|\d+\.)\s+/, "").trim());
+
+  if (listItems.length >= 2) {
+    return {
+      component: "list",
+      title: "List Items",
+      data: {
+        items: listItems,
+        rawMarkdown: text
+      }
+    };
+  }
+
+  // 3. Card Detection (Structured text snippet)
+  if (trimmed.length > 40) {
+    return {
+      component: "card",
+      title: "Summary Card",
+      data: {
+        text: trimmed,
+        highlights: listItems
+      }
+    };
+  }
+
+  // 4. Default Text Component
+  return {
+    component: "text",
+    title: "Text Message",
+    data: { text: trimmed }
+  };
+}
+
+function sendJsonResponse(res, conversation, bot, currentBotMode, responseText, sourcesMeta = [], reqStartTime = 0, ttft = null) {
+  const totalDuration = performance.now() - reqStartTime;
+  const structuredUI = parseStructuredUI(responseText);
+
+  return res.json({
+    success: true,
+    conversationId: conversation._id,
+    botId: bot._id,
+    botName: bot.name || "AI Assistant",
+    botMode: currentBotMode,
+    responseType: structuredUI.component,
+    message: {
+      role: "assistant",
+      content: responseText
+    },
+    sources: sourcesMeta,
+    structuredUI,
+    metrics: {
+      ttftMs: ttft !== null ? Number(ttft.toFixed(2)) : null,
+      totalDurationMs: Number(totalDuration.toFixed(2))
+    }
+  });
+}
+
 // -----------------------------------------------------------------------------
-// 4. RAG-POWERED BOT CHAT CONTROLLER WITH STRICT KNOWLEDGE BOUNDARY & CONTACT AUTOMATION
+// 4. RAG-POWERED BOT CHAT CONTROLLER WITH DUAL-MODE (SSE STREAMING & STRUCTURED JSON UI)
 // -----------------------------------------------------------------------------
 
 exports.sendBotChatMessage = async (req, res) => {
@@ -726,11 +858,18 @@ exports.sendBotChatMessage = async (req, res) => {
       await conversation.save();
     }
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
+    // Detect response format requested by client:
+    // Mode A: SSE Streaming ("text/event-stream" or req.body.stream === true)
+    // Mode B: Structured JSON ("application/json" or req.body.stream === false or req.body.format === "json")
+    const acceptHeader = (req.headers.accept || "").toLowerCase();
+    const isStreamRequested = (req.body.stream === true) || acceptHeader.includes("text/event-stream") || (req.body.stream !== false && !acceptHeader.includes("application/json"));
 
-    res.write(`data: ${JSON.stringify({ type: "meta", conversationId: conversation._id, title: conversation.title })}\n\n`);
+    if (isStreamRequested) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.write(`data: ${JSON.stringify({ type: "meta", conversationId: conversation._id, title: conversation.title })}\n\n`);
+    }
 
     // Fetch conversation memory (last 10 messages)
     const historyMessages = await BotMessage.find({ conversationId: conversation._id, botId })
@@ -960,38 +1099,63 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
-    const isGeneralQuery = (intent === "GENERAL_QUERY");
+    // Extract bot mode: small (Strict Document Only), medium (Balanced Hybrid), large (Omni AI)
+    const rawBotMode = (bot.botMode || bot.model || "medium").toLowerCase();
+    const currentBotMode = ["small", "medium", "large"].includes(rawBotMode) ? rawBotMode : "medium";
+
+    let isGeneralQuery = (intent === "GENERAL_QUERY" || intent === "GENERAL_CONVERSATION" || intent === "GREETING");
+
+    // In SMALL Mode (Strict Knowledge Bot), non-greeting queries force document RAG search
+    if (currentBotMode === "small" && intent !== "GREETING") {
+      isGeneralQuery = false;
+    }
+
     let ragResult = { isFound: true, chunks: [] };
 
-    if (!isGeneralQuery) {
+    // Check if bot has uploaded document files
+    const hasFilesCount = await BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] });
+    const hasUploadedFiles = hasFilesCount > 0;
+
+    if (!isGeneralQuery && hasUploadedFiles) {
       // Multi-tenant Isolated Knowledge Retrieval for Document / API questions
       const tRagStart = performance.now();
       ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
       ragSearchTime = performance.now() - tRagStart;
-
-      if (ragResult.debug) {
-        console.log("🧠 [RAG DEBUG]", {
-          userId: req.user.id,
-          botId,
-          message,
-          reason: ragResult.reason || "ACCEPTED",
-          metadataMatch: ragResult.metadataMatch || false,
-          debug: ragResult.debug
-        });
-      }
     }
 
     const sourcesMeta = ragResult.isFound && ragResult.chunks.length > 0
       ? ragResult.chunks.map(c => ({ fileName: c.fileName, snippet: c.snippet.substring(0, 100) + "..." }))
       : [];
 
+    // Production-Grade Terminal Diagnostic Logging
+    console.log(`
+🤖 =================== [BOT CHAT ROUTER DIAGNOSTICS] ===================
+  📌 Bot Name:           ${bot.name || "AI Bot"} (ID: ${botId})
+  🎯 Bot Mode Preset:    ${currentBotMode.toUpperCase()} (${currentBotMode === 'small' ? 'Strict Document Only' : currentBotMode === 'medium' ? 'Balanced Hybrid' : 'Omni General & RAG'})
+  💬 User Prompt:        "${message}"
+  🏷️ Classified Intent:   ${intent}
+  📂 Uploaded Files:      ${hasUploadedFiles ? `YES (${hasFilesCount} Files)` : "NO"}
+  ${isGeneralQuery 
+    ? `⚡ RAG Decision:        [BYPASSED] General Conversation Mode (0ms DB Overhead)` 
+    : `📄 RAG Decision:        [EXECUTED] Document Grounding Search (${ragSearchTime.toFixed(2)} ms | Chunks: ${ragResult.chunks?.length || 0})`}
+  🧠 System Prompt:       ${isGeneralQuery ? `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})` : "buildRagSystemPrompt (Strict Grounding + Sources)"}
+========================================================================\n`);
+
     if (sourcesMeta.length > 0) {
       res.write(`data: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
     }
 
-    // Strict Out-of-Scope Fallback Rule for document queries when no chunks match
-    if (!isGeneralQuery && !ragResult.isFound) {
-      const outOfScopeMsg = "I couldn't find information about that topic in the available documentation. My strongest answers come from the uploaded knowledge base. If your question relates to the documented topics, I'll be happy to help.";
+    // Strict Out-of-Scope Fallback Rule based on botMode when no chunks match
+    if (!isGeneralQuery && hasUploadedFiles && !ragResult.isFound) {
+      let outOfScopeMsg;
+      if (currentBotMode === "small") {
+        outOfScopeMsg = "I am configured in Strict Document Mode (Small) and can only answer questions directly covered by the uploaded documentation. I couldn't find information about that topic in the available files.";
+      } else if (currentBotMode === "medium") {
+        outOfScopeMsg = "I couldn't find specific details on that topic in the uploaded documentation. My strongest answers come from the available knowledge base. Please ask questions related to the documented topics.";
+      } else {
+        outOfScopeMsg = "I couldn't find information about that topic in the available documentation. I'll be happy to assist you using general knowledge if you'd like!";
+      }
+
       await streamTextInChunks(res, outOfScopeMsg, 15);
 
       await BotMessage.create({
@@ -1014,8 +1178,14 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
-    // Build grounded RAG system prompt
-    const systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
+    // Build system prompt based on adaptive intent and currentBotMode
+    const { buildGeneralSystemPrompt } = require("../utils/ragEngine");
+    let systemPrompt;
+    if (isGeneralQuery) {
+      systemPrompt = buildGeneralSystemPrompt(bot.name, bot.description, currentBotMode);
+    } else {
+      systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
+    }
 
     const aiGateway = require("../utils/aiGateway");
     const { calculatePriority } = require("../utils/priorityCalculator");
@@ -1056,7 +1226,7 @@ exports.sendBotChatMessage = async (req, res) => {
       provider: "auto",
       model: targetModel,
       messages: ollamaMessages,
-      res,
+      res: isStreamRequested ? res : null,
       userPriority,
       jobId,
       userId: req.user.id,
@@ -1080,7 +1250,9 @@ exports.sendBotChatMessage = async (req, res) => {
       } else {
         accumulatedResponseText = "I encountered an issue generating a response. Please check that Ollama is running locally.";
       }
-      await streamTextInChunks(res, accumulatedResponseText, 15);
+      if (isStreamRequested) {
+        await streamTextInChunks(res, accumulatedResponseText, 15);
+      }
     }
 
     await BotMessage.create({
@@ -1107,18 +1279,22 @@ exports.sendBotChatMessage = async (req, res) => {
 
     console.log(`
 ⏱️  =================== [LATENCY DIAGNOSTICS BREAKDOWN] ===================
-  📌 Route: Bot Chat Stream (/api/v1/bots/${botId}/chat)
+  📌 Route: Bot Chat ${isStreamRequested ? 'Stream (SSE)' : 'REST (JSON)'} (/api/v1/bots/${botId}/chat)
   ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
   ├── 🔍 Entity Extraction:             ${entityExtractTime.toFixed(2)} ms
   ├── 🧠 RAG & Vector Search:           ${ragSearchTime.toFixed(2)} ms
-  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A (Ollama Delay/Error)'} <-- [AI Model Load & Prompt Eval Lag]
+  ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'}
   ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
   └── 🏁 TOTAL REQUEST DURATION:        ${totalDuration.toFixed(2)} ms
 ========================================================================\n
 `);
 
-    res.write("data: [DONE]\n\n");
-    return res.end();
+    if (isStreamRequested) {
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    } else {
+      return sendJsonResponse(res, conversation, bot, currentBotMode, accumulatedResponseText, sourcesMeta, reqStartTime, ttft);
+    }
   } catch (err) {
     console.error("Bot Chat Streaming error:", err);
     if (!res.headersSent) {

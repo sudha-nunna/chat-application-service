@@ -27,6 +27,16 @@ const botSchema = new mongoose.Schema(
       type: String,
       default: "gpt-4o"
     },
+    botMode: {
+      type: String,
+      enum: ["small", "medium", "large"],
+      default: "medium",
+      lowercase: true
+    },
+    allowedDomains: {
+      type: [String],
+      default: []
+    },
     systemPrompt: {
       type: String,
       default: "You are a specialized AI assistant. You answer questions strictly based on the provided knowledge base and integrated APIs."
