@@ -33,14 +33,37 @@ const STOPWORDS = new Set([
 
 /**
  * Tokenizes text into cleaned lowercase word tokens.
+ * Automatically expands spaced & joined alphanumeric variations (e.g. "web 3" <-> "web3").
  */
 function tokenize(text) {
   if (!text || typeof text !== "string") return [];
-  return text
+  const rawTokens = text
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
     .filter(t => t.length > 1 && !STOPWORDS.has(t));
+
+  const expanded = new Set(rawTokens);
+
+  // Expand spaced alphanumeric tokens (e.g. "web" + "3" -> "web3")
+  for (let i = 0; i < rawTokens.length - 1; i++) {
+    const combined = rawTokens[i] + rawTokens[i + 1];
+    if (/^[a-z]+[0-9]+$/i.test(combined) || /^[0-9]+[a-z]+$/i.test(combined)) {
+      expanded.add(combined);
+    }
+  }
+
+  // Expand joined alphanumeric tokens (e.g. "web3" -> "web", "3")
+  for (const token of rawTokens) {
+    const match = token.match(/^([a-z]+)([0-9]+)$/i);
+    if (match) {
+      expanded.add(match[1]);
+      expanded.add(match[2]);
+      expanded.add(`${match[1]} ${match[2]}`);
+    }
+  }
+
+  return Array.from(expanded);
 }
 
 /**
@@ -412,44 +435,15 @@ function isKnowledgeDiscoveryQuestion(message) {
 function buildKnowledgeOverviewResponse(bot, files = [], message = "") {
   if (!bot || !isKnowledgeOverviewQuestion(message)) return null;
 
-  const normalized = (message || "").trim().toLowerCase();
-  const botName = bot.name || "Allvion";
+  const botName = bot.name || "AI Assistant";
   const topics = extractExtractedTopics(bot);
-  const bulletList = topics.map(t => `• ${t}`).join("\n");
 
-  // 1. "What is Allvion?" / "What is [botName]?" / "Tell me about Allvion"
-  if (normalized.includes("what is allvion") || normalized.includes(`what is ${botName.toLowerCase()}`) || normalized.includes("tell me about allvion")) {
-    let resp = `Allvion is a documentation-focused assistant designed to answer questions using the uploaded knowledge base and configured tools. It specializes in helping users quickly find information contained in the available documents.`;
-    if (topics.length > 0) {
-      resp += `\n\nBased on the available documentation, it can help with:\n\n${bulletList}\n\nFeel free to ask questions related to these areas.`;
-    }
-    return resp;
+  let topicsStr = "";
+  if (topics && topics.length > 0) {
+    topicsStr = topics.slice(0, 6).join(", ");
   }
 
-  // 2. "What is your role?"
-  if (normalized.includes("what is your role") || normalized.includes("your role")) {
-    let resp = `I am ${botName}, a knowledge assistant that helps users find and understand information from the available documentation and connected tools.`;
-    if (topics.length > 0) {
-      resp += `\n\nBased on the available documentation, I can help with:\n\n${bulletList}\n\nYou can ask questions about any of these areas, and I will answer using the available documentation and tools.`;
-    }
-    return resp;
-  }
-
-  // 3. "What type of knowledge do you have?" / "What knowledge do you have?" / "What are you trained on?" / "What topics can you help with?" / "What can you do?" / "What can you help with?"
-  if (
-    normalized.includes("knowledge") ||
-    normalized.includes("trained on") ||
-    normalized.includes("topics") ||
-    normalized.includes("what information") ||
-    normalized.includes("what can you do") ||
-    normalized.includes("what can you help") ||
-    normalized.includes("what do you know")
-  ) {
-    return `I can help with the following topics found in the knowledge base:\n\n${bulletList}\n\nFeel free to ask questions related to these areas.`;
-  }
-
-  // 4. Default / Fallback for general identity & capabilities ("Who are you?", "Identify yourself", etc.)
-  return `I am ${botName}, a knowledge assistant for this workspace.\n\nBased on the available documentation, I can help with:\n\n${bulletList}\n\nYou can ask questions about any of these areas, and I will answer using the available documentation and tools.`;
+  return `I am **${botName}**. I specialize in ${topicsStr || "our core application services and technologies"}.\n\nFeel free to ask any questions about these features and services!`;
 }
 
 function matchQueryToMetadata(queryText, metadata) {
@@ -694,7 +688,9 @@ ${apiDescriptions}
 4. Always identify yourself as a knowledge-base assistant. When asked about your role, knowledge, capabilities, or identity, describe yourself as a knowledge-base assistant that helps users find and understand information from the available documentation and tools, listing available topics.
 5. FORBIDDEN RESPONSES: NEVER say "I am a language model", "I am trained on vast amounts of data", "I use machine learning algorithms", "I can answer questions from general knowledge", or "My training data includes...".
 6. If the user asks for a deep, complex, or detailed explanation regarding platform setups, pricing matrix adjustments, or custom system automations, reply EXACTLY with:
-   "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough."`;
+   "I will gladly capture your primary context details right here to instantly connect you directly with our specialized engineering team for a full custom walkthrough."
+7. SYNONYM & SPACING FLEXIBILITY: Treat terms with minor spacing, hyphenation, or formatting differences as identical (e.g., 'web 3' = 'web3', 'react native' = 'react-native', 'node js' = 'nodejs', 'app 1' = 'app1'). Never claim information is missing simply due to a space or hyphen difference.
+8. CONCISE & DIRECT ANSWERS: When answering overview questions or listing application features, answer concisely in short, clear sentences. Identify yourself as '${botName}' and describe the customer's application directly from the document without long generic boilerplates.`;
 }
 
 /**

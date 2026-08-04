@@ -1120,9 +1120,9 @@ exports.sendBotChatMessage = async (req, res) => {
   💬 User Prompt:        "${message}"
   🏷️ Classified Intent:   ${intent}
   📂 Uploaded Files:      ${hasUploadedFiles ? `YES (${hasFilesCount} Files)` : "NO"}
-  ${isGeneralQuery 
-    ? `⚡ RAG Decision:        [BYPASSED] General Conversation Mode (0ms DB Overhead)` 
-    : `📄 RAG Decision:        [EXECUTED] Document Grounding Search (${ragSearchTime.toFixed(2)} ms | Chunks: ${ragResult.chunks?.length || 0})`}
+  ${isGeneralQuery
+        ? `⚡ RAG Decision:        [BYPASSED] General Conversation Mode (0ms DB Overhead)`
+        : `📄 RAG Decision:        [EXECUTED] Document Grounding Search (${ragSearchTime.toFixed(2)} ms | Chunks: ${ragResult.chunks?.length || 0})`}
   🧠 System Prompt:       ${isGeneralQuery ? `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})` : "buildRagSystemPrompt (Strict Grounding + Sources)"}
 ========================================================================\n`);
 
