@@ -311,7 +311,7 @@ class AIGateway {
                   }
 
                   if (res && !res.writableEnded) {
-                    res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
+                    res.write(`event: chunk\ndata: ${JSON.stringify({ text: chunkText })}\n\n`);
                   }
                 }
               } catch (e) { }

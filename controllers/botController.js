@@ -25,67 +25,52 @@ const {
 async function streamTextInChunks(res, text, delayMs = 15) {
   const tokens = text.match(/\s+|\S+/g) || [text];
   for (const token of tokens) {
-    res.write(`data: ${JSON.stringify({ type: "chunk", chunk: token, text: token })}\n\n`);
+    res.write(`event: chunk\ndata: ${JSON.stringify({ text: token })}\n\n`);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
 
 /**
- * Executes contact automation trigger against configured bot API or fallback CRM endpoint.
+ * Generic multi-agent contact & lead capture automation.
+ * If a custom BotApi is attached to this bot, dispatches payload directly to the custom API endpoint.
+ * Otherwise, persists the contact record locally into BotContact database.
  */
 async function triggerBotContactAutomation(userId, botId, conversationId, contactDetails) {
-  const crmApiKey = process.env.CRM_API_KEY || "sk_live_crm_key";
-  const crmApiUrl = process.env.CRM_API_URL || "https://soc.codegene.io/api/v1/crm/public/contacts";
-
-  // Check if bot has configured custom API
+  // Check if bot has a user-configured custom API integration
   const botApis = await BotApi.find({ botId, $or: [{ userId }, { ownerId: userId }] });
   const postApi = botApis.find(a => a.method === "POST") || botApis[0];
 
-  let targetUrl = crmApiUrl;
-  let headers = {
-    "Content-Type": "application/json",
-    "x-api-key": crmApiKey
-  };
+  let crmContactId = `lead_${Date.now()}`;
+  let crmSyncStatus = "SUCCESS";
 
-  if (postApi) {
-    targetUrl = postApi.url;
+  if (postApi && postApi.url) {
+    const headers = { "Content-Type": "application/json" };
     if (postApi.authType === "apiKey" && postApi.encryptedApiKey) {
       headers["x-api-key"] = decrypt(postApi.encryptedApiKey);
     } else if (postApi.authType === "bearerToken" && postApi.encryptedBearerToken) {
       headers["Authorization"] = `Bearer ${decrypt(postApi.encryptedBearerToken)}`;
     }
-  }
 
-  const payload = {
-    firstName: contactDetails.firstName,
-    lastName: contactDetails.lastName,
-    email: contactDetails.email,
-    phone: contactDetails.phone,
-    companyName: contactDetails.companyName || "Default Company"
-  };
+    try {
+      const response = await fetch(postApi.url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          firstName: contactDetails.firstName,
+          lastName: contactDetails.lastName,
+          email: contactDetails.email,
+          phone: contactDetails.phone,
+          companyName: contactDetails.companyName || "N/A"
+        })
+      });
 
-  let crmContactId = null;
-  let crmSyncStatus = "FAILED";
-
-  try {
-    const response = await fetch(targetUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload)
-    });
-
-    if (response.ok) {
-      const resData = await response.json();
-      crmContactId = resData.contactId || resData.id || `contact_${Date.now()}`;
-      crmSyncStatus = "SUCCESS";
-    } else {
-      crmContactId = `contact_sync_${Date.now()}`;
-      crmSyncStatus = "SUCCESS";
+      if (response.ok) {
+        const resData = await response.json();
+        crmContactId = resData.contactId || resData.id || `lead_${Date.now()}`;
+      }
+    } catch (err) {
+      console.warn("⚠️ Custom Bot API Dispatch Notice (recording locally):", err.message);
     }
-  } catch (err) {
-    console.warn("⚠️ Contact automation API notice (recording local sync):", err.message);
-    crmContactId = `contact_local_${Date.now()}`;
-    crmSyncStatus = "SUCCESS";
   }
 
   const savedContact = await BotContact.findOneAndUpdate(
@@ -868,7 +853,7 @@ exports.sendBotChatMessage = async (req, res) => {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
-      res.write(`data: ${JSON.stringify({ type: "meta", conversationId: conversation._id, title: conversation.title })}\n\n`);
+      res.write(`event: metadata\ndata: ${JSON.stringify({ responseType: "text", title: conversation.title || "Bot Conversation", conversationId: conversation._id })}\n\n`);
     }
 
     // Fetch conversation memory (last 10 messages)
@@ -1141,8 +1126,8 @@ exports.sendBotChatMessage = async (req, res) => {
   🧠 System Prompt:       ${isGeneralQuery ? `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})` : "buildRagSystemPrompt (Strict Grounding + Sources)"}
 ========================================================================\n`);
 
-    if (sourcesMeta.length > 0) {
-      res.write(`data: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
+    if (sourcesMeta.length > 0 && isStreamRequested) {
+      res.write(`event: sources\ndata: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
     }
 
     // Strict Out-of-Scope Fallback Rule based on botMode when no chunks match
@@ -1290,7 +1275,9 @@ exports.sendBotChatMessage = async (req, res) => {
 `);
 
     if (isStreamRequested) {
-      res.write("data: [DONE]\n\n");
+      const structuredUI = parseStructuredUI(accumulatedResponseText);
+      res.write(`event: metadata\ndata: ${JSON.stringify({ responseType: structuredUI.component, title: conversation.title || "Bot Conversation", conversationId: conversation._id })}\n\n`);
+      res.write("event: done\ndata: [DONE]\n\n");
       return res.end();
     } else {
       return sendJsonResponse(res, conversation, bot, currentBotMode, accumulatedResponseText, sourcesMeta, reqStartTime, ttft);
