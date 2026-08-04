@@ -1141,27 +1141,40 @@ exports.sendBotChatMessage = async (req, res) => {
         outOfScopeMsg = "I couldn't find information about that topic in the available documentation. I'll be happy to assist you using general knowledge if you'd like!";
       }
 
-      // Emit special schedule_call metadata for FE team to render schedule call UI!
+      const { extractExtractedTopics } = require("../utils/ragEngine");
+      const topTopics = extractExtractedTopics(bot);
+      const featuredTopic = topTopics[0] || "Our Knowledge Base";
+      const cardTitle = `Did You Know: ${featuredTopic}`;
+
+      // Emit special card & schedule_call metadata for FE team to render interactive Card UI!
       if (isStreamRequested) {
         res.write(`event: metadata\ndata: ${JSON.stringify({
-          type: "schedule_call",
-          title: "Schedule a Call with Our Team",
+          type: "card",
+          responseType: "card",
+          title: cardTitle,
           action: "SCHEDULE_CALL",
           message: outOfScopeMsg,
-          botMode: currentBotMode
+          conversationId: conversation._id,
+          botMode: currentBotMode,
+          topics: topTopics
         })}\n\n`);
 
         await streamTextInChunks(res, outOfScopeMsg, 15);
       } else {
         return res.json({
           response: outOfScopeMsg,
-          type: "schedule_call",
+          type: "card",
+          responseType: "card",
+          conversationId: conversation._id,
           structuredUI: {
-            type: "schedule_call",
-            title: "Schedule a Call with Our Team",
+            type: "card",
+            responseType: "card",
+            title: cardTitle,
             action: "SCHEDULE_CALL",
             message: outOfScopeMsg,
-            botMode: currentBotMode
+            conversationId: conversation._id,
+            botMode: currentBotMode,
+            topics: topTopics
           }
         });
       }
