@@ -25,7 +25,7 @@ const {
 async function streamTextInChunks(res, text, delayMs = 15) {
   const tokens = text.match(/\s+|\S+/g) || [text];
   for (const token of tokens) {
-    res.write(`event: chunk\ndata: ${JSON.stringify({ text: token })}\n\n`);
+    res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: token, text: token })}\n\n`);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 }
@@ -853,7 +853,7 @@ exports.sendBotChatMessage = async (req, res) => {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
-      res.write(`event: metadata\ndata: ${JSON.stringify({ responseType: "text", title: conversation.title || "Bot Conversation", conversationId: conversation._id })}\n\n`);
+      res.write(`event: metadata\ndata: ${JSON.stringify({ type: "meta", responseType: "text", title: conversation.title || "Bot Conversation", conversationId: conversation._id, chatId: conversation._id })}\n\n`);
     }
 
     // Fetch conversation memory (last 10 messages)
