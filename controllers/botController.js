@@ -1141,7 +1141,30 @@ exports.sendBotChatMessage = async (req, res) => {
         outOfScopeMsg = "I couldn't find information about that topic in the available documentation. I'll be happy to assist you using general knowledge if you'd like!";
       }
 
-      await streamTextInChunks(res, outOfScopeMsg, 15);
+      // Emit special schedule_call metadata for FE team to render schedule call UI!
+      if (isStreamRequested) {
+        res.write(`event: metadata\ndata: ${JSON.stringify({
+          type: "schedule_call",
+          title: "Schedule a Call with Our Team",
+          action: "SCHEDULE_CALL",
+          message: outOfScopeMsg,
+          botMode: currentBotMode
+        })}\n\n`);
+
+        await streamTextInChunks(res, outOfScopeMsg, 15);
+      } else {
+        return res.json({
+          response: outOfScopeMsg,
+          type: "schedule_call",
+          structuredUI: {
+            type: "schedule_call",
+            title: "Schedule a Call with Our Team",
+            action: "SCHEDULE_CALL",
+            message: outOfScopeMsg,
+            botMode: currentBotMode
+          }
+        });
+      }
 
       await BotMessage.create({
         conversationId: conversation._id,
