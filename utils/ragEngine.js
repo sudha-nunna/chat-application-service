@@ -97,7 +97,7 @@ async function generateEmbeddingVectorAsync(text) {
         return data.embedding;
       }
     }
-  } catch (err) {}
+  } catch (err) { }
 
   const fallback = generateEmbeddingVector(text);
   embeddingCache.set(cacheKey, fallback);

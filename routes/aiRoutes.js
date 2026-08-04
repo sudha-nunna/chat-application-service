@@ -17,16 +17,17 @@ router.post("/message/:chatId", protect, chatController.sendMessage);
 
 // Live Cluster Node Health & Load Diagnostics Route
 router.get("/cluster-status", protect, async (req, res) => {
-  await checkClusterHealth();
+  // Trigger background health check asynchronously so response is INSTANT (<5ms)
+  checkClusterHealth().catch((err) => console.warn("⚠️ Background health ping error:", err.message));
 
-  // Sanitize nodes for public user response (strictly omit url and secretKey)
+  // Return live in-memory clusterState instantly
   const sanitizedNodes = clusterState.map((node) => ({
     id: node.id,
     name: node.name,
     defaultModel: node.defaultModel,
     status: node.status,
-    activeRequests: node.activeRequests,
-    lastLatencyMs: node.lastLatencyMs
+    activeRequests: node.activeRequests || 0,
+    lastLatencyMs: node.lastLatencyMs || node.latency || 0
   }));
 
   return res.json({

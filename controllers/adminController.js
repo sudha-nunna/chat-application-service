@@ -11,11 +11,22 @@ exports.getAllNodes = async (req, res) => {
     // Trigger background health check asynchronously so page load is INSTANT (<10ms)
     checkClusterHealth().catch(err => console.warn("⚠️ Background health ping error:", err.message));
 
-    const rawNodes = await ServerNode.find().sort({ priority: -1, createdAt: 1 });
+    const { clusterState } = require("../utils/ollamaHelper");
+    const rawNodes = await ServerNode.find().sort({ priorityScore: -1, priority: -1, createdAt: 1 });
+
+    const activeMap = new Map(clusterState.map(n => [n.id, n.activeRequests || 0]));
+    const successMap = new Map(clusterState.map(n => [n.id, n.successRequests || 0]));
+    const failedMap = new Map(clusterState.map(n => [n.id, n.failedRequests || 0]));
 
     // Mask secret keys in API responses while retaining prefix (e.g. sk-proj-... or AQ.Ab8...)
     const sanitizedNodes = rawNodes.map(n => {
       const doc = n.toObject();
+      doc.activeRequests = activeMap.get(String(n._id)) || 0;
+      doc.successRequests = (doc.successRequests || 0) + (successMap.get(String(n._id)) || 0);
+      doc.failedRequests = (doc.failedRequests || 0) + (failedMap.get(String(n._id)) || 0);
+      doc.priorityScore = typeof doc.priorityScore === "number" ? doc.priorityScore : (doc.priority || 10);
+      doc.latency = doc.latency || doc.lastLatencyMs || 0;
+
       if (doc.secretKey) {
         const rawKey = decrypt(doc.secretKey);
         if (rawKey.startsWith("sk-proj-")) {

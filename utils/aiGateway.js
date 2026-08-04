@@ -70,11 +70,20 @@ class AIGateway {
   }
 
   /**
-   * Streams response from local Ollama Cluster with Load Balancing & Preemption Support
+   * Streams response from Cluster Server Nodes with Provider Pools, Priority Routing,
+   * Least-Loaded Balancing, Intra-Pool & Cross-Pool Failover, and Observability Metrics.
    */
   async _streamOllamaCluster({ model, customUrl, messages, res, userPriority, jobId, userId, onToken }) {
-    let selectedNode = clusterState[0] || { id: "default", name: "Default Node", activeRequests: 0 };
-    const triedNodeIds = new Set();
+    const { getProviderPools, refreshClusterNodesFromDB } = require("./ollamaHelper");
+    await refreshClusterNodesFromDB();
+
+    const ServerNode = require("../models/ServerNode");
+    const { geminiPool, llamaPool, openAiPool, allNodes } = getProviderPools();
+
+    // Group Provider Pools in Priority Fallback Hierarchy: Gemini Pool -> LLaMA Pool -> OpenAI Pool
+    const poolsHierarchy = [geminiPool, llamaPool, openAiPool];
+
+    let selectedNode = null;
     let response = null;
     let errorMessage = "";
     let streamedSuccessfully = false;
@@ -92,86 +101,174 @@ class AIGateway {
       "Accept": "application/json, text/event-stream"
     };
 
-    registerActiveJob(activeJobId, {
-      userId,
-      userPriority,
-      nodeId: selectedNode.id,
-      res,
-      abortController
-    });
+    const triedNodeIds = new Set();
+    const now = new Date();
 
-    // Multi-Node Failover Loop: Tries candidate healthy nodes until HTTP 200 OK is received
-    while (triedNodeIds.size < clusterState.length) {
-      const candidateNodes = clusterState.filter(n => !triedNodeIds.has(n.id) && !n.status.startsWith("OFFLINE"));
-      if (candidateNodes.length === 0) break;
+    // Cross-Pool Failover Loop: Gemini Pool -> LLaMA Pool -> OpenAI Pool
+    for (const currentPool of poolsHierarchy) {
+      if (streamedSuccessfully || (response && response.ok)) break;
 
-      // Select candidate node with lowest active task count
-      candidateNodes.sort((a, b) => a.activeRequests - b.activeRequests);
-      const currentNode = candidateNodes[0];
-      triedNodeIds.add(currentNode.id);
-      currentNode.activeRequests++;
+      // Filter available non-rate-limited and active candidates in current pool
+      let poolCandidates = currentPool.filter(n =>
+        !triedNodeIds.has(n.id) &&
+        n.status !== "INACTIVE" &&
+        !(n.status === "RATE_LIMITED" && n.retryAfter && new Date(n.retryAfter) > now)
+      );
 
-      const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
-      let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
-      if (isCurrentGemini) {
-        currentModel = "gemini-2.0-flash";
-      }
+      if (poolCandidates.length === 0) continue;
 
-      const nodeUrl = customUrl ? customUrl.trim().replace(/\/$/, "") : currentNode.url;
-      const isCloudOrOpenAI = currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("trycloudflare.com");
+      // Intra-Pool Routing Strategy: Priority-Based + Least-Loaded Load Balancing
+      // 1. Sort candidates by priorityScore (descending: highest priority first)
+      // 2. Within same priority score, sort by activeRequests (ascending: least-loaded first)
+      poolCandidates.sort((a, b) => {
+        if ((b.priorityScore || 10) !== (a.priorityScore || 10)) {
+          return (b.priorityScore || 10) - (a.priorityScore || 10);
+        }
+        return a.activeRequests - b.activeRequests;
+      });
 
-      let currentPath;
-      if (isCurrentGemini) {
-        currentPath = nodeUrl.endsWith("/openai") ? "/chat/completions" : "/v1/chat/completions";
-      } else if (isCloudOrOpenAI) {
-        currentPath = "/v1/chat/completions";
-      } else {
-        currentPath = "/api/chat";
-      }
+      // Intra-Pool Failover Loop: Iterate through sorted candidates in this pool
+      for (const currentNode of poolCandidates) {
+        triedNodeIds.add(currentNode.id);
+        currentNode.activeRequests++;
+        currentNode.lastUsedAt = new Date();
 
-      const nodeHeaders = { ...headers };
-      if (currentNode.secretKey) {
-        nodeHeaders["Authorization"] = `Bearer ${currentNode.secretKey}`;
-        nodeHeaders["X-Internal-Secret"] = currentNode.secretKey;
-      }
+        const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
+        let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
+        if (isCurrentGemini && (!currentModel || currentModel === "gemini-2.0-flash" || currentModel === "best")) {
+          currentModel = "gemini-2.5-flash";
+        }
 
-      const payload = { model: currentModel, messages, stream: true };
-      if (currentNode.format === "ollama") payload.keep_alive = "24h";
+        const nodeUrl = customUrl ? customUrl.trim().replace(/\/$/, "") : currentNode.url;
+        const isCloudOrOpenAI = currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("trycloudflare.com");
 
-      try {
-        console.log(`🚀 [AI GATEWAY DISPATCH] Attempting Node: ${currentNode.name} (${currentNode.id}) | Path: ${currentPath} | Model: ${currentModel}`);
-        response = await fetch(`${nodeUrl}${currentPath}`, {
-          method: "POST",
-          headers: nodeHeaders,
-          body: JSON.stringify(payload),
-          signal: abortController.signal
-        });
-
-        if (response.ok) {
-          selectedNode = currentNode;
-          break; // Success! Exit failover loop and stream response
+        let currentPath;
+        if (isCurrentGemini) {
+          currentPath = nodeUrl.endsWith("/openai") ? "/chat/completions" : "/v1/chat/completions";
+        } else if (isCloudOrOpenAI) {
+          currentPath = "/v1/chat/completions";
         } else {
-          console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} (${currentNode.id}) returned HTTP ${response.status}. Trying next available server node...`);
-          if (response.status === 429) {
-            errorMessage = "Google Gemini / Provider API rate limit or daily quota exceeded (HTTP 429).";
-          } else {
-            errorMessage = `AI Server Node ${currentNode.name} returned HTTP ${response.status}.`;
+          currentPath = "/api/chat";
+        }
+
+        let resolvedApiKey = currentNode.secretKey;
+        if (!resolvedApiKey || typeof resolvedApiKey !== "string" || !resolvedApiKey.trim()) {
+          if (isCurrentGemini) {
+            resolvedApiKey = process.env.GEMINI_API_KEY || "";
+          } else if (currentNode.format === "openai" || currentNode.url.includes("openai.com")) {
+            resolvedApiKey = process.env.OPENAI_API_KEY || "";
           }
         }
-      } catch (err) {
-        console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} network error: ${err.message}. Trying next available server node...`);
-        errorMessage = `Network error connecting to node ${currentNode.name}: ${err.message}`;
-      } finally {
-        currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
+
+        const nodeHeaders = { ...headers };
+        if (resolvedApiKey) {
+          nodeHeaders["Authorization"] = `Bearer ${resolvedApiKey}`;
+          nodeHeaders["X-Internal-Secret"] = resolvedApiKey;
+        }
+
+        const targetFetchUrl = `${nodeUrl}${currentPath}`;
+
+        registerActiveJob(activeJobId, {
+          userId,
+          userPriority,
+          nodeId: currentNode.id,
+          res,
+          abortController
+        });
+
+        // High Availability Model Fallback Tiers for Google Gemini (prioritizing 100% active models)
+        const modelsToTry = isCurrentGemini
+          ? ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
+          : [currentModel];
+
+        let modelSuccess = false;
+
+        for (const candidateModel of modelsToTry) {
+          const payload = { model: candidateModel, messages, stream: true };
+          if (currentNode.format === "ollama") payload.keep_alive = "24h";
+
+          const dispatchStartTime = performance.now();
+
+          try {
+            console.log(`🚀 [AI GATEWAY DISPATCH] RequestId: ${activeJobId} | Provider: ${currentNode.format || "auto"} | Node: ${currentNode.name} (${currentNode.id}) | Priority: ${currentNode.priorityScore} | Model: ${candidateModel}`);
+
+            response = await fetch(targetFetchUrl, {
+              method: "POST",
+              headers: nodeHeaders,
+              body: JSON.stringify(payload),
+              signal: abortController.signal
+            });
+
+            const elapsedMs = (performance.now() - dispatchStartTime).toFixed(2);
+            console.log(`⏱️ [AI GATEWAY RESPONSE] RequestId: ${activeJobId} | Node: ${currentNode.name} | Model: ${candidateModel} | HTTP Status: ${response.status} | Latency: ${elapsedMs}ms`);
+
+            if (response.ok) {
+              selectedNode = currentNode;
+              currentNode.successRequests = (currentNode.successRequests || 0) + 1;
+              currentNode.consecutiveFailures = 0;
+              currentNode.status = "ACTIVE";
+              modelSuccess = true;
+
+              if (currentNode.id && currentNode.id.length === 24) {
+                ServerNode.findByIdAndUpdate(currentNode.id, {
+                  $inc: { successRequests: 1 },
+                  status: "ACTIVE",
+                  consecutiveFailures: 0,
+                  defaultModel: candidateModel,
+                  lastUsedAt: new Date()
+                }).catch(() => { });
+              }
+
+              break; // Model success! Exit candidate model loop
+            } else if (response.status === 429 || response.status === 404) {
+              console.warn(`⚠️ [AI GATEWAY MODEL ROTATION] Model '${candidateModel}' returned HTTP ${response.status}. Rotating to next model tier...`);
+              errorMessage = `Provider API Rate Limit Exceeded (HTTP ${response.status}) on ${currentNode.name} (${candidateModel}).`;
+            } else {
+              errorMessage = `Server Node ${currentNode.name} returned HTTP ${response.status}.`;
+              break; // Non-404/429 HTTP error, try next node
+            }
+          } catch (err) {
+            errorMessage = `Network connection error on ${currentNode.name}: ${err.message}`;
+            console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} network error: ${err.message}.`);
+            break;
+          }
+        }
+
+        if (modelSuccess && response && response.ok) {
+          currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
+          break; // Intra-Pool Success! Exit node loop
+        } else {
+          currentNode.failedRequests = (currentNode.failedRequests || 0) + 1;
+          currentNode.consecutiveFailures = (currentNode.consecutiveFailures || 0) + 1;
+
+          if (response && response.status === 429) {
+            currentNode.status = "RATE_LIMITED";
+            currentNode.retryAfter = new Date(Date.now() + 60 * 1000);
+          }
+
+          if (currentNode.id && currentNode.id.length === 24) {
+            ServerNode.findByIdAndUpdate(currentNode.id, {
+              $inc: { failedRequests: 1, consecutiveFailures: 1 },
+              status: currentNode.status,
+              retryAfter: currentNode.retryAfter,
+              errorMessage
+            }).catch(() => { });
+          }
+          currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
+        }
       }
     }
 
-    if (selectedNode) {
-      selectedNode.activeRequests++;
+    if (!selectedNode && allNodes.length > 0) {
+      selectedNode = allNodes[0];
+    }
+    if (!selectedNode) {
+      selectedNode = { id: "fallback", name: "Fallback Node", activeRequests: 0 };
     }
 
     try {
       if (response && response.ok && response.body) {
+        selectedNode.activeRequests++;
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let rawBuffer = "";
@@ -198,10 +295,10 @@ class AIGateway {
 
               try {
                 const parsed = JSON.parse(jsonStr);
-                const chunkText = parsed.choices?.[0]?.delta?.content || 
-                                  parsed.choices?.[0]?.message?.content || 
-                                  parsed.message?.content || 
-                                  parsed.response || "";
+                const chunkText = parsed.choices?.[0]?.delta?.content ||
+                  parsed.choices?.[0]?.message?.content ||
+                  parsed.message?.content ||
+                  parsed.response || "";
                 if (chunkText) {
                   if (!firstTokenTimestamp) {
                     firstTokenTimestamp = performance.now();
@@ -226,10 +323,12 @@ class AIGateway {
         streamedSuccessfully = true;
       }
     } catch (err) {
-      console.warn(`⚠️ [AI GATEWAY ERROR] Ollama execution error: ${err.message}`);
+      console.warn(`⚠️ [AI GATEWAY ERROR] Stream consumption error: ${err.message}`);
     } finally {
       unregisterActiveJob(activeJobId);
-      selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
+      if (selectedNode) {
+        selectedNode.activeRequests = Math.max(0, selectedNode.activeRequests - 1);
+      }
     }
 
     const totalDurationMs = performance.now() - llmStartTime;
@@ -240,7 +339,7 @@ class AIGateway {
       errorMessage,
       ttft,
       totalDurationMs,
-      nodeId: selectedNode.id
+      nodeId: selectedNode ? selectedNode.id : "unknown"
     };
   }
 

@@ -34,14 +34,51 @@ const ServerNodeSchema = new mongoose.Schema(
     priority: {
       type: Number,
       default: 10,
-      min: 1,
+      min: 0,
+      max: 100
+    },
+    priorityScore: {
+      type: Number,
+      default: 10,
+      min: 0,
       max: 100
     },
     status: {
       type: String,
-      default: "HEALTHY"
+      enum: ["ACTIVE", "CHECKING", "RATE_LIMITED", "INACTIVE", "HEALTHY", "UNHEALTHY", "OFFLINE"],
+      default: "ACTIVE"
     },
     lastLatencyMs: {
+      type: Number,
+      default: 0
+    },
+    latency: {
+      type: Number,
+      default: 0
+    },
+    lastChecked: {
+      type: Date,
+      default: Date.now
+    },
+    lastUsedAt: {
+      type: Date
+    },
+    errorMessage: {
+      type: String,
+      default: ""
+    },
+    consecutiveFailures: {
+      type: Number,
+      default: 0
+    },
+    retryAfter: {
+      type: Date
+    },
+    successRequests: {
+      type: Number,
+      default: 0
+    },
+    failedRequests: {
       type: Number,
       default: 0
     }
