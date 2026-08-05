@@ -10,6 +10,7 @@ router.post("/", protect, checkAgentLimit, botController.createBot);
 router.get("/", protect, botController.getBots);
 router.get("/:botId", protect, botController.getBotById);
 router.put("/:botId", protect, botController.updateBot);
+router.patch("/:botId", protect, botController.updateBot);
 router.delete("/:botId", protect, botController.deleteBot);
 
 // Bot API Key & Secret Key Management (Production Standard)

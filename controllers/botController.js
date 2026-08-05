@@ -205,26 +205,25 @@ exports.getBotById = async (req, res) => {
 exports.updateBot = async (req, res) => {
   try {
     const { botId } = req.params;
-    const { name, description, model, botMode, allowedDomains, systemPrompt } = req.body;
+    const { name, model } = req.body;
 
     const updateData = {};
-    if (name !== undefined) updateData.name = name;
-    if (description !== undefined) updateData.description = description;
-    if (systemPrompt !== undefined) updateData.systemPrompt = systemPrompt;
-
-    if (Array.isArray(allowedDomains)) {
-      updateData.allowedDomains = allowedDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean);
-    }
-
-    if (botMode) {
-      updateData.botMode = ["small", "medium", "large"].includes(botMode.toLowerCase()) ? botMode.toLowerCase() : "medium";
-    }
-    if (model) {
-      if (["small", "medium", "large"].includes(model.toLowerCase())) {
-        updateData.botMode = model.toLowerCase();
-      } else {
-        updateData.model = model;
+    if (name !== undefined) {
+      if (typeof name !== "string" || !name.trim()) {
+        return res.status(400).json({ error: "Bot name is required and cannot be empty." });
       }
+      updateData.name = name.trim();
+    }
+
+    if (model !== undefined) {
+      if (typeof model !== "string" || !model.trim()) {
+        return res.status(400).json({ error: "Model is required and cannot be empty." });
+      }
+      updateData.model = model.trim();
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: "Please provide bot name or model to update." });
     }
 
     const bot = await Bot.findOneAndUpdate(
