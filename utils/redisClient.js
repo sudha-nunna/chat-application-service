@@ -1,17 +1,29 @@
 const Redis = require("ioredis");
 
-// High-Performance Redis Client for In-Memory Caching (< 1ms latency)
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "127.0.0.1",
-  port: parseInt(process.env.REDIS_PORT || "6379"),
-  password: process.env.REDIS_PASSWORD || undefined,
+const redisConfig = {
   maxRetriesPerRequest: null, // Required by BullMQ
-  enableReadyCheck: true,
-  lazyConnect: false
-});
+  connectTimeout: 5000,
+  enableReadyCheck: false,
+  retryStrategy(times) {
+    if (times > 3) {
+      console.warn("⚠️ [REDIS NOTICE] Max retries reached. Operating in fallback mode.");
+      return null;
+    }
+    return Math.min(times * 200, 1000);
+  }
+};
+
+const redis = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL, redisConfig)
+  : new Redis({
+      host: process.env.REDIS_HOST || "127.0.0.1",
+      port: parseInt(process.env.REDIS_PORT || "6379"),
+      password: process.env.REDIS_PASSWORD || undefined,
+      ...redisConfig
+    });
 
 redis.on("connect", () => {
-  console.log("⚡ [REDIS CONNECTED] High-speed Redis connected on 127.0.0.1:6379");
+  console.log("⚡ [REDIS CONNECTED] High-speed Redis connected successfully.");
 });
 
 redis.on("error", (err) => {
