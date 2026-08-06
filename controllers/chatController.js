@@ -220,7 +220,7 @@ exports.sendMessage = async (req, res) => {
     dbFetchTime = performance.now() - tDbStart;
 
     // Unified System Instruction Block merging Core Guidelines and Conversation Summary
-    let unifiedSystemPrompt = `You are Allvion AI, a highly capable, articulate, and helpful conversational AI assistant.
+    let unifiedSystemPrompt = `You are a helpful, highly capable, articulate, and intelligent AI Assistant (like ChatGPT).
 
 CORE BEHAVIOR RULES:
 1. Be direct, natural, engaging, and articulate—just like ChatGPT.
