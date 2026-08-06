@@ -1628,6 +1628,9 @@ exports.generateBotKeys = async (req, res) => {
     bot.keyCreatedAt = new Date();
     await bot.save();
 
+    const hostUrl = process.env.SERVER_URL || `${req.protocol}://${req.get("host")}`;
+    const chatUrl = `${hostUrl.replace(/\/$/, "")}/api/v1/external/bots/chat`;
+
     return res.status(201).json({
       success: true,
       message: "Bot API Key and Secret Key generated successfully.",
@@ -1635,7 +1638,8 @@ exports.generateBotKeys = async (req, res) => {
       botName: bot.name,
       apiKey: bot.apiKey,
       secretKey: bot.secretKey,
-      keyCreatedAt: bot.keyCreatedAt
+      keyCreatedAt: bot.keyCreatedAt,
+      chatUrl
     });
   } catch (err) {
     console.error("Generate Bot Keys Error:", err);
@@ -1665,11 +1669,15 @@ exports.getBotKeys = async (req, res) => {
       return res.status(404).json({ success: false, message: "Bot not found or unauthorized." });
     }
 
+    const hostUrl = process.env.SERVER_URL || `${req.protocol}://${req.get("host")}`;
+    const chatUrl = `${hostUrl.replace(/\/$/, "")}/api/v1/external/bots/chat`;
+
     if (!bot.apiKey || !bot.secretKey) {
       return res.json({
         success: true,
         hasKeys: false,
-        message: "No API Key or Secret Key has been generated for this bot yet."
+        message: "No API Key or Secret Key has been generated for this bot yet.",
+        chatUrl
       });
     }
 
@@ -1681,7 +1689,8 @@ exports.getBotKeys = async (req, res) => {
       apiKey: bot.apiKey,
       secretKey: bot.secretKey,
       keyCreatedAt: bot.keyCreatedAt,
-      keyLastUsedAt: bot.keyLastUsedAt
+      keyLastUsedAt: bot.keyLastUsedAt,
+      chatUrl
     });
   } catch (err) {
     console.error("Get Bot Keys Error:", err);
