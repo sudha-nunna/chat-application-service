@@ -41,6 +41,14 @@ const botSchema = new mongoose.Schema(
       type: String,
       default: "You are a specialized AI assistant. You answer questions strictly based on the provided knowledge base and integrated APIs."
     },
+    rulesConfig: {
+      manualRulesText: { type: String, default: "" },
+      rulesText: { type: String, default: "" },
+      rulesCount: { type: Number, default: 0 },
+      wantsScheduleCard: { type: Boolean, default: false },
+      rulesList: { type: [String], default: [] },
+      sourceFiles: { type: [String], default: [] }
+    },
     knowledgeSummary: {
       titles: { type: [String], default: [] },
       products: { type: [String], default: [] },

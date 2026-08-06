@@ -1,3 +1,4 @@
+const mongoose = require("mongoose");
 const { performance } = require("perf_hooks");
 const Bot = require("../models/Bot");
 const BotFile = require("../models/BotFile");
@@ -6,9 +7,7 @@ const BotEmbedding = require("../models/BotEmbeddings");
 const BotApi = require("../models/BotApi");
 const BotConversation = require("../models/BotConversation");
 const BotMessage = require("../models/BotMessage");
-const BotContact = require("../models/BotContact");
 const { encrypt, decrypt } = require("../utils/crypto");
-const { extractEntities, isEntitiesComplete } = require("../utils/entityExtractor");
 const {
   chunkText,
   generateEmbeddingVector,
@@ -25,73 +24,10 @@ const {
 async function streamTextInChunks(res, text, delayMs = 15) {
   const tokens = text.match(/\s+|\S+/g) || [text];
   for (const token of tokens) {
+    console.log(`📡 [SSE OUT Chunk (Helper)]`, JSON.stringify({ text: token }));
     res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: token, text: token })}\n\n`);
     await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
-}
-
-/**
- * Generic multi-agent contact & lead capture automation.
- * If a custom BotApi is attached to this bot, dispatches payload directly to the custom API endpoint.
- * Otherwise, persists the contact record locally into BotContact database.
- */
-async function triggerBotContactAutomation(userId, botId, conversationId, contactDetails) {
-  // Check if bot has a user-configured custom API integration
-  const botApis = await BotApi.find({ botId, $or: [{ userId }, { ownerId: userId }] });
-  const postApi = botApis.find(a => a.method === "POST") || botApis[0];
-
-  let crmContactId = `lead_${Date.now()}`;
-  let crmSyncStatus = "SUCCESS";
-
-  if (postApi && postApi.url) {
-    const headers = { "Content-Type": "application/json" };
-    if (postApi.authType === "apiKey" && postApi.encryptedApiKey) {
-      headers["x-api-key"] = decrypt(postApi.encryptedApiKey);
-    } else if (postApi.authType === "bearerToken" && postApi.encryptedBearerToken) {
-      headers["Authorization"] = `Bearer ${decrypt(postApi.encryptedBearerToken)}`;
-    }
-
-    try {
-      const response = await fetch(postApi.url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          firstName: contactDetails.firstName,
-          lastName: contactDetails.lastName,
-          email: contactDetails.email,
-          phone: contactDetails.phone,
-          companyName: contactDetails.companyName || "N/A"
-        })
-      });
-
-      if (response.ok) {
-        const resData = await response.json();
-        crmContactId = resData.contactId || resData.id || `lead_${Date.now()}`;
-      }
-    } catch (err) {
-      console.warn("⚠️ Custom Bot API Dispatch Notice (recording locally):", err.message);
-    }
-  }
-
-  const savedContact = await BotContact.findOneAndUpdate(
-    { userId, botId, email: contactDetails.email },
-    {
-      userId,
-      botId,
-      conversationId,
-      firstName: contactDetails.firstName,
-      lastName: contactDetails.lastName,
-      email: contactDetails.email,
-      phone: contactDetails.phone,
-      companyName: contactDetails.companyName,
-      crmContactId,
-      crmSyncStatus,
-      crmSyncedAt: new Date()
-    },
-    { upsert: true, new: true }
-  );
-
-  return savedContact;
 }
 
 // -----------------------------------------------------------------------------
@@ -100,14 +36,22 @@ async function triggerBotContactAutomation(userId, botId, conversationId, contac
 
 exports.createBot = async (req, res) => {
   try {
-    const { name, description, model, botMode, allowedDomains, systemPrompt, initialApis, stagedFiles } = req.body;
+    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Bot name is required." });
     }
 
     const uploadedFiles = Array.isArray(stagedFiles) ? stagedFiles : [];
-    if (uploadedFiles.length === 0) {
-      return res.status(400).json({ error: "Please upload at least one knowledge file before creating the bot." });
+    if (uploadedFiles.length === 0 && (!rulesText || !rulesText.trim())) {
+      return res.status(400).json({ error: "Please upload at least one knowledge/rules file or specify rules before creating the bot." });
+    }
+
+    // Validate Rule Limits if rulesText is provided directly
+    if (rulesText && typeof rulesText === "string" && rulesText.trim()) {
+      const validation = validateRulesLimits(rulesText);
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.error });
+      }
     }
 
     // Determine botMode: small, medium, or large
@@ -115,6 +59,17 @@ exports.createBot = async (req, res) => {
     const finalBotMode = ["small", "medium", "large"].includes(effectiveBotMode) ? effectiveBotMode : "medium";
     const finalModel = (model && !["small", "medium", "large"].includes(model.toLowerCase())) ? model : "gpt-4o";
     const domainsList = Array.isArray(allowedDomains) ? allowedDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean) : [];
+
+    const rawRulesText = (rulesText && typeof rulesText === "string") ? rulesText.trim() : "";
+    const rulesLines = rawRulesText.split(/\r?\n/).filter(l => l.trim().length > 0);
+    const initialRulesObj = {
+      manualRulesText: rawRulesText,
+      rulesText: rawRulesText,
+      rulesCount: rulesLines.length,
+      wantsScheduleCard: /\b(schedule|call|agent|human|appointment|meeting|card|contact|escalat)\b/i.test(rawRulesText),
+      rulesList: rulesLines,
+      sourceFiles: []
+    };
 
     const bot = await Bot.create({
       ownerId: req.user.id,
@@ -124,8 +79,15 @@ exports.createBot = async (req, res) => {
       model: finalModel,
       botMode: finalBotMode,
       allowedDomains: domainsList,
-      systemPrompt: systemPrompt || "You are a specialized AI assistant."
+      systemPrompt: systemPrompt || "You are a specialized AI assistant.",
+      rulesConfig: initialRulesObj
     });
+
+    // Sync rules object to Redis if provided directly
+    if (bot.rulesConfig?.rulesText) {
+      const { setCache } = require("../utils/redisClient");
+      await setCache(`bot:${bot._id}:rules`, initialRulesObj, 3600);
+    }
 
     // Create initial APIs if provided
     if (initialApis && Array.isArray(initialApis)) {
@@ -236,6 +198,9 @@ exports.updateBot = async (req, res) => {
       return res.status(404).json({ error: "Bot not found or unauthorized." });
     }
 
+    const { delCache } = require("../utils/redisClient");
+    await delCache(`bot_cfg_${botId}_${req.user.id}`);
+
     return res.json(bot);
   } catch (err) {
     console.error("Update Bot error:", err);
@@ -274,10 +239,175 @@ exports.deleteBot = async (req, res) => {
 // 2. KNOWLEDGE UPLOAD & RAG CHUNKING CONTROLLERS
 // -----------------------------------------------------------------------------
 
+function validateRulesLimits(rulesText) {
+  if (!rulesText || typeof rulesText !== "string") {
+    return { valid: true, ruleCount: 0, charCount: 0 };
+  }
+  const trimmed = rulesText.trim();
+  const ruleLines = trimmed.split(/\r?\n/).filter(line => line.trim().length > 0);
+  return { valid: true, ruleCount: ruleLines.length, charCount: trimmed.length };
+}
+
+/**
+ * Intelligently parse raw text into clean, cohesive Rule items.
+ * Bundles section titles (e.g. "1. RESPONSE LENGTH") with their bullet points
+ * and strips out decorative divider lines (e.g. ===, ---).
+ */
+function parseStructuredRules(rawText) {
+  if (!rawText || typeof rawText !== "string") return [];
+
+  // Split by newlines and clean lines
+  const rawLines = rawText.split(/\r?\n/).map(l => l.trim()).filter(l => {
+    if (!l) return false;
+    if (/^[=\-*#\s]{3,}$/.test(l)) return false; // Ignore decorative divider lines like ===, ---
+    if (/^={3,}.*=*/.test(l) || /=*={3,}$/.test(l)) return false; // Ignore header bars like === CODEGENE AI ===
+    return true;
+  });
+
+  const ruleItems = [];
+
+  for (const line of rawLines) {
+    // If line has internal bullet points separated by bullet characters like •, split them as well
+    if (line.includes("•")) {
+      const subItems = line.split("•").map(s => s.trim()).filter(Boolean);
+      subItems.forEach(item => {
+        const clean = item.replace(/^[\d+\.\-\*•\s]+/, "").trim();
+        if (clean && clean.length > 2) ruleItems.push(clean);
+      });
+    } else {
+      const clean = line.replace(/^[\d+\.\-\*•\s]+/, "").trim();
+      if (clean && clean.length > 2) {
+        ruleItems.push(clean);
+      }
+    }
+  }
+
+  return Array.from(new Set(ruleItems));
+}
+
+async function syncBotRulesText(botId) {
+  try {
+    const { setCache, delCache } = require("../utils/redisClient");
+    const bot = await Bot.findById(botId).select("rulesConfig");
+    const rulesFiles = await BotFile.find({ botId, fileCategory: "rules" });
+
+    const fileRulesTexts = rulesFiles
+      .map(f => f.parsedText || f.originalContent || "")
+      .filter(Boolean);
+
+    const sourceFiles = rulesFiles.map(f => f.fileName);
+
+    const allTextParts = [];
+    const manualRulesText = bot?.rulesConfig?.manualRulesText || "";
+    if (manualRulesText && manualRulesText.trim()) {
+      allTextParts.push(manualRulesText.trim());
+    }
+    allTextParts.push(...fileRulesTexts);
+
+    const fullRawText = allTextParts.join("\n");
+    const rulesLines = parseStructuredRules(fullRawText);
+    const combinedRulesText = rulesLines.join("\n");
+
+    const rulesObj = {
+      manualRulesText,
+      rulesText: combinedRulesText,
+      rulesCount: rulesLines.length,
+      wantsScheduleCard: /\b(schedule|call|agent|human|appointment|meeting|card|contact|escalat|live_agent)\b/i.test(combinedRulesText),
+      rulesList: rulesLines,
+      sourceFiles
+    };
+
+    await Bot.findByIdAndUpdate(botId, {
+      rulesConfig: rulesObj
+    });
+
+    const rulesKey = `bot:${botId}:rules`;
+    if (combinedRulesText.trim()) {
+      await setCache(rulesKey, rulesObj, 3600); // 1 hour TTL
+    } else {
+      await delCache(rulesKey);
+    }
+
+    return combinedRulesText;
+  } catch (err) {
+    console.error("syncBotRulesText Error:", err);
+    return "";
+  }
+}
+
+/**
+ * Controller to update itemized rules list (add, edit, delete rule items directly)
+ * Endpoint: PUT /bots/:botId/rules
+ */
+exports.updateBotRules = async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const { rulesList, manualRulesText } = req.body;
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!bot) {
+      return res.status(404).json({ error: "Bot not found or unauthorized." });
+    }
+
+    let finalRulesList = [];
+
+    if (Array.isArray(rulesList)) {
+      finalRulesList = rulesList.map(r => String(r).trim()).filter(Boolean);
+    } else if (typeof manualRulesText === "string") {
+      finalRulesList = parseStructuredRules(manualRulesText);
+    } else {
+      return res.status(400).json({ error: "Please provide valid rulesList array or manualRulesText string." });
+    }
+
+    const combinedRulesText = Array.from(new Set(finalRulesList)).join("\n");
+    const validation = validateRulesLimits(combinedRulesText);
+    if (!validation.valid) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const rulesFiles = await BotFile.find({ botId, fileCategory: "rules" });
+    const sourceFiles = rulesFiles.map(f => f.fileName);
+
+    const rulesObj = {
+      manualRulesText: typeof manualRulesText === "string" ? manualRulesText.trim() : combinedRulesText,
+      rulesText: combinedRulesText,
+      rulesCount: finalRulesList.length,
+      wantsScheduleCard: /\b(schedule|call|agent|human|appointment|meeting|card|contact|escalat)\b/i.test(combinedRulesText),
+      rulesList: finalRulesList,
+      sourceFiles
+    };
+
+    bot.rulesConfig = rulesObj;
+    await bot.save();
+
+    const { setCache, delCache } = require("../utils/redisClient");
+    const rulesKey = `bot:${botId}:rules`;
+    if (combinedRulesText.trim()) {
+      await setCache(rulesKey, rulesObj, 3600);
+    } else {
+      await delCache(rulesKey);
+    }
+    await delCache(`bot_cfg_${botId}_${req.user.id}`);
+
+    return res.json({
+      success: true,
+      message: "Bot rules updated successfully.",
+      rulesConfig: rulesObj
+    });
+  } catch (err) {
+    console.error("Update Bot Rules Error:", err);
+    return res.status(500).json({ error: "Failed to update bot rules." });
+  }
+};
+
 exports.uploadBotFile = async (req, res) => {
   try {
     const { botId } = req.params;
-    const { fileName, fileType, fileContentBase64, rawText } = req.body;
+    const { fileName, fileType, fileCategory, fileContentBase64, rawText } = req.body;
 
     const bot = await Bot.findOne({
       _id: botId,
@@ -287,19 +417,45 @@ exports.uploadBotFile = async (req, res) => {
       return res.status(404).json({ error: "Bot not found or unauthorized." });
     }
 
+    const cleanName = fileName || `file_${Date.now()}.${fileType || "txt"}`;
+    const detectedType = (fileType || cleanName.split(".").pop() || "txt").toLowerCase();
+    const category = (fileCategory || "knowledge").toLowerCase() === "rules" ? "rules" : "knowledge";
+
+    if (category === "rules" && detectedType !== "txt") {
+      return res.status(400).json({ error: "Only .txt files are accepted for bot rules policy documents." });
+    }
+
     let parsedContent = rawText || "";
 
     if (!parsedContent && fileContentBase64) {
       const buffer = Buffer.from(fileContentBase64, "base64");
-      parsedContent = buffer.toString("utf-8");
+      if (detectedType === "pdf") {
+        try {
+          const pdfParse = require("pdf-parse");
+          const pdfData = await pdfParse(buffer);
+          parsedContent = pdfData.text || "";
+        } catch (pdfErr) {
+          console.error("PDF parse error in uploadBotFile:", pdfErr);
+          parsedContent = buffer.toString("utf-8");
+        }
+      } else {
+        parsedContent = buffer.toString("utf-8");
+      }
     }
 
-    if (!parsedContent || typeof parsedContent !== "string") {
-      return res.status(400).json({ error: "File content could not be read or parsed." });
+    if (!parsedContent || typeof parsedContent !== "string" || !parsedContent.trim()) {
+      return res.status(400).json({ error: "File content could not be read or extracted." });
     }
 
-    const cleanName = fileName || `file_${Date.now()}.${fileType || "txt"}`;
-    const detectedType = (fileType || cleanName.split(".").pop() || "txt").toLowerCase();
+    // Validate Rule Limits if file is a Rules Document
+    if (category === "rules") {
+      const existingRulesFiles = await BotFile.find({ botId, fileCategory: "rules" });
+      const combinedRulesText = [...existingRulesFiles.map(f => f.parsedText || ""), parsedContent].join("\n");
+      const validation = validateRulesLimits(combinedRulesText);
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.error });
+      }
+    }
 
     // Store BotFile record preserving originalContent and metadata
     const botFile = await BotFile.create({
@@ -308,66 +464,74 @@ exports.uploadBotFile = async (req, res) => {
       userId: req.user.id,
       fileName: cleanName,
       fileType: detectedType,
+      fileCategory: category,
       fileSize: Buffer.byteLength(parsedContent, "utf-8"),
       originalContent: parsedContent,
       parsedText: parsedContent
     });
 
-    console.log(`📁 [AUDIT LOG] Knowledge File Uploaded: ${cleanName}, Type: ${detectedType}, Size: ${botFile.fileSize} bytes`);
+    console.log(`📁 [AUDIT LOG] File Uploaded (${category}): ${cleanName}, Type: ${detectedType}, Size: ${botFile.fileSize} bytes`);
 
-    // Generate text chunks & embeddings
-    const chunkSnippets = chunkText(parsedContent, 200, 30);
-    const chunkDocs = [];
+    // Only generate RAG text chunks & embeddings for Knowledge files (NOT Rules files)
+    if (category === "knowledge") {
+      const chunkSnippets = chunkText(parsedContent, 200, 30);
+      const chunkDocs = [];
 
-    for (let i = 0; i < chunkSnippets.length; i++) {
-      chunkDocs.push({
-        botId,
-        userId: req.user.id,
-        fileId: botFile._id,
-        chunkIndex: i,
-        text: chunkSnippets[i].text,
-        keywords: chunkSnippets[i].keywords
-      });
-    }
-
-    if (chunkDocs.length > 0) {
-      const insertedChunks = await BotChunk.insertMany(chunkDocs);
-
-      // Create BotEmbeddings vector records using nomic-embed-text
-      const embeddingDocs = await Promise.all(
-        insertedChunks.map(async (chunk) => ({
-          userId: req.user.id,
+      for (let i = 0; i < chunkSnippets.length; i++) {
+        chunkDocs.push({
           botId,
+          userId: req.user.id,
           fileId: botFile._id,
-          chunkId: chunk._id,
-          text: chunk.text,
-          embedding: await generateEmbeddingVectorAsync(chunk.text)
-        }))
-      );
+          chunkIndex: i,
+          text: chunkSnippets[i].text,
+          keywords: chunkSnippets[i].keywords
+        });
+      }
 
-      await BotEmbedding.insertMany(embeddingDocs);
+      if (chunkDocs.length > 0) {
+        const insertedChunks = await BotChunk.insertMany(chunkDocs);
+
+        // Create BotEmbeddings vector records using nomic-embed-text
+        const embeddingDocs = await Promise.all(
+          insertedChunks.map(async (chunk) => ({
+            userId: req.user.id,
+            botId,
+            fileId: botFile._id,
+            chunkId: chunk._id,
+            text: chunk.text,
+            embedding: await generateEmbeddingVectorAsync(chunk.text)
+          }))
+        );
+
+        await BotEmbedding.insertMany(embeddingDocs);
+      }
+
+      botFile.chunkCount = chunkDocs.length;
+      await botFile.save();
+
+      const knowledgeMetadata = extractKnowledgeMetadataFromText(parsedContent);
+      await Bot.findByIdAndUpdate(botId, {
+        $set: {
+          knowledgeSummary: {
+            titles: Array.from(new Set([...(bot.knowledgeSummary?.titles || []), ...knowledgeMetadata.titles])),
+            products: Array.from(new Set([...(bot.knowledgeSummary?.products || []), ...knowledgeMetadata.products])),
+            modules: Array.from(new Set([...(bot.knowledgeSummary?.modules || []), ...knowledgeMetadata.modules])),
+            topics: Array.from(new Set([...(bot.knowledgeSummary?.topics || []), ...knowledgeMetadata.topics])),
+            features: Array.from(new Set([...(bot.knowledgeSummary?.features || []), ...knowledgeMetadata.features])),
+            services: Array.from(new Set([...(bot.knowledgeSummary?.services || []), ...knowledgeMetadata.services])),
+            headings: Array.from(new Set([...(bot.knowledgeSummary?.headings || []), ...knowledgeMetadata.headings])),
+            rawSummary: knowledgeMetadata.rawSummary || (bot.knowledgeSummary?.rawSummary || "")
+          },
+          knowledgeTopics: Array.from(new Set([...(bot.knowledgeTopics || []), ...knowledgeMetadata.topics])),
+          knowledgeModules: Array.from(new Set([...(bot.knowledgeModules || []), ...knowledgeMetadata.modules]))
+        }
+      });
+    } else {
+      botFile.chunkCount = 0;
+      await botFile.save();
     }
 
-    botFile.chunkCount = chunkDocs.length;
-    await botFile.save();
-
-    const knowledgeMetadata = extractKnowledgeMetadataFromText(parsedContent);
-    await Bot.findByIdAndUpdate(botId, {
-      $set: {
-        knowledgeSummary: {
-          titles: Array.from(new Set([...(bot.knowledgeSummary?.titles || []), ...knowledgeMetadata.titles])),
-          products: Array.from(new Set([...(bot.knowledgeSummary?.products || []), ...knowledgeMetadata.products])),
-          modules: Array.from(new Set([...(bot.knowledgeSummary?.modules || []), ...knowledgeMetadata.modules])),
-          topics: Array.from(new Set([...(bot.knowledgeSummary?.topics || []), ...knowledgeMetadata.topics])),
-          features: Array.from(new Set([...(bot.knowledgeSummary?.features || []), ...knowledgeMetadata.features])),
-          services: Array.from(new Set([...(bot.knowledgeSummary?.services || []), ...knowledgeMetadata.services])),
-          headings: Array.from(new Set([...(bot.knowledgeSummary?.headings || []), ...knowledgeMetadata.headings])),
-          rawSummary: knowledgeMetadata.rawSummary || (bot.knowledgeSummary?.rawSummary || "")
-        },
-        knowledgeTopics: Array.from(new Set([...(bot.knowledgeTopics || []), ...knowledgeMetadata.topics])),
-        knowledgeModules: Array.from(new Set([...(bot.knowledgeModules || []), ...knowledgeMetadata.modules]))
-      }
-    });
+    await syncBotRulesText(botId);
 
     return res.status(201).json(botFile);
   } catch (err) {
@@ -394,16 +558,12 @@ exports.getBotFiles = async (req, res) => {
 exports.replaceBotFile = async (req, res) => {
   try {
     const { botId, fileId } = req.params;
-    const { fileName, fileType, fileContentBase64, rawText } = req.body;
+    const { fileName, fileType, fileCategory, fileContentBase64, rawText } = req.body;
 
     const bot = await Bot.findOne({
       _id: botId,
       $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
     });
-    if (!bot) {
-      return res.status(404).json({ error: "Bot not found or unauthorized." });
-    }
-
     const existingFile = await BotFile.findOne({
       _id: fileId,
       botId,
@@ -413,18 +573,48 @@ exports.replaceBotFile = async (req, res) => {
       return res.status(404).json({ error: "File to replace was not found." });
     }
 
+    const cleanName = fileName || existingFile.fileName;
+    const detectedType = (fileType || cleanName.split(".").pop() || "txt").toLowerCase();
+    if (fileCategory) {
+      existingFile.fileCategory = fileCategory.toLowerCase() === "rules" ? "rules" : "knowledge";
+    }
+
+    if (existingFile.fileCategory === "rules" && detectedType !== "txt") {
+      return res.status(400).json({ error: "Only .txt files are accepted for bot rules policy documents." });
+    }
+
     let parsedContent = rawText || "";
     if (!parsedContent && fileContentBase64) {
       const buffer = Buffer.from(fileContentBase64, "base64");
-      parsedContent = buffer.toString("utf-8");
+      if (detectedType === "pdf") {
+        try {
+          const pdfParse = require("pdf-parse");
+          const pdfData = await pdfParse(buffer);
+          parsedContent = pdfData.text || "";
+        } catch (pdfErr) {
+          console.error("PDF parse error in replaceBotFile:", pdfErr);
+          parsedContent = buffer.toString("utf-8");
+        }
+      } else {
+        parsedContent = buffer.toString("utf-8");
+      }
     }
 
-    if (!parsedContent || typeof parsedContent !== "string") {
+    if (!parsedContent || typeof parsedContent !== "string" || !parsedContent.trim()) {
       return res.status(400).json({ error: "Replacement file content could not be read or parsed." });
     }
 
-    const cleanName = fileName || existingFile.fileName;
-    const detectedType = (fileType || cleanName.split(".").pop() || "txt").toLowerCase();
+    const isRulesCategory = existingFile.fileCategory === "rules";
+
+    // Validate Rule Limits if file is a Rules Document
+    if (isRulesCategory) {
+      const otherRulesFiles = await BotFile.find({ botId, fileCategory: "rules", _id: { $ne: fileId } });
+      const combinedRulesText = [...otherRulesFiles.map(f => f.parsedText || ""), parsedContent].join("\n");
+      const validation = validateRulesLimits(combinedRulesText);
+      if (!validation.valid) {
+        return res.status(400).json({ error: validation.error });
+      }
+    }
 
     // 1. Purge all previous chunks & embeddings for this file
     await BotChunk.deleteMany({ fileId });
@@ -437,59 +627,66 @@ exports.replaceBotFile = async (req, res) => {
     existingFile.originalContent = parsedContent;
     existingFile.parsedText = parsedContent;
 
-    // 3. Chunk new content & generate vector embeddings
-    const chunkSnippets = chunkText(parsedContent, 200, 30);
-    const chunkDocs = [];
+    // 3. Chunk new content & generate vector embeddings ONLY if Knowledge category
+    if (!isRulesCategory) {
+      const chunkSnippets = chunkText(parsedContent, 200, 30);
+      const chunkDocs = [];
 
-    for (let i = 0; i < chunkSnippets.length; i++) {
-      chunkDocs.push({
-        botId,
-        userId: req.user.id,
-        fileId: existingFile._id,
-        chunkIndex: i,
-        text: chunkSnippets[i].text,
-        keywords: chunkSnippets[i].keywords
-      });
-    }
-
-    if (chunkDocs.length > 0) {
-      const insertedChunks = await BotChunk.insertMany(chunkDocs);
-
-      const embeddingDocs = await Promise.all(
-        insertedChunks.map(async (chunk) => ({
-          userId: req.user.id,
+      for (let i = 0; i < chunkSnippets.length; i++) {
+        chunkDocs.push({
           botId,
+          userId: req.user.id,
           fileId: existingFile._id,
-          chunkId: chunk._id,
-          text: chunk.text,
-          embedding: await generateEmbeddingVectorAsync(chunk.text)
-        }))
-      );
+          chunkIndex: i,
+          text: chunkSnippets[i].text,
+          keywords: chunkSnippets[i].keywords
+        });
+      }
 
-      await BotEmbedding.insertMany(embeddingDocs);
+      if (chunkDocs.length > 0) {
+        const insertedChunks = await BotChunk.insertMany(chunkDocs);
+
+        const embeddingDocs = await Promise.all(
+          insertedChunks.map(async (chunk) => ({
+            userId: req.user.id,
+            botId,
+            fileId: existingFile._id,
+            chunkId: chunk._id,
+            text: chunk.text,
+            embedding: await generateEmbeddingVectorAsync(chunk.text)
+          }))
+        );
+
+        await BotEmbedding.insertMany(embeddingDocs);
+      }
+
+      existingFile.chunkCount = chunkDocs.length;
+      await existingFile.save();
+
+      // 4. Update knowledge metadata summary
+      const knowledgeMetadata = extractKnowledgeMetadataFromText(parsedContent);
+      await Bot.findByIdAndUpdate(botId, {
+        $set: {
+          knowledgeSummary: {
+            titles: Array.from(new Set([...(bot.knowledgeSummary?.titles || []), ...knowledgeMetadata.titles])),
+            products: Array.from(new Set([...(bot.knowledgeSummary?.products || []), ...knowledgeMetadata.products])),
+            modules: Array.from(new Set([...(bot.knowledgeSummary?.modules || []), ...knowledgeMetadata.modules])),
+            topics: Array.from(new Set([...(bot.knowledgeSummary?.topics || []), ...knowledgeMetadata.topics])),
+            features: Array.from(new Set([...(bot.knowledgeSummary?.features || []), ...knowledgeMetadata.features])),
+            services: Array.from(new Set([...(bot.knowledgeSummary?.services || []), ...knowledgeMetadata.services])),
+            headings: Array.from(new Set([...(bot.knowledgeSummary?.headings || []), ...knowledgeMetadata.headings])),
+            rawSummary: knowledgeMetadata.rawSummary || (bot.knowledgeSummary?.rawSummary || "")
+          },
+          knowledgeTopics: Array.from(new Set([...(bot.knowledgeTopics || []), ...knowledgeMetadata.topics])),
+          knowledgeModules: Array.from(new Set([...(bot.knowledgeModules || []), ...knowledgeMetadata.modules]))
+        }
+      });
+    } else {
+      existingFile.chunkCount = 0;
+      await existingFile.save();
     }
 
-    existingFile.chunkCount = chunkDocs.length;
-    await existingFile.save();
-
-    // 4. Update knowledge metadata summary
-    const knowledgeMetadata = extractKnowledgeMetadataFromText(parsedContent);
-    await Bot.findByIdAndUpdate(botId, {
-      $set: {
-        knowledgeSummary: {
-          titles: Array.from(new Set([...(bot.knowledgeSummary?.titles || []), ...knowledgeMetadata.titles])),
-          products: Array.from(new Set([...(bot.knowledgeSummary?.products || []), ...knowledgeMetadata.products])),
-          modules: Array.from(new Set([...(bot.knowledgeSummary?.modules || []), ...knowledgeMetadata.modules])),
-          topics: Array.from(new Set([...(bot.knowledgeSummary?.topics || []), ...knowledgeMetadata.topics])),
-          features: Array.from(new Set([...(bot.knowledgeSummary?.features || []), ...knowledgeMetadata.features])),
-          services: Array.from(new Set([...(bot.knowledgeSummary?.services || []), ...knowledgeMetadata.services])),
-          headings: Array.from(new Set([...(bot.knowledgeSummary?.headings || []), ...knowledgeMetadata.headings])),
-          rawSummary: knowledgeMetadata.rawSummary || (bot.knowledgeSummary?.rawSummary || "")
-        },
-        knowledgeTopics: Array.from(new Set([...(bot.knowledgeTopics || []), ...knowledgeMetadata.topics])),
-        knowledgeModules: Array.from(new Set([...(bot.knowledgeModules || []), ...knowledgeMetadata.modules]))
-      }
-    });
+    await syncBotRulesText(botId);
 
     console.log(`📁 [AUDIT LOG] Knowledge File Replaced Successfully: ${cleanName}, New Size: ${existingFile.fileSize} bytes, Chunks: ${chunkDocs.length}`);
     return res.json(existingFile);
@@ -513,6 +710,8 @@ exports.deleteBotFile = async (req, res) => {
 
     await BotChunk.deleteMany({ fileId });
     await BotEmbedding.deleteMany({ fileId });
+
+    await syncBotRulesText(botId);
 
     return res.json({ message: "Knowledge file deleted successfully." });
   } catch (err) {
@@ -686,81 +885,14 @@ exports.testBotApi = async (req, res) => {
 };
 
 /**
- * Helper to parse markdown text into structured UI Component payload:
- * Components supported: "table" | "list" | "card" | "text"
+ * Helper to pass raw AI response text directly to frontend.
+ * Frontend ReactMarkdown handles tables, lists, and markdown formatting natively.
  */
 function parseStructuredUI(text) {
-  if (!text || typeof text !== "string") {
-    return { component: "text", title: "Response", data: { text: "" } };
-  }
-
-  const trimmed = text.trim();
-
-  // 1. Table Detection (| Col1 | Col2 |)
-  const tableRegex = /\|(.+)\|[\r\n]+\|[-:\s|]+\|[\r\n]+((?:\|.+\|[\r\n]*)+)/;
-  const tableMatch = trimmed.match(tableRegex);
-
-  if (tableMatch) {
-    const rawHeaders = tableMatch[1].split("|").map(h => h.trim()).filter(Boolean);
-    const rawRows = tableMatch[2]
-      .trim()
-      .split(/\r?\n/)
-      .filter(line => line.includes("|") && !/^\|?\s*[-:\s|]+\s*\|?$/.test(line))
-      .map(row => {
-        const cells = row.split("|").map(cell => cell.trim());
-        // Handle optional leading/trailing pipe empty cells
-        if (cells.length > 2 && cells[0] === "" && cells[cells.length - 1] === "") {
-          return cells.slice(1, -1);
-        }
-        return cells.filter(Boolean);
-      })
-      .filter(row => row.length > 0);
-
-    return {
-      component: "table",
-      title: "Structured Data Table",
-      data: {
-        headers: rawHeaders,
-        rows: rawRows,
-        rawMarkdown: text
-      }
-    };
-  }
-
-  // 2. List Detection (- Item or 1. Item)
-  const listItems = trimmed
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(line => /^[-*•]\s+/.test(line) || /^\d+\.\s+/.test(line))
-    .map(line => line.replace(/^([-*•]|\d+\.)\s+/, "").trim());
-
-  if (listItems.length >= 2) {
-    return {
-      component: "list",
-      title: "List Items",
-      data: {
-        items: listItems,
-        rawMarkdown: text
-      }
-    };
-  }
-
-  // 3. Card Detection (Structured text snippet)
-  if (trimmed.length > 40) {
-    return {
-      component: "card",
-      title: "Summary Card",
-      data: {
-        text: trimmed,
-        highlights: listItems
-      }
-    };
-  }
-
-  // 4. Default Text Component
+  const trimmed = (text || "").trim();
   return {
     component: "text",
-    title: "Text Message",
+    title: "Response",
     data: { text: trimmed }
   };
 }
@@ -775,7 +907,7 @@ function sendJsonResponse(res, conversation, bot, currentBotMode, responseText, 
     botId: bot._id,
     botName: bot.name || "AI Assistant",
     botMode: currentBotMode,
-    responseType: structuredUI.component,
+    responseType: "markdown",
     message: {
       role: "assistant",
       content: responseText
@@ -796,7 +928,6 @@ function sendJsonResponse(res, conversation, bot, currentBotMode, responseText, 
 exports.sendBotChatMessage = async (req, res) => {
   const reqStartTime = performance.now();
   let dbFetchTime = 0;
-  let entityExtractTime = 0;
   let ragSearchTime = 0;
   let ttft = null;
   let streamDuration = 0;
@@ -812,39 +943,89 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     const tDbStart = performance.now();
-    const bot = await Bot.findOne({
-      _id: botId,
-      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
-    });
+    const { getCache, setCache } = require("../utils/redisClient");
+    const botCacheKey = `bot_cfg_${botId}_${req.user.id}`;
+    let bot = await getCache(botCacheKey);
+
+    if (!bot) {
+      bot = await Bot.findOne({
+        _id: botId,
+        $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+      }).lean();
+      if (bot) {
+        await setCache(botCacheKey, bot, 300); // Cache for 5 minutes in Redis
+      }
+    }
+
     if (!bot) {
       return res.status(404).json({ error: "Bot not found or unauthorized." });
     }
 
+    const { chatId, sessionId, visitorId } = req.body;
+    const effectiveVisitorId = visitorId || (req.headers["x-visitor-id"] ? String(req.headers["x-visitor-id"]).trim() : null);
+
     let conversation;
-    if (conversationId) {
+    const sessionKey = (effectiveVisitorId && botId) ? `bot:${botId}:vis:${effectiveVisitorId}` : null;
+
+    // 1. Explicit conversationId check
+    const targetId = conversationId || chatId || sessionId;
+    if (targetId && mongoose.Types.ObjectId.isValid(targetId)) {
       conversation = await BotConversation.findOne({
-        _id: conversationId,
+        _id: targetId,
         botId,
         $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
       });
     }
 
+    // 2. Redis O(1) Session Lookup for visitorId
+    if (!conversation && sessionKey) {
+      const cachedConvId = await getCache(sessionKey);
+      if (cachedConvId) {
+        conversation = await BotConversation.findOne({
+          _id: cachedConvId,
+          botId,
+          $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+        });
+      }
+
+      // 3. Fallback check in MongoDB (handles Redis restart or cache eviction gracefully)
+      if (!conversation) {
+        const candidate = await BotConversation.findOne({
+          botId,
+          visitorId: effectiveVisitorId,
+          $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+        }).sort({ updatedAt: -1 });
+
+        if (candidate) {
+          const HALF_HOUR_MS = 30 * 60 * 1000;
+          const isRecentlyActive = (new Date() - new Date(candidate.updatedAt)) < HALF_HOUR_MS;
+          if (isRecentlyActive) {
+            conversation = candidate;
+          }
+        }
+      }
+    }
+
+    // 4. Create new conversation if no active thread exists
     if (!conversation) {
       conversation = await BotConversation.create({
         botId,
         ownerId: req.user.id,
         userId: req.user.id,
+        visitorId: effectiveVisitorId || "",
         title: message.trim().substring(0, 35) || "New Conversation"
       });
     } else if (!conversation.title || conversation.title === "New Conversation" || conversation.title === "New Bot Conversation") {
-      // Persist the first meaningful user message as conversation title for future sessions
       conversation.title = message.trim().substring(0, 35) || "New Conversation";
       await conversation.save();
     }
 
-    // Detect response format requested by client:
-    // Mode A: SSE Streaming ("text/event-stream" or req.body.stream === true)
-    // Mode B: Structured JSON ("application/json" or req.body.stream === false or req.body.format === "json")
+    // Refresh sliding 30-minute Redis TTL for active session
+    if (sessionKey && conversation) {
+      await setCache(sessionKey, String(conversation._id), 1800);
+    }
+
+    // Detect response format requested by client
     const acceptHeader = (req.headers.accept || "").toLowerCase();
     const isStreamRequested = (req.body.stream === true) || acceptHeader.includes("text/event-stream") || (req.body.stream !== false && !acceptHeader.includes("application/json"));
 
@@ -852,58 +1033,28 @@ exports.sendBotChatMessage = async (req, res) => {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
-      res.write(`event: metadata\ndata: ${JSON.stringify({ type: "meta", responseType: "text", title: conversation.title || "Bot Conversation", conversationId: conversation._id, chatId: conversation._id })}\n\n`);
+      res.write(`event: metadata\ndata: ${JSON.stringify({ type: "meta", responseType: "markdown", title: conversation.title || "Bot Conversation", conversationId: conversation._id, chatId: conversation._id, visitorId: effectiveVisitorId })}\n\n`);
     }
 
-    // Fetch conversation memory (last 10 messages)
+    // Rolling Context Window: Fetch last 6 messages (3 turns) for bounded LLM prompt token footprint
     const historyMessages = await BotMessage.find({ conversationId: conversation._id, botId })
       .sort({ createdAt: -1 })
-      .limit(10);
+      .limit(6);
     const sortedHistory = historyMessages.reverse();
 
-    // Trigger LLM Narrative Summary generation when total message count reaches threshold
+    // Async background LLM summarization trigger (every 8 messages after 16 threshold)
     const totalMsgCount = await BotMessage.countDocuments({ conversationId: conversation._id });
-    if (totalMsgCount >= 20 && totalMsgCount % 5 === 0) {
-      const newSummary = await generateLLMSummary(sortedHistory, conversation.conversationSummary);
-      conversation.conversationSummary = newSummary;
-      await conversation.save();
+    if (totalMsgCount >= 16 && totalMsgCount % 8 === 0) {
+      generateLLMSummary(sortedHistory, conversation.conversationSummary)
+        .then((newSummary) => {
+          if (newSummary) {
+            BotConversation.findByIdAndUpdate(conversation._id, { conversationSummary: newSummary }).catch(() => { });
+          }
+        })
+        .catch(() => { });
     }
 
     dbFetchTime = performance.now() - tDbStart;
-
-    // Contact Entity Extraction & Automation Check
-    const tExtractStart = performance.now();
-    const extractionResult = extractEntities(message, {});
-    const extracted = extractionResult.extracted || {};
-    entityExtractTime = performance.now() - tExtractStart;
-
-    if (extracted.firstName && extracted.lastName && extracted.email && extracted.phone) {
-      console.log("🚀 [CONTACT AUTOMATION] Contact payload captured:", extracted);
-      const savedContact = await triggerBotContactAutomation(req.user.id, botId, conversation._id, extracted);
-
-      const successResponse = `Thank you! Your contact details have been verified and registered into our database:\n\n• **First Name**: ${extracted.firstName}\n• **Last Name**: ${extracted.lastName}\n• **Email**: ${extracted.email}\n• **Phone**: ${extracted.phone}\n• **Company**: ${extracted.companyName || "Not provided"}\n\nCRM Sync Status: **${savedContact.crmSyncStatus}** (Contact ID: ${savedContact.crmContactId})`;
-
-      await streamTextInChunks(res, successResponse, 15);
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "user",
-        content: message
-      });
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "assistant",
-        content: successResponse
-      });
-
-      res.write("data: [DONE]\n\n");
-      return res.end();
-    }
 
     // Team Escalation Pipeline Check (Grounding Matrix Mandate)
     if (/\b(platform\s+setup|pricing\s+matrix|custom\s+automation|deep\s+explanation|complex\s+setup)\b/i.test(message.trim())) {
@@ -1129,82 +1280,33 @@ exports.sendBotChatMessage = async (req, res) => {
       res.write(`event: sources\ndata: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
     }
 
-    // Strict Out-of-Scope Fallback Rule based on botMode when no chunks match
-    if (!isGeneralQuery && hasUploadedFiles && !ragResult.isFound) {
-      let outOfScopeMsg;
-      if (currentBotMode === "small") {
-        outOfScopeMsg = "I am configured in Strict Document Mode (Small) and can only answer questions directly covered by the uploaded documentation. I couldn't find information about that topic in the available files.";
-      } else if (currentBotMode === "medium") {
-        outOfScopeMsg = "I couldn't find specific details on that topic in the uploaded documentation. My strongest answers come from the available knowledge base. Please ask questions related to the documented topics.";
-      } else {
-        outOfScopeMsg = "I couldn't find information about that topic in the available documentation. I'll be happy to assist you using general knowledge if you'd like!";
+    // Fetch compiled rules object from Redis cache (bot:${botId}:rules) with 0ms runtime overhead
+    const rulesCacheKey = `bot:${botId}:rules`;
+    let cachedRulesObj = await getCache(rulesCacheKey);
+
+    if (!cachedRulesObj) {
+      const rawText = (bot.rulesConfig?.rulesText || "").trim();
+      const rulesLines = rawText.split(/\r?\n/).filter(l => l.trim().length > 0);
+      cachedRulesObj = {
+        rulesText: rawText,
+        rulesCount: rulesLines.length,
+        wantsScheduleCard: /\b(schedule|call|agent|human|appointment|meeting|card|contact|escalat)\b/i.test(rawText),
+        rulesList: rulesLines
+      };
+      if (rawText) {
+        await setCache(rulesCacheKey, cachedRulesObj, 3600);
       }
-
-      const { extractExtractedTopics } = require("../utils/ragEngine");
-      const topTopics = extractExtractedTopics(bot);
-      const featuredTopic = topTopics[0] || "Our Knowledge Base";
-      const cardTitle = `Did You Know: ${featuredTopic}`;
-
-      // Emit special card & schedule_call metadata for FE team to render interactive Card UI!
-      if (isStreamRequested) {
-        res.write(`event: metadata\ndata: ${JSON.stringify({
-          type: "card",
-          responseType: "card",
-          title: cardTitle,
-          action: "SCHEDULE_CALL",
-          message: outOfScopeMsg,
-          conversationId: conversation._id,
-          botMode: currentBotMode,
-          topics: topTopics
-        })}\n\n`);
-
-        await streamTextInChunks(res, outOfScopeMsg, 15);
-      } else {
-        return res.json({
-          response: outOfScopeMsg,
-          type: "card",
-          responseType: "card",
-          conversationId: conversation._id,
-          structuredUI: {
-            type: "card",
-            responseType: "card",
-            title: cardTitle,
-            action: "SCHEDULE_CALL",
-            message: outOfScopeMsg,
-            conversationId: conversation._id,
-            botMode: currentBotMode,
-            topics: topTopics
-          }
-        });
-      }
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "user",
-        content: message
-      });
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "assistant",
-        content: outOfScopeMsg
-      });
-
-      res.write("data: [DONE]\n\n");
-      return res.end();
     }
+
+    const effectiveRulesText = typeof cachedRulesObj === "object" ? (cachedRulesObj.rulesText || "") : String(cachedRulesObj || "");
 
     // Build system prompt based on adaptive intent and currentBotMode
     const { buildGeneralSystemPrompt } = require("../utils/ragEngine");
     let systemPrompt;
     if (isGeneralQuery) {
-      systemPrompt = buildGeneralSystemPrompt(bot.name, bot.description, currentBotMode);
+      systemPrompt = buildGeneralSystemPrompt(bot.name, bot.description, currentBotMode, effectiveRulesText);
     } else {
-      systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary);
+      systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary, effectiveRulesText);
     }
 
     const aiGateway = require("../utils/aiGateway");
@@ -1301,7 +1403,6 @@ exports.sendBotChatMessage = async (req, res) => {
 ⏱️  =================== [LATENCY DIAGNOSTICS BREAKDOWN] ===================
   📌 Route: Bot Chat ${isStreamRequested ? 'Stream (SSE)' : 'REST (JSON)'} (/api/v1/bots/${botId}/chat)
   ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
-  ├── 🔍 Entity Extraction:             ${entityExtractTime.toFixed(2)} ms
   ├── 🧠 RAG & Vector Search:           ${ragSearchTime.toFixed(2)} ms
   ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'}
   ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
@@ -1640,7 +1741,7 @@ exports.rotateBotKeys = async (req, res) => {
 exports.externalBotChat = async (req, res) => {
   try {
     const bot = req.bot; // Attached by botKeyAuth middleware
-    const { message } = req.body;
+    const { message, conversationId, visitorId, chatId, sessionId } = req.body;
 
     if (!message || typeof message !== "string" || !message.trim()) {
       return res.status(400).json({ success: false, message: "Validation error: 'message' payload is required and must be a non-empty string." });
@@ -1649,6 +1750,9 @@ exports.externalBotChat = async (req, res) => {
     if (message.trim().length > 4000) {
       return res.status(400).json({ success: false, message: "Validation error: 'message' payload exceeds maximum limit of 4000 characters." });
     }
+
+    req.body.conversationId = conversationId || chatId || sessionId;
+    req.body.visitorId = visitorId || req.headers["x-visitor-id"];
 
     // Pass botId & owner user context
     req.params.botId = bot._id.toString();

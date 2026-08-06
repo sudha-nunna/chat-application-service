@@ -20,6 +20,11 @@ const botConversationSchema = new mongoose.Schema(
       required: true,
       index: true
     },
+    visitorId: {
+      type: String,
+      default: "",
+      index: true
+    },
     title: {
       type: String,
       default: "New Bot Conversation"
@@ -35,5 +40,6 @@ const botConversationSchema = new mongoose.Schema(
 );
 
 botConversationSchema.index({ userId: 1, botId: 1 });
+botConversationSchema.index({ botId: 1, visitorId: 1, updatedAt: -1 });
 
 module.exports = mongoose.model("BotConversation", botConversationSchema);

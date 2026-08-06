@@ -23,6 +23,9 @@ router.get("/:botId/files", protect, botController.getBotFiles);
 router.put("/:botId/files/:fileId", protect, botController.replaceBotFile);
 router.delete("/:botId/files/:fileId", protect, botController.deleteBotFile);
 
+// Granular Rules Management
+router.put("/:botId/rules", protect, botController.updateBotRules);
+
 // API Integrations & Postman Collections
 router.post("/:botId/apis", protect, botController.createBotApi);
 router.get("/:botId/apis", protect, botController.getBotApis);

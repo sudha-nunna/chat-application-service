@@ -272,6 +272,7 @@ class AIGateway {
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let rawBuffer = "";
+        const streamBuffer = new ActionStreamBuffer(res, onToken);
 
         while (true) {
           const { done, value } = await reader.read();
@@ -304,15 +305,7 @@ class AIGateway {
                     firstTokenTimestamp = performance.now();
                     ttft = firstTokenTimestamp - llmStartTime;
                   }
-                  accumulatedResponseText += chunkText;
-
-                  if (typeof onToken === "function") {
-                    onToken(chunkText);
-                  }
-
-                  if (res && !res.writableEnded) {
-                    res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
-                  }
+                  streamBuffer.push(chunkText);
                 }
               } catch (e) { }
             }
@@ -320,6 +313,9 @@ class AIGateway {
 
           if (done) break;
         }
+
+        streamBuffer.flush();
+        accumulatedResponseText = streamBuffer.cleanText;
         streamedSuccessfully = true;
       }
     } catch (err) {
@@ -360,19 +356,16 @@ class AIGateway {
       stream: true
     });
 
-    let accumulatedText = "";
+    const streamBuffer = new ActionStreamBuffer(res, onToken);
     for await (const chunk of stream) {
       const chunkText = chunk.choices[0]?.delta?.content || "";
       if (chunkText) {
-        accumulatedText += chunkText;
-        if (typeof onToken === "function") onToken(chunkText);
-        if (res && !res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
-        }
+        streamBuffer.push(chunkText);
       }
     }
+    streamBuffer.flush();
 
-    return { success: true, text: accumulatedText };
+    return { success: true, text: streamBuffer.cleanText };
   }
 
   /**
@@ -391,19 +384,96 @@ class AIGateway {
       contents: messages.map(m => `${m.role}: ${m.content}`).join("\n")
     });
 
-    let accumulatedText = "";
+    const streamBuffer = new ActionStreamBuffer(res, onToken);
     for await (const chunk of responseStream) {
       const chunkText = chunk.text || "";
       if (chunkText) {
-        accumulatedText += chunkText;
-        if (typeof onToken === "function") onToken(chunkText);
-        if (res && !res.writableEnded) {
-          res.write(`data: ${JSON.stringify({ type: "chunk", chunk: chunkText, text: chunkText })}\n\n`);
-        }
+        streamBuffer.push(chunkText);
       }
     }
+    streamBuffer.flush();
 
-    return { success: true, text: accumulatedText };
+    return { success: true, text: streamBuffer.cleanText };
+  }
+}
+
+/**
+ * Helper to parse ACTION directives from LLM output lines
+ * e.g., ACTION: responseType=live_agent liveAgent=true
+ */
+function parseActionDirective(line) {
+  if (!line || typeof line !== "string") return null;
+  const trimmed = line.trim();
+  const match = trimmed.match(/^\[?\s*ACTION\s*:\s*(.+)\]?$/i);
+  if (!match) return null;
+
+  const rawParams = match[1].replace(/\]$/, "").trim();
+  const metadata = { type: "meta" };
+
+  const pairs = rawParams.split(/\s+/);
+  pairs.forEach(pair => {
+    const [key, val] = pair.split("=");
+    if (key) {
+      let cleanVal = val ? val.trim().replace(/^["']|["']$/g, "") : true;
+      if (cleanVal === "true") cleanVal = true;
+      if (cleanVal === "false") cleanVal = false;
+      metadata[key.trim()] = cleanVal;
+    }
+  });
+
+  return metadata;
+}
+
+class ActionStreamBuffer {
+  constructor(res, onToken) {
+    this.res = res;
+    this.onToken = onToken;
+    this.buffer = "";
+    this.cleanText = "";
+    this.extractedMeta = [];
+    this.firstTokenFired = false;
+  }
+
+  push(chunkText) {
+    if (!chunkText) return;
+    this.buffer += chunkText;
+
+    let newlineIndex;
+    while ((newlineIndex = this.buffer.indexOf("\n")) !== -1) {
+      const line = this.buffer.substring(0, newlineIndex);
+      this.buffer = this.buffer.substring(newlineIndex + 1);
+      this._emitLine(line + "\n");
+    }
+  }
+
+  flush() {
+    if (this.buffer.length > 0) {
+      this._emitLine(this.buffer);
+      this.buffer = "";
+    }
+  }
+
+  _emitLine(lineWithBreak) {
+    const trimmed = lineWithBreak.trim();
+    const actionMeta = parseActionDirective(trimmed);
+
+    if (actionMeta) {
+      this.extractedMeta.push(actionMeta);
+      console.log(`📡 [SSE OUT Meta Action]:`, JSON.stringify(actionMeta));
+      if (this.res && !this.res.writableEnded) {
+        this.res.write(`event: metadata\ndata: ${JSON.stringify(actionMeta)}\n\n`);
+      }
+    } else {
+      this.cleanText += lineWithBreak;
+      if (!this.firstTokenFired && typeof this.onToken === "function") {
+        this.firstTokenFired = true;
+        this.onToken(lineWithBreak);
+      }
+      if (this.res && !this.res.writableEnded) {
+        console.log(`📡 [SSE OUT Chunk]:`, JSON.stringify({ text: lineWithBreak }));
+        this.res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: lineWithBreak, text: lineWithBreak })}\n\n`);
+      }
+    }
   }
 }
 

@@ -42,5 +42,6 @@ const botMessageSchema = new mongoose.Schema(
 );
 
 botMessageSchema.index({ userId: 1, botId: 1 });
+botMessageSchema.index({ conversationId: 1, createdAt: -1 });
 
 module.exports = mongoose.model("BotMessage", botMessageSchema);

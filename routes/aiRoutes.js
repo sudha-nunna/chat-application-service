@@ -17,24 +17,28 @@ router.post("/message/:chatId", protect, chatController.sendMessage);
 
 // Live Cluster Node Health & Load Diagnostics Route
 router.get("/cluster-status", protect, async (req, res) => {
-  // Trigger background health check asynchronously so response is INSTANT (<5ms)
-  checkClusterHealth().catch((err) => console.warn("⚠️ Background health ping error:", err.message));
+  try {
+    const { clusterState, refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
+    await refreshClusterNodesFromDB();
 
-  // Return live in-memory clusterState instantly
-  const sanitizedNodes = clusterState.map((node) => ({
-    id: node.id,
-    name: node.name,
-    defaultModel: node.defaultModel,
-    status: node.status,
-    activeRequests: node.activeRequests || 0,
-    lastLatencyMs: node.lastLatencyMs || node.latency || 0
-  }));
+    const sanitizedNodes = clusterState.map((node) => ({
+      id: node.id,
+      name: node.name,
+      defaultModel: node.defaultModel,
+      status: node.status,
+      activeRequests: node.activeRequests || 0,
+      lastLatencyMs: node.lastLatencyMs || node.latency || 0
+    }));
 
-  return res.json({
-    success: true,
-    totalNodes: sanitizedNodes.length,
-    nodes: sanitizedNodes
-  });
+    return res.json({
+      success: true,
+      totalNodes: sanitizedNodes.length,
+      nodes: sanitizedNodes
+    });
+  } catch (err) {
+    console.error("Error fetching cluster status:", err);
+    return res.status(500).json({ error: "Failed to fetch cluster status." });
+  }
 });
 
 // NEW CRM PROXY ROUTE: Captures AI payload and pushes safely to codegene.io using backend .env variables

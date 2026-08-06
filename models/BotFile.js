@@ -41,6 +41,11 @@ const botFileSchema = new mongoose.Schema(
       type: String,
       required: true
     },
+    fileCategory: {
+      type: String,
+      enum: ["knowledge", "rules"],
+      default: "knowledge"
+    },
     chunkCount: {
       type: Number,
       default: 0

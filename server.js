@@ -15,6 +15,8 @@ const planRoutes = require("./routes/planRoutes");
 const adminRoutes = require("./routes/adminRoutes");
 const seedPlans = require("./utils/planSeeder");
 const { warmOllamaConnection } = require("./utils/ollamaHelper");
+const { redis } = require("./utils/redisClient");
+const { knowledgeQueue } = require("./utils/bullQueue");
 
 connectDB().then(() => {
   seedPlans();
@@ -27,8 +29,8 @@ const app = express();
 app.use("/api/v1/external/bots", cors({
   origin: "*",
   credentials: false,
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Bot-Api-Key", "X-Bot-Secret-Key", "x-auth-token"]
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "X-Bot-Api-Key", "X-Bot-Secret-Key", "X-Visitor-Id", "x-visitor-id", "X-User-Plan", "x-user-plan", "x-auth-token"]
 }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || "")
