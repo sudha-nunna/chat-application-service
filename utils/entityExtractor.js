@@ -105,7 +105,7 @@ function detectIntent(message, currentMemory = {}) {
     return "CASUAL_CONVERSATION";
   }
 
-  // 5. PRODUCT_INQUIRY INTENT ("what is the use of it", "pricing", "features", "walkthrough details", "how does Allvion work")
+  // 5. PRODUCT_INQUIRY INTENT ("what is the use of it", "pricing", "features", "walkthrough details", "how does it work")
   if (
     /\b(use\s+of\s+it|what\s+is\s+the\s+use|pricing|features|walkthrough|how\s+does\s+it\s+work|platform\s+features|crm\s+features|what\s+you\s+need|what\s+do\s+you\s+need)\b/i.test(trimmed)
   ) {

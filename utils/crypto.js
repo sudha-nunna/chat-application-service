@@ -1,7 +1,7 @@
 const crypto = require("crypto");
 
 const ALGORITHM = "aes-256-cbc";
-const SECRET_KEY = process.env.ENCRYPTION_SECRET || "allvion_crm_multi_tenant_secret_key_32bytes!!";
+const SECRET_KEY = process.env.ENCRYPTION_SECRET || "multi_tenant_bot_secret_key_32bytes!!";
 const KEY = crypto.scryptSync(SECRET_KEY, "salt", 32);
 
 function encrypt(text) {

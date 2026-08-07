@@ -140,18 +140,24 @@ function detectBotIntent(message, botMetadata = null) {
     return "GREETING";
   }
 
-  // 2. Explicit Document / API Queries
+  // 2. Formatting & Contextual Follow-up Queries (e.g. "in table form", "give me in list", "show as table", "summarize that")
+  const isFormattingOrFollowup = /\b(table|list|bullet|bullets|format|form|summarize|detail|explain\s+more|row|rows|column|columns|chart|grid)\b/i.test(trimmed);
+  if (isFormattingOrFollowup) {
+    return "DOCUMENT_QUERY";
+  }
+
+  // 3. Explicit Document / API Queries
   const explicitDocQuery = /\b(pdf|document|uploaded|file|manual|policy|guide|kb|knowledge\s+base|postman|collection|documentation)\b/i.test(trimmed);
   if (explicitDocQuery) {
     return "DOCUMENT_QUERY";
   }
 
-  // 3. Match against bot metadata topics
+  // 4. Match against bot metadata topics
   if (botMetadata && matchQueryToMetadata(message, botMetadata)) {
     return "DOCUMENT_QUERY";
   }
 
-  // 4. Default fallback: General questions bypass document RAG search
+  // 5. Default fallback: General questions bypass document RAG search
   return "GENERAL_QUERY";
 }
 
@@ -211,12 +217,17 @@ async function generateLLMSummary(historyMessages = [], existingSummary = "") {
     .map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
     .join("\n\n");
 
-  const prompt = `You are a conversation summarization engine. Create a concise, high-quality, 2-4 sentence narrative summary of the key topics, user intentions, technical concepts, decisions, and assistant guidance discussed in this conversation.
+  const prompt = `You are an enterprise conversation summarization engine. Combine the previous summary with the latest conversation messages into a concise 2-4 sentence narrative summary.
+Extract ONLY important information:
+- User requirements, goals, and constraints
+- Key decisions made and user preferences
+- Unresolved issues or pending requests
+- Key technical concepts or discussion points
 
 Previous Summary:
 ${existingSummary || "None"}
 
-Recent Messages:
+Latest Conversation Messages:
 ${formattedHistory}
 
 INSTRUCTIONS:
@@ -351,7 +362,7 @@ function extractKnowledgeMetadataFromText(text) {
   }
 
   for (const phrase of phrases) {
-    if (/\b(allvion|crm|terminal|engine|platform|suite|solution|service\s+platform)\b/.test(phrase)) {
+    if (/\b(platform|suite|solution|engine|system|application|service\s+platform)\b/.test(phrase)) {
       products.add(phrase);
       topics.add(phrase);
     }
@@ -500,6 +511,15 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
     targetUserId = null;
   }
 
+  // Augment query text with previous user prompt if query is a short formatting or follow-up request
+  if (Array.isArray(historyMessages) && historyMessages.length > 0 && queryText) {
+    const lastUserMsg = [...historyMessages].reverse().find(m => m.role === "user" && m.content && m.content.trim() !== queryText.trim());
+    const isShortOrFollowup = queryText.split(/\s+/).length <= 6 || /\b(table|list|bullet|bullets|format|form|summarize|detail|explain\s+more|row|rows|column|columns|chart|grid)\b/i.test(queryText);
+    if (isShortOrFollowup && lastUserMsg?.content) {
+      queryText = `${lastUserMsg.content} ${userQuestion}`;
+    }
+  }
+
   const filter = { botId: targetBotId };
   if (targetUserId) {
     filter.$or = [{ userId: targetUserId }, { ownerId: targetUserId }];
@@ -614,23 +634,56 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
 }
 
 function generateConversationalResponse(intent, message, history = [], chunks = [], bot = {}) {
+  const msgTrim = (message || "").trim().toLowerCase();
   const botName = bot.name || "AI Assistant";
-  if (intent === "GREETING" || /^(hi|hello|hey|greetings)$/i.test((message || "").trim())) {
-    return `Hello! I am ${botName}. How can I assist you today?`;
+
+  if (intent === "GREETING" || /^(hi|hello|hey|greetings)$/i.test(msgTrim)) {
+    return `Hello! How can I assist you today? I am ${botName}, your specialized assistant.`;
   }
-  if (intent === "ROLE" || message === "What is your role?") {
-    return `My role is to act as ${botName}, assisting you with your questions based on our knowledge base and connected services.`;
+
+  if (msgTrim.includes("role") || intent === "ROLE") {
+    return `My role is to act as ${botName}, assisting you based on our configured rules and knowledge base.`;
   }
+
   if (isKnowledgeOverviewQuestion(message)) {
-    return buildKnowledgeOverviewResponse(bot, [], message);
+    const overview = buildKnowledgeOverviewResponse(bot, [], message);
+    if (overview) return overview;
   }
+
+  if (history && history.length > 0) {
+    const lastMsg = [...history].reverse().find(m => m.content);
+    if (lastMsg) {
+      return `Regarding our discussion on "${lastMsg.content.substring(0, 60)}...": How can I assist you further?`;
+    }
+  }
+
   return `Hello! I am ${botName}. How can I assist you today?`;
 }
 
 /**
  * Builds strictly grounded RAG system prompt.
  */
-function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availableApis = [], knowledgeSummary = null, rulesText = "") {
+function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availableApis = [], knowledgeSummary = null, rulesText = "", mode = "small") {
+  const modeLower = (mode || "small").toLowerCase();
+
+  let modeGuidance = "";
+  if (modeLower === "small") {
+    modeGuidance = `
+MODE: STRICT KNOWLEDGE BOT (SMALL)
+1. You are strictly limited to facts explicitly stated in the KNOWLEDGE CONTEXT, configured APIs, and BOT RULES.
+2. If a user inquiry is NOT supported or answered within the provided KNOWLEDGE CONTEXT or BOT RULES, politely decline to answer and state: "I am configured in Strict Document Mode (Small) and can only answer questions related to our uploaded documentation." Do NOT use general pre-trained knowledge for out-of-scope topics.`;
+  } else if (modeLower === "medium") {
+    modeGuidance = `
+MODE: BALANCED HYBRID ASSISTANT (MEDIUM)
+1. Use uploaded documentation and BOT RULES as your primary source of truth for business and technical queries.
+2. For casual chitchat or general inquiries, answer concisely and helpfully while smoothly bridging back to your primary domain focus.`;
+  } else {
+    modeGuidance = `
+MODE: OMNI AI ASSISTANT (LARGE)
+1. You have full unconstrained conversational and technical capabilities (coding, math, general knowledge, creative reasoning).
+2. Seamlessly integrate document context with broad AI knowledge to provide comprehensive, intelligent answers.`;
+  }
+
   let contextBlocks = "No knowledge documents available for this query.";
   if (retrievedChunks && retrievedChunks.length > 0) {
     contextBlocks = retrievedChunks
@@ -667,42 +720,46 @@ function buildRagSystemPrompt(botName, botDescription, retrievedChunks, availabl
     rulesSection = rulesText.trim();
   }
 
-  return `You are a STRICTLY GROUNDED specialized knowledge assistant named '${botName}'.
+  return `You are a specialized knowledge assistant named '${botName}'.
 ${botDescription ? `Purpose & Scope: ${botDescription}\n` : ""}
 
 ## BOT RULES
 ${rulesSection}
 
+${modeGuidance}
+
 ## KNOWLEDGE CONTEXT
-${contextBlocks}
+${contextBlocks}${overviewContext}
 
 ## API RESULTS
 ${apiDescriptions}
 
 ## CRITICAL GROUNDING & MULTI-AGENT INSTRUCTIONS:
 1. You are strictly '${botName}', a specialized AI assistant operating within your assigned domain scope. Your primary source of truth is the provided KNOWLEDGE CONTEXT, configured APIs, and BOT RULES.
-2. You must answer questions using the provided KNOWLEDGE CONTEXT and APIs. Avoid inventing details or making ungrounded claims outside your provided documentation and BOT RULES.
-3. Evaluate and strictly prioritize MANDATORY BOT RULES above. Apply any rule-specific formatting, out-of-scope guidance, or custom response structures requested.
-4. When asked about your role, capabilities, or identity, introduce yourself as '${botName}' and summarize your core functions based on your knowledge base and configured tools.
-5. Do NOT refer to yourself as a generic pre-trained model or state internal AI architecture details. Maintain a helpful, professional persona representing '${botName}'.
-6. SYNONYM & SPACING FLEXIBILITY: Treat terms with minor spacing, hyphenation, or formatting differences as identical (e.g., 'web 3' = 'web3', 'react native' = 'react-native', 'node js' = 'nodejs', 'app 1' = 'app1'). Never claim information is missing simply due to a space or hyphen difference.
-7. CONCISE & DIRECT ANSWERS: Answer questions clearly, accurately, and concisely based on your document context without unneeded boilerplates.
-8. DYNAMIC UI ACTIONS & COMPONENT DIRECTIVES:
+2. Evaluate and strictly prioritize MANDATORY BOT RULES and MODE guidance above. Apply any rule-specific formatting, out-of-scope guidance, or custom response structures requested.
+3. When asked about your role, capabilities, or identity, introduce yourself proudly and warmly as '${botName}'.
+4. STRICT VENDOR BRAND PROHIBITION: You must NEVER identify as, state, or claim to be "ChatGPT", "OpenAI", "Gemini", "Google", "Ollama", "Claude", "LLaMA", or any third-party AI model or company. You are strictly '${botName}'.
+5. SYNONYM & SPACING FLEXIBILITY: Treat terms with minor spacing, hyphenation, or formatting differences as identical (e.g., 'web 3' = 'web3', 'react native' = 'react-native', 'node js' = 'nodejs', 'app 1' = 'app1'). Never claim information is missing simply due to a space or hyphen difference.
+6. CONCISE & DIRECT ANSWERS: Answer questions clearly, accurately, and concisely based on your document context without unneeded boilerplates.
+7. DYNAMIC UI ACTIONS & COMPONENT DIRECTIVES:
    - Check BOT RULES above for out-of-scope directives, business rules, greeting rules, or specific UI action component rules.
    - Whenever a user query triggers an Out-Of-Scope rule, Business Rule, or UI action (such as 'live_agent', 'contact_card', 'pill_list', 'carousel', 'schedule_call', 'table', or any custom responseType specified in BOT RULES):
      a) Output the natural language text message specified in the rules or out-of-scope configuration.
      b) At the VERY END of your response on a NEW SEPARATE LINE, append the action directive corresponding to the rule's responseType:
         ACTION: responseType=<configured_responseType> [key1=val1] [key2=val2]
         (e.g., ACTION: responseType=live_agent liveAgent=true OR ACTION: responseType=contact_card)
-   - Do NOT wrap ACTION in code blocks. Always output it on a separate line at the end whenever a UI action component is requested.`;
+   - Do NOT wrap ACTION in code blocks. Always output it on a separate line at the end whenever a UI action component is requested.
+8. CONTEXTUAL & FORMATTING FOLLOW-UPS:
+   - When a user asks to format, rephrase, summarize, or restructure previous information (e.g., "in table form", "list format", "as a table", "bullet points", "in detail"), evaluate the conversation history and knowledge context, and output the response directly in the requested format (e.g. Markdown table using | Col1 | Col2 | format).
+   - NEVER repeat generic greetings or identity introductions on follow-up or formatting requests.`;
 }
 
 /**
  * System prompt for General Conversational mode (human-like conversational chat & voice agent ready).
  * Adapts based on botMode ("small" | "medium" | "large")
  */
-function buildGeneralSystemPrompt(botName = "AI Assistant", botDescription = "", mode = "medium", rulesText = "") {
-  const modeLower = (mode || "medium").toLowerCase();
+function buildGeneralSystemPrompt(botName = "AI Assistant", botDescription = "", mode = "small", rulesText = "") {
+  const modeLower = (mode || "small").toLowerCase();
 
   let modeGuidance = "";
   if (modeLower === "small") {
@@ -736,9 +793,9 @@ ${rulesSection}
 ${modeGuidance}
 
 HUMAN CONVERSATIONAL RULES:
-1. Respond naturally, conversationally, and warmly—just like a helpful assistant or voice agent representing '${botName}'.
+1. Respond naturally, conversationally, and warmly—just like a helpful assistant representing '${botName}'.
 2. Keep responses articulate, engaging, and easy to understand when spoken aloud.
-3. If asked about your identity or role, introduce yourself warmly as '${botName}'.
+3. If asked about your identity, name, or role, introduce yourself warmly as '${botName}'. NEVER mention "ChatGPT", "OpenAI", "Gemini", "Google", "Ollama", "Claude", "LLaMA", or any underlying AI vendor.
 4. MANDATORY USER RULES: Strictly evaluate and follow BOT RULES provided above before responding.
 5. MANDATORY DYNAMIC ACTION DIRECTIVES & UI COMPONENT RULES:
    - Inspect BOT RULES above for out-of-scope directives, business rules, greeting rules, or specific UI action component rules.
@@ -747,7 +804,10 @@ HUMAN CONVERSATIONAL RULES:
      b) At the VERY END of your response on a NEW SEPARATE LINE, append the action directive corresponding to the rule's responseType:
         ACTION: responseType=<configured_responseType> [key1=val1] [key2=val2]
         (e.g., ACTION: responseType=live_agent liveAgent=true OR ACTION: responseType=contact_card)
-   - Do NOT wrap ACTION in code blocks. Always output it on a separate line at the end whenever a UI action component is requested.`;
+   - Do NOT wrap ACTION in code blocks. Always output it on a separate line at the end whenever a UI action component is requested.
+6. CONTEXTUAL & FORMATTING FOLLOW-UPS:
+   - When a user asks to format, rephrase, summarize, or restructure previous information (e.g., "in table form", "list format", "as a table", "bullet points", "in detail"), evaluate the conversation history and knowledge context, and output the response directly in the requested format (e.g. Markdown table using | Col1 | Col2 | format).
+   - NEVER repeat generic greetings or identity introductions on follow-up or formatting requests.`;
 }
 
 module.exports = {

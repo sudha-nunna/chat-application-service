@@ -30,7 +30,7 @@ const botSchema = new mongoose.Schema(
     botMode: {
       type: String,
       enum: ["small", "medium", "large"],
-      default: "medium",
+      default: "small",
       lowercase: true
     },
     allowedDomains: {

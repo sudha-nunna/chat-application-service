@@ -7,6 +7,10 @@ const BotEmbedding = require("../models/BotEmbeddings");
 const BotApi = require("../models/BotApi");
 const BotConversation = require("../models/BotConversation");
 const BotMessage = require("../models/BotMessage");
+const BotContact = require("../models/BotContact");
+const Summary = require("../models/Summary");
+const memoryService = require("../services/memoryService");
+const { getCache, setCache, delCache } = require("../utils/redisClient");
 const { encrypt, decrypt } = require("../utils/crypto");
 const {
   chunkText,
@@ -55,8 +59,8 @@ exports.createBot = async (req, res) => {
     }
 
     // Determine botMode: small, medium, or large
-    const effectiveBotMode = (botMode || model || "medium").toLowerCase();
-    const finalBotMode = ["small", "medium", "large"].includes(effectiveBotMode) ? effectiveBotMode : "medium";
+    const effectiveBotMode = (botMode || model || "small").toLowerCase();
+    const finalBotMode = ["small", "medium", "large"].includes(effectiveBotMode) ? effectiveBotMode : "small";
     const finalModel = (model && !["small", "medium", "large"].includes(model.toLowerCase())) ? model : "gpt-4o";
     const domainsList = Array.isArray(allowedDomains) ? allowedDomains.map(d => String(d).trim().toLowerCase()).filter(Boolean) : [];
 
@@ -211,27 +215,44 @@ exports.updateBot = async (req, res) => {
 exports.deleteBot = async (req, res) => {
   try {
     const { botId } = req.params;
-    const bot = await Bot.findOneAndDelete({
-      _id: botId,
-      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
-    });
-    if (!bot) {
-      return res.status(404).json({ error: "Bot not found or unauthorized." });
+    const rawUserId = req.user?.id || req.user?._id || req.user?.userId;
+    const userIdStr = rawUserId ? rawUserId.toString() : null;
+
+    const bot = await Bot.findById(botId);
+
+    if (bot) {
+      const isOwner = !userIdStr ||
+        (bot.userId && bot.userId.toString() === userIdStr) ||
+        (bot.ownerId && bot.ownerId.toString() === userIdStr);
+
+      if (!isOwner) {
+        return res.status(403).json({ success: false, message: "Unauthorized to delete this bot." });
+      }
+
+      await Bot.findByIdAndDelete(botId);
     }
 
-    // Cascade delete associated resources
-    await BotFile.deleteMany({ botId });
-    await BotChunk.deleteMany({ botId });
-    await BotEmbedding.deleteMany({ botId });
-    await BotApi.deleteMany({ botId });
-    await BotConversation.deleteMany({ botId });
-    await BotMessage.deleteMany({ botId });
-    await BotContact.deleteMany({ botId });
+    const convs = await BotConversation.find({ botId }).select("_id");
+    const convIds = convs.map(c => c._id);
 
-    return res.json({ message: "Bot and all associated multi-tenant knowledge base data deleted successfully." });
+    // Cascade delete associated resources
+    await Promise.all([
+      BotFile.deleteMany({ botId }),
+      BotChunk.deleteMany({ botId }),
+      BotEmbedding.deleteMany({ botId }),
+      BotApi.deleteMany({ botId }),
+      BotConversation.deleteMany({ botId }),
+      BotMessage.deleteMany({ botId }),
+      BotContact.deleteMany({ botId }),
+      Summary.deleteMany({ chatId: { $in: convIds } })
+    ]);
+
+    await delCache(`bot:${botId}:rules`).catch(() => {});
+
+    return res.json({ success: true, message: "Bot and all associated multi-tenant knowledge base data deleted successfully." });
   } catch (err) {
     console.error("Delete Bot error:", err);
-    return res.status(500).json({ error: "Failed to delete bot." });
+    return res.status(500).json({ success: false, message: "Failed to delete bot.", error: err.message });
   }
 };
 
@@ -1205,38 +1226,12 @@ exports.sendBotChatMessage = async (req, res) => {
       return res.end();
     }
 
-    // Greeting & Conversational Quick Handler
     // Intent classification via Smart Intent Router
     const intent = detectBotIntent(message, bot.knowledgeSummary);
 
-    if (intent === "GREETING") {
-      const botName = bot.name || "AI Assistant";
-      const greetingMsg = `Hello! I'm ${botName}. How can I assist you today? Feel free to ask general questions or inquiries related to our documentation and connected APIs.`;
-      await streamTextInChunks(res, greetingMsg, 15);
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "user",
-        content: message
-      });
-
-      await BotMessage.create({
-        conversationId: conversation._id,
-        botId,
-        userId: req.user.id,
-        role: "assistant",
-        content: greetingMsg
-      });
-
-      res.write("data: [DONE]\n\n");
-      return res.end();
-    }
-
     // Extract bot mode: small (Strict Document Only), medium (Balanced Hybrid), large (Omni AI)
-    const rawBotMode = (bot.botMode || bot.model || "medium").toLowerCase();
-    const currentBotMode = ["small", "medium", "large"].includes(rawBotMode) ? rawBotMode : "medium";
+    const rawBotMode = (bot.botMode || bot.model || "small").toLowerCase();
+    const currentBotMode = ["small", "medium", "large"].includes(rawBotMode) ? rawBotMode : "small";
 
     let isGeneralQuery = (intent === "GENERAL_QUERY" || intent === "GENERAL_CONVERSATION" || intent === "GREETING");
 
@@ -1251,7 +1246,7 @@ exports.sendBotChatMessage = async (req, res) => {
     const hasFilesCount = await BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] });
     const hasUploadedFiles = hasFilesCount > 0;
 
-    if (!isGeneralQuery && hasUploadedFiles) {
+    if (intent !== "GREETING" && hasUploadedFiles) {
       // Multi-tenant Isolated Knowledge Retrieval for Document / API questions
       const tRagStart = performance.now();
       ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
@@ -1270,10 +1265,10 @@ exports.sendBotChatMessage = async (req, res) => {
   💬 User Prompt:        "${message}"
   🏷️ Classified Intent:   ${intent}
   📂 Uploaded Files:      ${hasUploadedFiles ? `YES (${hasFilesCount} Files)` : "NO"}
-  ${isGeneralQuery
-        ? `⚡ RAG Decision:        [BYPASSED] General Conversation Mode (0ms DB Overhead)`
-        : `📄 RAG Decision:        [EXECUTED] Document Grounding Search (${ragSearchTime.toFixed(2)} ms | Chunks: ${ragResult.chunks?.length || 0})`}
-  🧠 System Prompt:       ${isGeneralQuery ? `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})` : "buildRagSystemPrompt (Strict Grounding + Sources)"}
+  ${hasUploadedFiles && intent !== "GREETING"
+        ? `📄 RAG Decision:        [EXECUTED] Document Grounding Search (${ragSearchTime.toFixed(2)} ms | Chunks: ${ragResult.chunks?.length || 0})`
+        : `⚡ RAG Decision:        [BYPASSED] General Conversation Mode (0ms DB Overhead)`}
+  🧠 System Prompt:       ${(hasUploadedFiles || ragResult.chunks?.length > 0) ? "buildRagSystemPrompt (Strict Grounding + Sources)" : `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})`}
 ========================================================================\n`);
 
     if (sourcesMeta.length > 0 && isStreamRequested) {
@@ -1303,10 +1298,10 @@ exports.sendBotChatMessage = async (req, res) => {
     // Build system prompt based on adaptive intent and currentBotMode
     const { buildGeneralSystemPrompt } = require("../utils/ragEngine");
     let systemPrompt;
-    if (isGeneralQuery) {
+    if (intent === "GREETING" && !hasUploadedFiles) {
       systemPrompt = buildGeneralSystemPrompt(bot.name, bot.description, currentBotMode, effectiveRulesText);
     } else {
-      systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary, effectiveRulesText);
+      systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary, effectiveRulesText, currentBotMode);
     }
 
     const aiGateway = require("../utils/aiGateway");
@@ -1348,6 +1343,7 @@ exports.sendBotChatMessage = async (req, res) => {
       provider: "auto",
       model: targetModel,
       messages: ollamaMessages,
+      conversationSummary: conversation.conversationSummary || "",
       res: isStreamRequested ? res : null,
       userPriority,
       jobId,
@@ -1393,6 +1389,9 @@ exports.sendBotChatMessage = async (req, res) => {
       content: accumulatedResponseText,
       sources: sourcesMeta
     });
+
+    // Non-blocking background trigger for provider-aware rolling summary
+    memoryService.triggerBackgroundSummaryUpdate(conversation._id, botId);
 
     const totalDuration = performance.now() - reqStartTime;
     if (firstTokenTimestamp) {
@@ -1470,6 +1469,7 @@ exports.deleteBotConversation = async (req, res) => {
       return res.status(404).json({ error: "Conversation not found or unauthorized." });
     }
     await BotMessage.deleteMany({ conversationId });
+    await Summary.deleteOne({ chatId: conversationId });
     return res.json({ message: "Bot conversation deleted successfully." });
   } catch (err) {
     return res.status(500).json({ error: "Failed to delete conversation." });

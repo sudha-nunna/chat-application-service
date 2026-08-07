@@ -1,3 +1,4 @@
+// Reload server with updated botKeyAuth middleware
 require("dotenv").config();
 
 const express = require("express");

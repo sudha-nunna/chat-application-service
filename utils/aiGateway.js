@@ -18,6 +18,95 @@ const { performance } = require("perf_hooks");
 const { selectBestClusterNode, clusterState } = require("./ollamaHelper");
 const { selectBestClusterNodeWithPreemption, registerActiveJob, unregisterActiveJob } = require("./priorityDispatcher");
 
+/**
+ * Helper to determine if a node or provider is a Local Model vs Cloud Model
+ */
+function isLocalNodeOrProvider(nodeOrProvider) {
+  if (!nodeOrProvider) return true;
+  if (typeof nodeOrProvider === "string") {
+    const prov = nodeOrProvider.toLowerCase();
+    if (prov === "openai" || prov === "gemini" || prov === "claude" || prov === "anthropic") return false;
+    return true;
+  }
+
+  const format = (nodeOrProvider.format || "").toLowerCase();
+  const url = (nodeOrProvider.url || "").toLowerCase();
+
+  if (format === "openai" || format === "gemini") {
+    if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("anthropic.com")) {
+      return false;
+    }
+  }
+
+  if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("anthropic.com") || url.includes("trycloudflare.com")) {
+    return false;
+  }
+
+  if (format === "ollama" || format === "llama" || url.includes("localhost") || url.includes("127.0.0.1") || url.includes(":11434")) {
+    return true;
+  }
+
+  return format !== "gemini" && format !== "openai";
+}
+
+/**
+ * Builds provider-aware context payload enforcing the exact Context Priority Order:
+ * 1. Bot Rules / System Prompt
+ * 2. Retrieved Knowledge Base Chunks (RAG)
+ * 3. Recent Messages (6–10 messages)
+ * 4. Rolling Summary (Cloud Models Only)
+ */
+function buildProviderAwareContextPayload({ messages = [], conversationSummary = "", isLocal = false }) {
+  let systemMsg = null;
+  let summaryText = (conversationSummary && typeof conversationSummary === "string") ? conversationSummary.trim() : "";
+  const recentMsgs = [];
+
+  for (const msg of messages) {
+    if (!msg) continue;
+    if (msg.role === "system") {
+      const content = msg.content || "";
+      const isSumm = msg.isSummary ||
+        content.startsWith("[CONVERSATION SUMMARY]") ||
+        content.startsWith("Conversation Summary:") ||
+        content.startsWith("Summary:");
+
+      if (isSumm) {
+        if (!summaryText && content) {
+          summaryText = content.replace(/^(?:\[CONVERSATION SUMMARY\]|Conversation Summary:|Summary:)\s*/i, "").trim();
+        }
+      } else if (!systemMsg) {
+        systemMsg = msg;
+      }
+    } else if (msg.role === "summary" || msg.isSummary) {
+      if (!summaryText && msg.content) {
+        summaryText = String(msg.content).trim();
+      }
+    } else {
+      recentMsgs.push(msg);
+    }
+  }
+
+  // Bound recent messages to last 10 (5 turns)
+  const boundedRecentMsgs = recentMsgs.slice(-10);
+
+  const finalPayload = [];
+  if (systemMsg) {
+    finalPayload.push(systemMsg);
+  }
+
+  boundedRecentMsgs.forEach(m => finalPayload.push({ role: m.role, content: m.content }));
+
+  // Requirement 3 & 6: Only send Rolling Summary to Cloud Models (rank 4 priority)
+  if (!isLocal && summaryText) {
+    finalPayload.push({
+      role: "system",
+      content: `[CONVERSATION SUMMARY]\n${summaryText}`
+    });
+  }
+
+  return finalPayload;
+}
+
 class AIGateway {
   /**
    * Main entry point for streaming AI responses to SSE or custom handlers
@@ -27,6 +116,7 @@ class AIGateway {
     model = "best",
     customUrl = null,
     messages = [],
+    conversationSummary = null,
     res = null,
     userPriority = 10,
     jobId = null,
@@ -40,6 +130,7 @@ class AIGateway {
         model,
         customUrl,
         messages,
+        conversationSummary,
         res,
         userPriority,
         jobId,
@@ -52,6 +143,7 @@ class AIGateway {
       return await this._streamCloudOpenAI({
         model: model === "best" ? "gpt-4o-mini" : model,
         messages,
+        conversationSummary,
         res,
         onToken
       });
@@ -61,6 +153,7 @@ class AIGateway {
       return await this._streamCloudGemini({
         model: model === "best" ? "gemini-1.5-flash" : model,
         messages,
+        conversationSummary,
         res,
         onToken
       });
@@ -73,7 +166,7 @@ class AIGateway {
    * Streams response from Cluster Server Nodes with Provider Pools, Priority Routing,
    * Least-Loaded Balancing, Intra-Pool & Cross-Pool Failover, and Observability Metrics.
    */
-  async _streamOllamaCluster({ model, customUrl, messages, res, userPriority, jobId, userId, onToken }) {
+  async _streamOllamaCluster({ model, customUrl, messages, conversationSummary = null, res, userPriority, jobId, userId, onToken }) {
     const { getProviderPools, refreshClusterNodesFromDB } = require("./ollamaHelper");
     await refreshClusterNodesFromDB();
 
@@ -183,8 +276,18 @@ class AIGateway {
 
         let modelSuccess = false;
 
+        // Provider-aware context payload selection:
+        // Local Models: System Prompt + RAG + Recent Messages (NO Summary)
+        // Cloud Models: System Prompt + RAG + Recent Messages + Rolling Summary
+        const isLocal = isLocalNodeOrProvider(currentNode);
+        const providerMessages = buildProviderAwareContextPayload({
+          messages,
+          conversationSummary,
+          isLocal
+        });
+
         for (const candidateModel of modelsToTry) {
-          const payload = { model: candidateModel, messages, stream: true };
+          const payload = { model: candidateModel, messages: providerMessages, stream: true };
           if (currentNode.format === "ollama") payload.keep_alive = "24h";
 
           const dispatchStartTime = performance.now();
@@ -342,17 +445,23 @@ class AIGateway {
   /**
    * Cloud OpenAI Stream Fallback Implementation
    */
-  async _streamCloudOpenAI({ model, messages, res, onToken }) {
+  async _streamCloudOpenAI({ model, messages, conversationSummary = null, res, onToken }) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       throw new Error("OPENAI_API_KEY environment variable is not configured.");
     }
 
+    const providerMessages = buildProviderAwareContextPayload({
+      messages,
+      conversationSummary,
+      isLocal: false
+    });
+
     const { OpenAI } = require("openai");
     const openai = new OpenAI({ apiKey });
     const stream = await openai.chat.completions.create({
       model: model || "gpt-4o-mini",
-      messages,
+      messages: providerMessages,
       stream: true
     });
 
@@ -371,17 +480,23 @@ class AIGateway {
   /**
    * Cloud Google Gemini Stream Fallback Implementation
    */
-  async _streamCloudGemini({ model, messages, res, onToken }) {
+  async _streamCloudGemini({ model, messages, conversationSummary = null, res, onToken }) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error("GEMINI_API_KEY environment variable is not configured.");
     }
 
+    const providerMessages = buildProviderAwareContextPayload({
+      messages,
+      conversationSummary,
+      isLocal: false
+    });
+
     const { GoogleGenAI } = require("@google/genai");
     const ai = new GoogleGenAI({ apiKey });
     const responseStream = await ai.models.generateContentStream({
       model: model || "gemini-1.5-flash",
-      contents: messages.map(m => `${m.role}: ${m.content}`).join("\n")
+      contents: providerMessages.map(m => `${m.role}: ${m.content}`).join("\n")
     });
 
     const streamBuffer = new ActionStreamBuffer(res, onToken);
@@ -453,8 +568,20 @@ class ActionStreamBuffer {
     }
   }
 
+  _sanitizeVendorBranding(text) {
+    if (!text || typeof text !== "string") return text;
+    return text
+      .replace(/\bChatGPT\b/gi, "AI Assistant")
+      .replace(/\bOpenAI\b/gi, "AI Platform")
+      .replace(/\b(Google Gemini|Gemini AI|Google's Gemini|Gemini)\b/gi, "AI Assistant")
+      .replace(/\bOllama\b/gi, "AI Engine")
+      .replace(/\bClaude\b/gi, "AI Assistant")
+      .replace(/\bAnthropic\b/gi, "AI Platform");
+  }
+
   _emitLine(lineWithBreak) {
-    const trimmed = lineWithBreak.trim();
+    const sanitizedLine = this._sanitizeVendorBranding(lineWithBreak);
+    const trimmed = sanitizedLine.trim();
     const actionMeta = parseActionDirective(trimmed);
 
     if (actionMeta) {
@@ -464,14 +591,14 @@ class ActionStreamBuffer {
         this.res.write(`event: metadata\ndata: ${JSON.stringify(actionMeta)}\n\n`);
       }
     } else {
-      this.cleanText += lineWithBreak;
+      this.cleanText += sanitizedLine;
       if (!this.firstTokenFired && typeof this.onToken === "function") {
         this.firstTokenFired = true;
-        this.onToken(lineWithBreak);
+        this.onToken(sanitizedLine);
       }
       if (this.res && !this.res.writableEnded) {
-        console.log(`📡 [SSE OUT Chunk]:`, JSON.stringify({ text: lineWithBreak }));
-        this.res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: lineWithBreak, text: lineWithBreak })}\n\n`);
+        console.log(`📡 [SSE OUT Chunk]:`, JSON.stringify({ text: sanitizedLine }));
+        this.res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: sanitizedLine, text: sanitizedLine })}\n\n`);
       }
     }
   }
