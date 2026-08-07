@@ -10,7 +10,7 @@ if (!protect) {
   console.error("CRITICAL ERROR: 'protect' middleware configuration missing!");
 }
 
-const { clusterState, checkClusterHealth } = require("../utils/ollamaHelper");
+const { clusterState } = require("../utils/ollamaHelper");
 
 // Calls the correct streaming method that handles "text/event-stream"
 router.post("/message/:chatId", protect, chatController.sendMessage);

@@ -7,11 +7,8 @@ const { encrypt, decrypt } = require("../utils/encryption");
  */
 exports.getAllNodes = async (req, res) => {
   try {
-    const { checkClusterHealth } = require("../utils/ollamaHelper");
-    // Trigger background health check asynchronously so page load is INSTANT (<10ms)
-    checkClusterHealth().catch(err => console.warn("⚠️ Background health ping error:", err.message));
-
-    const { clusterState } = require("../utils/ollamaHelper");
+    const { clusterState, refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
+    await refreshClusterNodesFromDB();
     const rawNodes = await ServerNode.find().sort({ priorityScore: -1, priority: -1, createdAt: 1 });
 
     const activeMap = new Map(clusterState.map(n => [n.id, n.activeRequests || 0]));

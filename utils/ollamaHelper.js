@@ -259,16 +259,10 @@ async function getAvailableOllamaModel(customBaseUrl = null, preferredModel = nu
 }
 
 /**
- * Server startup connection warmup & 30s Health Check Interval Scheduler
+ * Server startup connection warmup (loads server nodes from DB without background continuous polling)
  */
 async function warmOllamaConnection() {
-  await checkClusterHealth();
-
-  if (!healthCheckTimer) {
-    healthCheckTimer = setInterval(() => {
-      checkClusterHealth().catch(err => console.warn("Background health check error:", err.message));
-    }, HEALTH_CHECK_INTERVAL_MS);
-  }
+  await refreshClusterNodesFromDB();
   return true;
 }
 
