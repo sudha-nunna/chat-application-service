@@ -520,9 +520,31 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
     }
   }
 
-  const filter = { botId: targetBotId };
+  let filter = { botId: targetBotId };
+  if (targetBotId && mongoose.Types.ObjectId.isValid(targetBotId)) {
+    const Bot = require("../models/Bot");
+    const botDoc = await Bot.findById(targetBotId).select("projectId").lean();
+    if (botDoc && botDoc.projectId) {
+      filter = {
+        $or: [
+          { botId: targetBotId },
+          { projectId: botDoc.projectId }
+        ]
+      };
+    }
+  }
+
   if (targetUserId) {
-    filter.$or = [{ userId: targetUserId }, { ownerId: targetUserId }];
+    if (filter.$or) {
+      filter = {
+        $and: [
+          { $or: filter.$or },
+          { $or: [{ userId: targetUserId }, { ownerId: targetUserId }] }
+        ]
+      };
+    } else {
+      filter.$or = [{ userId: targetUserId }, { ownerId: targetUserId }];
+    }
   }
 
   const rawChunks = await BotChunk.find(filter).populate("fileId", "fileName fileType fileCategory");

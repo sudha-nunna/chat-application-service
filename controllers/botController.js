@@ -40,15 +40,12 @@ async function streamTextInChunks(res, text, delayMs = 15) {
 
 exports.createBot = async (req, res) => {
   try {
-    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles } = req.body;
+    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles, botType, responseMode, botSpecificRules, voiceConfig, avatarConfig, capabilities, avatarImage, avatarVideo, avatarProvider, voiceProfile, projectId } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Bot name is required." });
     }
 
     const uploadedFiles = Array.isArray(stagedFiles) ? stagedFiles : [];
-    if (uploadedFiles.length === 0 && (!rulesText || !rulesText.trim())) {
-      return res.status(400).json({ error: "Please upload at least one knowledge/rules file or specify rules before creating the bot." });
-    }
 
     // Validate Rule Limits if rulesText is provided directly
     if (rulesText && typeof rulesText === "string" && rulesText.trim()) {
@@ -75,6 +72,38 @@ exports.createBot = async (req, res) => {
       sourceFiles: []
     };
 
+    const selectedType = botType || "HYBRID";
+    const defaultCapabilities = capabilities || {
+      enableRag: ["CHAT", "VOICE", "AVATAR", "HYBRID"].includes(selectedType),
+      enableActions: ["ACTION", "HYBRID"].includes(selectedType),
+      enableVoice: ["VOICE", "AVATAR", "HYBRID"].includes(selectedType),
+      enableAvatar: ["AVATAR", "HYBRID"].includes(selectedType)
+    };
+
+    let finalAvatarConfig = avatarConfig || {};
+    let finalAvatarImage = avatarImage || "";
+    let finalAvatarVideo = avatarVideo || "";
+
+    if (avatarImage && typeof avatarImage === "string" && avatarImage.length > 50) {
+      try {
+        const avatarService = require("../services/avatarService");
+        const avatarResult = await avatarService.processAvatarUpload(
+          avatarImage,
+          `${req.protocol}://${req.get("host")}`
+        );
+        finalAvatarImage = avatarResult.imageUrl || avatarImage;
+        finalAvatarVideo = avatarResult.videoUrl || avatarVideo;
+        finalAvatarConfig = {
+          faceImageUrl: avatarResult.imageUrl,
+          faceVideoUrl: avatarResult.videoUrl,
+          visemeMap: avatarResult.visemeMap,
+          avatarProvider: avatarProvider || "LOCAL_VISEME"
+        };
+      } catch (avErr) {
+        console.warn("Creation avatar processing warning:", avErr.message);
+      }
+    }
+
     const bot = await Bot.create({
       ownerId: req.user.id,
       userId: req.user.id,
@@ -82,8 +111,19 @@ exports.createBot = async (req, res) => {
       description: description ? description.trim() : "",
       model: finalModel,
       botMode: finalBotMode,
+      botType: selectedType,
+      capabilities: defaultCapabilities,
+      projectId: projectId || null,
+      responseMode: responseMode || (selectedType === "CHAT" ? "TEXT_ONLY" : selectedType === "VOICE" ? "AUDIO_ONLY" : selectedType === "AVATAR" ? "VIDEO_AVATAR" : "HYBRID"),
+      avatarImage: finalAvatarImage,
+      avatarVideo: finalAvatarVideo,
+      avatarProvider: avatarProvider || "LOCAL_VISEME",
+      voiceProfile: voiceProfile || voiceConfig || { voiceId: "default-en", voiceType: "PRESET" },
+      botSpecificRules: botSpecificRules || "",
+      avatarConfig: finalAvatarConfig,
+      voiceConfig: voiceConfig || {},
       allowedDomains: domainsList,
-      systemPrompt: systemPrompt || "You are a specialized AI assistant.",
+      systemPrompt: systemPrompt || `You are a specialized ${selectedType} AI assistant.`,
       rulesConfig: initialRulesObj
     });
 
@@ -171,7 +211,7 @@ exports.getBotById = async (req, res) => {
 exports.updateBot = async (req, res) => {
   try {
     const { botId } = req.params;
-    const { name, model } = req.body;
+    const { name, model, description, systemPrompt, botType, responseMode, botSpecificRules, avatarConfig, voiceConfig } = req.body;
 
     const updateData = {};
     if (name !== undefined) {
@@ -188,8 +228,16 @@ exports.updateBot = async (req, res) => {
       updateData.model = model.trim();
     }
 
+    if (description !== undefined) updateData.description = String(description).trim();
+    if (systemPrompt !== undefined) updateData.systemPrompt = String(systemPrompt).trim();
+    if (botType !== undefined) updateData.botType = botType;
+    if (responseMode !== undefined) updateData.responseMode = responseMode;
+    if (botSpecificRules !== undefined) updateData.botSpecificRules = String(botSpecificRules).trim();
+    if (avatarConfig !== undefined) updateData.avatarConfig = avatarConfig;
+    if (voiceConfig !== undefined) updateData.voiceConfig = voiceConfig;
+
     if (Object.keys(updateData).length === 0) {
-      return res.status(400).json({ error: "Please provide bot name or model to update." });
+      return res.status(400).json({ error: "Please provide valid bot fields to update." });
     }
 
     const bot = await Bot.findOneAndUpdate(
@@ -209,6 +257,40 @@ exports.updateBot = async (req, res) => {
   } catch (err) {
     console.error("Update Bot error:", err);
     return res.status(500).json({ error: "Failed to update bot." });
+  }
+};
+
+exports.uploadBotAvatar = async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const { fileData } = req.body;
+    const avatarService = require("../services/avatarService");
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!bot) {
+      return res.status(404).json({ error: "Bot not found or unauthorized." });
+    }
+
+    const reqHost = `${req.protocol}://${req.get("host")}`;
+    const avatarConfig = await avatarService.processAvatarUpload(fileData || req.file, reqHost);
+
+    bot.avatarConfig = avatarConfig;
+    if (!bot.botType || bot.botType === "HYBRID") {
+      bot.botType = "VIDEO_AVATAR";
+    }
+    await bot.save();
+
+    const { delCache } = require("../utils/redisClient");
+    await delCache(`bot_cfg_${botId}_${req.user.id}`);
+
+    return res.json({ success: true, avatarConfig: bot.avatarConfig, bot });
+  } catch (err) {
+    console.error("Upload Bot Avatar error:", err);
+    return res.status(500).json({ error: err.message || "Failed to process avatar upload." });
   }
 };
 
@@ -918,9 +1000,21 @@ function parseStructuredUI(text) {
   };
 }
 
-function sendJsonResponse(res, conversation, bot, currentBotMode, responseText, sourcesMeta = [], reqStartTime = 0, ttft = null) {
+async function sendJsonResponse(res, conversation, bot, currentBotMode, responseText, sourcesMeta = [], reqStartTime = 0, ttft = null, reqHost = "http://localhost:5000") {
   const totalDuration = performance.now() - reqStartTime;
   const structuredUI = parseStructuredUI(responseText);
+
+  let speechData = null;
+  const isAudioOrAvatarBot = ["AVATAR", "VIDEO_AVATAR", "VOICE", "HYBRID"].includes(bot.botType) || ["AUDIO_ONLY", "VIDEO_AVATAR", "HYBRID"].includes(bot.responseMode);
+
+  if (isAudioOrAvatarBot && responseText && responseText.trim()) {
+    try {
+      const voiceService = require("../services/voiceService");
+      speechData = await voiceService.generateSpeechAndVisemes(responseText, bot.voiceConfig || {}, reqHost);
+    } catch (e) {
+      console.warn("Speech generation fallback warning:", e.message);
+    }
+  }
 
   return res.json({
     success: true,
@@ -928,11 +1022,15 @@ function sendJsonResponse(res, conversation, bot, currentBotMode, responseText, 
     botId: bot._id,
     botName: bot.name || "AI Assistant",
     botMode: currentBotMode,
+    botType: bot.botType || "HYBRID",
+    responseMode: bot.responseMode || "HYBRID",
     responseType: "markdown",
     message: {
       role: "assistant",
       content: responseText
     },
+    speechData,
+    avatarConfig: bot.avatarConfig || {},
     sources: sourcesMeta,
     structuredUI,
     metrics: {
@@ -1409,13 +1507,25 @@ exports.sendBotChatMessage = async (req, res) => {
 ========================================================================\n
 `);
 
+    const reqHost = `${req.protocol}://${req.get("host")}`;
+    const isAudioOrAvatarBot = ["AVATAR", "VIDEO_AVATAR", "VOICE", "HYBRID"].includes(bot.botType) || ["AUDIO_ONLY", "VIDEO_AVATAR", "HYBRID"].includes(bot.responseMode);
+
     if (isStreamRequested) {
+      if (isAudioOrAvatarBot && accumulatedResponseText && accumulatedResponseText.trim()) {
+        try {
+          const voiceService = require("../services/voiceService");
+          const speechData = await voiceService.generateSpeechAndVisemes(accumulatedResponseText, bot.voiceConfig || {}, reqHost);
+          res.write(`event: speechData\ndata: ${JSON.stringify({ type: "speechData", speechData, avatarConfig: bot.avatarConfig || {} })}\n\n`);
+        } catch (e) {
+          console.warn("SSE Speech generation warning:", e.message);
+        }
+      }
       const structuredUI = parseStructuredUI(accumulatedResponseText);
-      res.write(`event: metadata\ndata: ${JSON.stringify({ responseType: structuredUI.component, title: conversation.title || "Bot Conversation", conversationId: conversation._id })}\n\n`);
+      res.write(`event: metadata\ndata: ${JSON.stringify({ responseType: structuredUI.component, title: conversation.title || "Bot Conversation", conversationId: conversation._id, botType: bot.botType, responseMode: bot.responseMode })}\n\n`);
       res.write("event: done\ndata: [DONE]\n\n");
       return res.end();
     } else {
-      return sendJsonResponse(res, conversation, bot, currentBotMode, accumulatedResponseText, sourcesMeta, reqStartTime, ttft);
+      return await sendJsonResponse(res, conversation, bot, currentBotMode, accumulatedResponseText, sourcesMeta, reqStartTime, ttft, reqHost);
     }
   } catch (err) {
     console.error("Bot Chat Streaming error:", err);
@@ -1771,5 +1881,53 @@ exports.externalBotChat = async (req, res) => {
   } catch (err) {
     console.error("External Bot Chat Error:", err);
     return res.status(500).json({ success: false, message: "Failed to process external bot chat message.", error: err.message });
+  }
+};
+
+/**
+ * Uploads and processes a face avatar photo/video for a Bot
+ * Endpoint: POST /bots/:botId/avatar
+ */
+exports.uploadBotAvatar = async (req, res) => {
+  try {
+    const { botId } = req.params;
+    const { fileData, avatarImage, avatarVideo } = req.body;
+
+    const bot = await Bot.findOne({
+      _id: botId,
+      $or: [{ userId: req.user.id }, { ownerId: req.user.id }]
+    });
+
+    if (!bot) {
+      return res.status(404).json({ error: "Bot not found or unauthorized." });
+    }
+
+    const avatarService = require("../services/avatarService");
+    const avatarResult = await avatarService.processAvatarUpload(
+      fileData || avatarImage || avatarVideo,
+      `${req.protocol}://${req.get("host")}`
+    );
+
+    bot.avatarImage = avatarResult.imageUrl || avatarImage || "";
+    bot.avatarVideo = avatarResult.videoUrl || avatarVideo || "";
+    bot.avatarConfig = {
+      faceImageUrl: avatarResult.imageUrl,
+      faceVideoUrl: avatarResult.videoUrl,
+      visemeMap: avatarResult.visemeMap,
+      avatarProvider: bot.avatarProvider || "LOCAL_VISEME"
+    };
+
+    await bot.save();
+
+    return res.json({
+      success: true,
+      message: "Avatar uploaded and processed successfully.",
+      avatarConfig: bot.avatarConfig,
+      avatarImage: bot.avatarImage,
+      bot
+    });
+  } catch (err) {
+    console.error("Upload Bot Avatar Error:", err);
+    return res.status(500).json({ error: "Failed to upload avatar." });
   }
 };

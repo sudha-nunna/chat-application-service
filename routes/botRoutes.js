@@ -19,6 +19,7 @@ router.post("/:botId/keys/generate", protect, botController.generateBotKeys);  /
 
 // Knowledge Upload & Files
 router.post("/:botId/upload", protect, botController.uploadBotFile);
+router.post("/:botId/avatar", protect, botController.uploadBotAvatar);
 router.get("/:botId/files", protect, botController.getBotFiles);
 router.put("/:botId/files/:fileId", protect, botController.replaceBotFile);
 router.delete("/:botId/files/:fileId", protect, botController.deleteBotFile);

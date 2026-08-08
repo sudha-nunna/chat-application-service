@@ -45,13 +45,29 @@ app.use(cors({
   credentials: true
 }));
 
+const path = require("path");
+const fs = require("fs");
+
+// Ensure upload directories exist
+const uploadDirs = ["uploads", "uploads/audio", "uploads/avatars"];
+uploadDirs.forEach((dir) => {
+  const fullPath = path.join(__dirname, dir);
+  if (!fs.existsSync(fullPath)) {
+    fs.mkdirSync(fullPath, { recursive: true });
+  }
+});
+
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+const projectRoutes = require("./routes/projectRoutes");
 
 app.use("/chats", chatRoutes);
 app.use("/auth", authRoutes);
 app.use("/ollama", ollamaRoutes);
 app.use("/bots", botRoutes);
+app.use("/projects", projectRoutes);
 app.use("/api/v1/external/bots", externalBotRoutes);
 app.use("/subscription", subscriptionRoutes);
 app.use("/plans", planRoutes);
