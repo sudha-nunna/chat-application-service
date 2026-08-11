@@ -4,6 +4,10 @@ const authMiddleware = require("../middleware/auth");
 const protect = typeof authMiddleware === "function" ? authMiddleware : authMiddleware.protect;
 const { checkAgentLimit } = require("../middleware/limitMiddleware");
 const botController = require("../controllers/botController");
+const avatarController = require("../controllers/avatarController");
+
+// General Public & Avatar Chat Endpoints (Declared before :botId param routes)
+router.post("/avatar/chat", avatarController.handleAvatarChat);
 
 // Bot CRUD & Key Lifecycle Management
 router.post("/", protect, checkAgentLimit, botController.createBot);
@@ -17,7 +21,8 @@ router.delete("/:botId", protect, botController.deleteBot);
 router.get("/:botId/keys", protect, botController.getBotKeys);                // GET Bot Keys
 router.post("/:botId/keys/generate", protect, botController.generateBotKeys);  // POST Generate & Regenerate Keys
 
-// Knowledge Upload & Files
+// Knowledge Upload, Avatars & Media Assets
+router.get("/media/:assetId", botController.streamMediaAsset);
 router.post("/:botId/upload", protect, botController.uploadBotFile);
 router.post("/:botId/avatar", protect, botController.uploadBotAvatar);
 router.get("/:botId/files", protect, botController.getBotFiles);

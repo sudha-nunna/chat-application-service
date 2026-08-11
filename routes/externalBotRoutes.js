@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const botKeyAuth = require("../middleware/botKeyAuth");
 const botController = require("../controllers/botController");
+const avatarController = require("../controllers/avatarController");
 
 /**
  * Public External Bot Integration Endpoints

@@ -25,9 +25,8 @@ connectDB().then(() => {
 
 const app = express();
 
-// 1. Public External Bot Widget CORS (Allows third-party websites/apps using API Keys)
-// Must be declared BEFORE global restricted CORS middleware
-app.use("/api/v1/external/bots", cors({
+// 1. Public External Bot & Avatar CORS (Allows third-party websites/apps without token requirements)
+app.use(["/api/v1/external/bots", "/api/v1/avatar"], cors({
   origin: "*",
   credentials: false,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],

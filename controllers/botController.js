@@ -40,7 +40,7 @@ async function streamTextInChunks(res, text, delayMs = 15) {
 
 exports.createBot = async (req, res) => {
   try {
-    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles, botType, responseMode, botSpecificRules, voiceConfig, avatarConfig, capabilities, avatarImage, avatarVideo, avatarProvider, voiceProfile, projectId } = req.body;
+    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles, botType, responseMode, botSpecificRules, voiceConfig, avatarConfig, capabilities, avatarImage, avatarVideo, avatar3DModel, avatarProvider, voiceProfile, projectId } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Bot name is required." });
     }
@@ -83,6 +83,8 @@ exports.createBot = async (req, res) => {
     let finalAvatarConfig = avatarConfig || {};
     let finalAvatarImage = avatarImage || "";
     let finalAvatarVideo = avatarVideo || "";
+    let finalAvatar3DModel = avatar3DModel || avatarConfig?.faceModelUrl || avatarConfig?.avatar3DModel || "/models/viverse_avatar_model_210287.vrm";
+    let finalAvatarProvider = avatarProvider || avatarConfig?.avatarProvider || "THREE_3D";
 
     if (avatarImage && typeof avatarImage === "string" && avatarImage.length > 50) {
       try {
@@ -93,15 +95,29 @@ exports.createBot = async (req, res) => {
         );
         finalAvatarImage = avatarResult.imageUrl || avatarImage;
         finalAvatarVideo = avatarResult.videoUrl || avatarVideo;
+        if (avatarResult.faceModelUrl) finalAvatar3DModel = avatarResult.faceModelUrl;
+        if (avatarResult.avatarProvider) finalAvatarProvider = avatarResult.avatarProvider;
         finalAvatarConfig = {
-          faceImageUrl: avatarResult.imageUrl,
-          faceVideoUrl: avatarResult.videoUrl,
+          ...avatarConfig,
+          faceImageUrl: finalAvatarImage,
+          faceVideoUrl: finalAvatarVideo,
+          faceModelUrl: finalAvatar3DModel,
+          avatar3DModel: finalAvatar3DModel,
           visemeMap: avatarResult.visemeMap,
-          avatarProvider: avatarProvider || "LOCAL_VISEME"
+          avatarProvider: finalAvatarProvider
         };
       } catch (avErr) {
         console.warn("Creation avatar processing warning:", avErr.message);
       }
+    } else {
+      finalAvatarConfig = {
+        ...finalAvatarConfig,
+        faceImageUrl: finalAvatarImage,
+        faceVideoUrl: finalAvatarVideo,
+        faceModelUrl: finalAvatar3DModel,
+        avatar3DModel: finalAvatar3DModel,
+        avatarProvider: finalAvatarProvider
+      };
     }
 
     const bot = await Bot.create({
@@ -117,7 +133,8 @@ exports.createBot = async (req, res) => {
       responseMode: responseMode || (selectedType === "CHAT" ? "TEXT_ONLY" : selectedType === "VOICE" ? "AUDIO_ONLY" : selectedType === "AVATAR" ? "VIDEO_AVATAR" : "HYBRID"),
       avatarImage: finalAvatarImage,
       avatarVideo: finalAvatarVideo,
-      avatarProvider: avatarProvider || "LOCAL_VISEME",
+      avatar3DModel: finalAvatar3DModel,
+      avatarProvider: finalAvatarProvider,
       voiceProfile: voiceProfile || voiceConfig || { voiceId: "default-en", voiceType: "PRESET" },
       botSpecificRules: botSpecificRules || "",
       avatarConfig: finalAvatarConfig,
@@ -211,7 +228,7 @@ exports.getBotById = async (req, res) => {
 exports.updateBot = async (req, res) => {
   try {
     const { botId } = req.params;
-    const { name, model, description, systemPrompt, botType, responseMode, botSpecificRules, avatarConfig, voiceConfig } = req.body;
+    const { name, model, description, systemPrompt, botType, responseMode, botSpecificRules, avatarConfig, voiceConfig, avatarImage, avatarVideo, avatar3DModel, avatarProvider } = req.body;
 
     const updateData = {};
     if (name !== undefined) {
@@ -235,6 +252,10 @@ exports.updateBot = async (req, res) => {
     if (botSpecificRules !== undefined) updateData.botSpecificRules = String(botSpecificRules).trim();
     if (avatarConfig !== undefined) updateData.avatarConfig = avatarConfig;
     if (voiceConfig !== undefined) updateData.voiceConfig = voiceConfig;
+    if (avatarImage !== undefined) updateData.avatarImage = avatarImage;
+    if (avatarVideo !== undefined) updateData.avatarVideo = avatarVideo;
+    if (avatar3DModel !== undefined) updateData.avatar3DModel = avatar3DModel;
+    if (avatarProvider !== undefined) updateData.avatarProvider = avatarProvider;
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: "Please provide valid bot fields to update." });
@@ -329,7 +350,7 @@ exports.deleteBot = async (req, res) => {
       Summary.deleteMany({ chatId: { $in: convIds } })
     ]);
 
-    await delCache(`bot:${botId}:rules`).catch(() => {});
+    await delCache(`bot:${botId}:rules`).catch(() => { });
 
     return res.json({ success: true, message: "Bot and all associated multi-tenant knowledge base data deleted successfully." });
   } catch (err) {
@@ -1016,6 +1037,21 @@ async function sendJsonResponse(res, conversation, bot, currentBotMode, response
     }
   }
 
+  const avatarMetadata = isAudioOrAvatarBot ? {
+    state: "speaking",
+    expression: "friendly",
+    animation: "talking",
+    visemes: speechData?.visemes || [],
+    headMovement: true,
+    eyeBlink: true,
+    movements: {
+      headRotation: { x: 0.02, y: 0.05, z: 0.0 },
+      eyeBlinkRate: 3.5,
+      breathingRate: 2.0,
+      gesture: "nod"
+    }
+  } : null;
+
   return res.json({
     success: true,
     conversationId: conversation._id,
@@ -1030,6 +1066,7 @@ async function sendJsonResponse(res, conversation, bot, currentBotMode, response
       content: responseText
     },
     speechData,
+    avatar: avatarMetadata,
     avatarConfig: bot.avatarConfig || {},
     sources: sourcesMeta,
     structuredUI,
@@ -1908,13 +1945,22 @@ exports.uploadBotAvatar = async (req, res) => {
       `${req.protocol}://${req.get("host")}`
     );
 
-    bot.avatarImage = avatarResult.imageUrl || avatarImage || "";
-    bot.avatarVideo = avatarResult.videoUrl || avatarVideo || "";
+    bot.avatarImage = avatarResult.faceImageUrl || avatarImage || "";
+    bot.avatarVideo = avatarResult.faceVideoUrl || avatarVideo || "";
+    if (avatarResult.faceModelUrl || avatarResult.avatar3DModel) {
+      bot.avatar3DModel = avatarResult.faceModelUrl || avatarResult.avatar3DModel;
+    }
+    if (avatarResult.avatarProvider) {
+      bot.avatarProvider = avatarResult.avatarProvider;
+    }
+
     bot.avatarConfig = {
-      faceImageUrl: avatarResult.imageUrl,
-      faceVideoUrl: avatarResult.videoUrl,
+      faceImageUrl: avatarResult.faceImageUrl || bot.avatarImage,
+      faceVideoUrl: avatarResult.faceVideoUrl || bot.avatarVideo,
+      faceModelUrl: avatarResult.faceModelUrl || bot.avatar3DModel,
+      avatar3DModel: avatarResult.faceModelUrl || bot.avatar3DModel,
       visemeMap: avatarResult.visemeMap,
-      avatarProvider: bot.avatarProvider || "LOCAL_VISEME"
+      avatarProvider: bot.avatarProvider || (bot.avatar3DModel ? "THREE_3D" : "LOCAL_VISEME")
     };
 
     await bot.save();
@@ -1924,10 +1970,42 @@ exports.uploadBotAvatar = async (req, res) => {
       message: "Avatar uploaded and processed successfully.",
       avatarConfig: bot.avatarConfig,
       avatarImage: bot.avatarImage,
+      avatarVideo: bot.avatarVideo,
+      avatar3DModel: bot.avatar3DModel,
       bot
     });
   } catch (err) {
     console.error("Upload Bot Avatar Error:", err);
     return res.status(500).json({ error: "Failed to upload avatar." });
+  }
+};
+
+/**
+ * Stream binary media asset from MongoDB MediaAsset collection
+ * Endpoint: GET /bots/media/:assetId
+ */
+exports.streamMediaAsset = async (req, res) => {
+  try {
+    const { assetId } = req.params;
+    const MediaAsset = require("../models/MediaAsset");
+
+    const asset = await MediaAsset.findById(assetId);
+    if (!asset || !asset.data) {
+      return res.status(404).json({ error: "Media asset not found." });
+    }
+
+    res.set("Content-Type", asset.contentType || "application/octet-stream");
+    res.set("Content-Length", asset.size || asset.data.length);
+
+    if (asset.isTransient) {
+      res.set("Cache-Control", "public, max-age=86400");
+    } else {
+      res.set("Cache-Control", "public, max-age=31536000, immutable");
+    }
+
+    return res.send(asset.data);
+  } catch (err) {
+    console.error("Stream Media Asset error:", err);
+    return res.status(500).json({ error: "Failed to stream media asset." });
   }
 };

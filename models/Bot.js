@@ -107,9 +107,13 @@ const botSchema = new mongoose.Schema(
       type: String,
       default: ""
     },
+    avatar3DModel: {
+      type: String,
+      default: "/models/viverse_avatar_model_210287.vrm"
+    },
     avatarProvider: {
       type: String,
-      default: "LOCAL_VISEME"
+      default: "THREE_3D"
     },
     voiceProfile: {
       voiceId: { type: String, default: "default-en" },

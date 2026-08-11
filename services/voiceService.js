@@ -118,33 +118,119 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "http:
 
   const audioBuffer = createSyntheticAudioBuffer(totalDurationMs);
   
-  // Save audio file to uploads/audio/
   const fileHash = crypto.randomBytes(8).toString("hex");
   const fileName = `speech_${Date.now()}_${fileHash}.wav`;
-  const uploadDirPath = path.join(__dirname, "../uploads/audio");
 
-  if (!fs.existsSync(uploadDirPath)) {
-    fs.mkdirSync(uploadDirPath, { recursive: true });
+  // Store in MongoDB MediaAsset collection with TTL index (isTransient: true)
+  const MediaAsset = require("../models/MediaAsset");
+  let relativeUrl = "";
+  let fullAudioUrl = "";
+  try {
+    const mediaAsset = await MediaAsset.create({
+      filename: fileName,
+      contentType: "audio/wav",
+      data: audioBuffer,
+      size: audioBuffer.length,
+      type: "SPEECH_AUDIO",
+      botId: options.botId || null,
+      userId: options.userId || null,
+      isTransient: true
+    });
+    relativeUrl = `/bots/media/${mediaAsset._id}`;
+    fullAudioUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
+  } catch (err) {
+    console.warn("Failed to store speech audio in MongoDB MediaAsset, using base64 fallback:", err.message);
   }
 
-  const filePath = path.join(uploadDirPath, fileName);
-  await fs.promises.writeFile(filePath, audioBuffer);
-
-  const relativeUrl = `/uploads/audio/${fileName}`;
-  const fullAudioUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
-  const audioBase64 = `data:audio/wav;base64,${audioBuffer.toString("base64")}`;
+  if (!fullAudioUrl) {
+    fullAudioUrl = `data:audio/wav;base64,${audioBuffer.toString("base64")}`;
+  }
 
   return {
     text,
     audioUrl: fullAudioUrl,
-    relativeAudioUrl: relativeUrl,
-    audioBase64,
+    relativeAudioUrl: relativeUrl || fullAudioUrl,
     durationMs: totalDurationMs,
     visemes
   };
 }
 
+/**
+ * Speech-To-Text (STT) Transcriber
+ * Accepts audio Base64, audio URL, or buffer, and extracts/transcribes the user speech text.
+ * @param {string|Buffer|object} input 
+ * @returns {Promise<string>} Transcribed text string
+ */
+async function convertSpeechToText(input) {
+  if (!input) return "";
+
+  if (typeof input === "string") {
+    // If input is plain text (not base64 audio data URI), return directly
+    if (!input.startsWith("data:audio") && !input.startsWith("http") && !/^[A-Za-z0-9+/=]{100,}$/.test(input)) {
+      return input.trim();
+    }
+
+    // Handle Base64 Data URI or raw Base64 string
+    if (input.startsWith("data:audio")) {
+      const base64Content = input.split(",")[1] || "";
+      if (base64Content) {
+        // Fallback: If OpenAI / Whisper API key is configured in env, call Whisper API
+        if (process.env.OPENAI_API_KEY) {
+          try {
+            const axios = require("axios");
+            const FormData = require("form-data");
+            const audioBuffer = Buffer.from(base64Content, "base64");
+            const form = new FormData();
+            form.append("file", audioBuffer, { filename: "speech.wav", contentType: "audio/wav" });
+            form.append("model", "whisper-1");
+
+            const whisperRes = await axios.post("https://api.openai.com/v1/audio/transcriptions", form, {
+              headers: {
+                ...form.getHeaders(),
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+              }
+            });
+            if (whisperRes.data?.text) {
+              return whisperRes.data.text.trim();
+            }
+          } catch (e) {
+            console.warn("Whisper STT transcription error:", e.message);
+          }
+        }
+      }
+    }
+  }
+
+  // File object / Buffer support
+  if (input && typeof input === "object" && input.buffer) {
+    if (process.env.OPENAI_API_KEY) {
+      try {
+        const axios = require("axios");
+        const FormData = require("form-data");
+        const form = new FormData();
+        form.append("file", input.buffer, { filename: input.originalname || "speech.wav", contentType: input.mimetype || "audio/wav" });
+        form.append("model", "whisper-1");
+
+        const whisperRes = await axios.post("https://api.openai.com/v1/audio/transcriptions", form, {
+          headers: {
+            ...form.getHeaders(),
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+          }
+        });
+        if (whisperRes.data?.text) {
+          return whisperRes.data.text.trim();
+        }
+      } catch (e) {
+        console.warn("Whisper STT file transcription error:", e.message);
+      }
+    }
+  }
+
+  return typeof input === "string" ? input.trim() : "";
+}
+
 module.exports = {
   extractVisemeTimeline,
-  generateSpeechAndVisemes
+  generateSpeechAndVisemes,
+  convertSpeechToText
 };
