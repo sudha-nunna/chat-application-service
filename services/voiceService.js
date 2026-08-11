@@ -22,10 +22,10 @@ const VISEME_MAP = {
  */
 function extractVisemeTimeline(text) {
   if (!text || typeof text !== "string") return [];
-  
+
   const cleanText = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ");
   const words = cleanText.split(/\s+/).filter(Boolean);
-  
+
   const visemes = [];
   let currentTimeMs = 0;
 
@@ -74,9 +74,9 @@ function createSyntheticAudioBuffer(durationMs) {
   const bitsPerSample = 16;
   const totalSamples = Math.floor((durationMs / 1000) * sampleRate);
   const dataSize = totalSamples * numChannels * (bitsPerSample / 8);
-  
+
   const buffer = Buffer.alloc(44 + dataSize);
-  
+
   // WAV Header
   buffer.write("RIFF", 0);
   buffer.writeUInt32LE(36 + dataSize, 4);
@@ -116,40 +116,54 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "http:
   const totalDurationMs = rawVisemes.length > 0 ? rawVisemes[rawVisemes.length - 1].timeMs + rawVisemes[rawVisemes.length - 1].durationMs : 1000;
   const visemes = includeVisemes ? rawVisemes : [];
 
-  const audioBuffer = createSyntheticAudioBuffer(totalDurationMs);
-  
-  const fileHash = crypto.randomBytes(8).toString("hex");
-  const fileName = `speech_${Date.now()}_${fileHash}.wav`;
-
-  // Store in MongoDB MediaAsset collection with TTL index (isTransient: true)
-  const MediaAsset = require("../models/MediaAsset");
   let relativeUrl = "";
   let fullAudioUrl = "";
-  try {
-    const mediaAsset = await MediaAsset.create({
-      filename: fileName,
-      contentType: "audio/wav",
-      data: audioBuffer,
-      size: audioBuffer.length,
-      type: "SPEECH_AUDIO",
-      botId: options.botId || null,
-      userId: options.userId || null,
-      isTransient: true
-    });
-    relativeUrl = `/bots/media/${mediaAsset._id}`;
-    fullAudioUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
-  } catch (err) {
-    console.warn("Failed to store speech audio in MongoDB MediaAsset, using base64 fallback:", err.message);
-  }
 
-  if (!fullAudioUrl) {
-    fullAudioUrl = `data:audio/wav;base64,${audioBuffer.toString("base64")}`;
+  // 100% Free MP3 Spoken Voice Generator using google-tts-api (0 API Keys required, handles full text)
+  try {
+    const googleTTS = require("google-tts-api");
+    const MediaAsset = require("../models/MediaAsset");
+
+    const cleanText = text.replace(/[*_#`~]/g, " ").trim();
+    if (cleanText) {
+      const base64Results = await googleTTS.getAllAudioBase64(cleanText, {
+        lang: voiceConfig.lang || "en",
+        slow: false,
+        host: "https://translate.google.com",
+        timeout: 10000,
+      });
+
+      const audioBuffer = Buffer.concat(
+        base64Results.map((item) => Buffer.from(item.base64, "base64"))
+      );
+
+      if (audioBuffer && audioBuffer.length > 0) {
+        const fileHash = crypto.randomBytes(8).toString("hex");
+        const fileName = `speech_${Date.now()}_${fileHash}.mp3`;
+
+        const mediaAsset = await MediaAsset.create({
+          filename: fileName,
+          contentType: "audio/mp3",
+          data: audioBuffer,
+          size: audioBuffer.length,
+          type: "SPEECH_AUDIO",
+          botId: options.botId || null,
+          userId: options.userId || null,
+          isTransient: true,
+        });
+
+        relativeUrl = `/bots/media/${mediaAsset._id}`;
+        fullAudioUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
+      }
+    }
+  } catch (err) {
+    console.warn("google-tts-api voice generation warning:", err.message);
   }
 
   return {
     text,
     audioUrl: fullAudioUrl,
-    relativeAudioUrl: relativeUrl || fullAudioUrl,
+    relativeAudioUrl: relativeUrl,
     durationMs: totalDurationMs,
     visemes
   };
