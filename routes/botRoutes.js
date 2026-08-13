@@ -6,8 +6,36 @@ const { checkAgentLimit } = require("../middleware/limitMiddleware");
 const botController = require("../controllers/botController");
 const avatarController = require("../controllers/avatarController");
 
-// General Public & Avatar Chat Endpoints (Declared before :botId param routes)
-router.post("/avatar/chat", avatarController.handleAvatarChat);
+const multer = require("multer");
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }
+});
+
+const optionalAuth = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    let token = authHeader.trim();
+    if (token.startsWith("Bearer ") || token.includes(" ")) {
+      token = token.split(" ")[1];
+    }
+    if (token) {
+      try {
+        const jwt = require("jsonwebtoken");
+        req.user = jwt.verify(token, process.env.JWT_SECRET);
+      } catch (err) {}
+    }
+  }
+  next();
+};
+
+// Avatar Chat Endpoint (Supports optional JWT Bearer token; accepts both audio and audioFile field names)
+router.post(
+  "/avatar/chat",
+  optionalAuth,
+  upload.fields([{ name: "audio", maxCount: 1 }, { name: "audioFile", maxCount: 1 }]),
+  avatarController.handleAvatarChat
+);
 
 // Bot CRUD & Key Lifecycle Management
 router.post("/", protect, checkAgentLimit, botController.createBot);

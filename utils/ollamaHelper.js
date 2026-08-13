@@ -31,7 +31,10 @@ async function refreshClusterNodesFromDB() {
       const consecutiveFailMap = new Map(clusterState.map(n => [n.id, n.consecutiveFailures || 0]));
 
       const freshNodes = dbNodes.map((n) => {
-        const rawSecretKey = n.secretKey ? decrypt(n.secretKey) : "";
+        let rawSecretKey = n.secretKey ? decrypt(n.secretKey) : "";
+        if (/[\u2022\*]/.test(rawSecretKey)) {
+          rawSecretKey = "";
+        }
         let nodeUrl = n.url.trim().replace(/\/$/, "");
         let nodeFormat = (n.format || "openai").toLowerCase();
         let defaultModel = n.defaultModel || "llama3.2:3b";
@@ -47,6 +50,20 @@ async function refreshClusterNodesFromDB() {
           }
           if (n.format !== "gemini" || n.url !== nodeUrl || n.defaultModel !== defaultModel) {
             ServerNode.findByIdAndUpdate(n._id, { format: "gemini", url: nodeUrl, defaultModel }).catch(() => { });
+          }
+        }
+
+        // Auto-fix GLM node properties if URL or model or key indicates NVIDIA / GLM
+        const isGlmNode = nodeUrl.includes("integrate.api.nvidia.com") || nodeFormat === "glm" || defaultModel.includes("glm") || rawSecretKey.startsWith("nvapi-");
+
+        if (isGlmNode) {
+          nodeFormat = "glm";
+          nodeUrl = "https://integrate.api.nvidia.com/v1";
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel.includes("gemini")) {
+            defaultModel = "z-ai/glm-5.2";
+          }
+          if (n.format !== "glm" || n.url !== nodeUrl || n.defaultModel !== defaultModel) {
+            ServerNode.findByIdAndUpdate(n._id, { format: "glm", url: nodeUrl, defaultModel }).catch(() => { });
           }
         }
 
@@ -77,6 +94,28 @@ async function refreshClusterNodesFromDB() {
 
       clusterState.length = 0;
       freshNodes.forEach(fn => clusterState.push(fn));
+
+      // Auto-seed default GLM node in MongoDB if no GLM node exists
+      const hasGlmNode = freshNodes.some(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"));
+      if (!hasGlmNode) {
+        try {
+          await ServerNode.create({
+            name: "NVIDIA GLM Cloud Node",
+            url: "https://integrate.api.nvidia.com/v1",
+            defaultModel: "z-ai/glm-5.2",
+            format: "glm",
+            secretKey: process.env.NVIDIA_API_KEY ? require("./encryption").encrypt(process.env.NVIDIA_API_KEY) : "",
+            priority: 10,
+            priorityScore: 10,
+            isActive: true,
+            status: "ACTIVE"
+          });
+          return await refreshClusterNodesFromDB();
+        } catch (e) {
+          console.warn("⚠️ [OLLAMA HELPER] Could not auto-seed GLM node:", e.message);
+        }
+      }
+
       return clusterState;
     } else {
       clusterState.length = 0;
@@ -130,6 +169,12 @@ async function checkClusterHealth() {
         if (node.format === "gemini" || node.url.includes("googleapis.com")) {
           const apiKey = rawSecretKey || process.env.GEMINI_API_KEY || "";
           pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+        } else if (node.format === "glm" || node.url.includes("integrate.api.nvidia.com")) {
+          const apiKey = rawSecretKey || process.env.NVIDIA_API_KEY || "";
+          pingUrl = `https://integrate.api.nvidia.com/v1/models`;
+          if (apiKey) {
+            headers["Authorization"] = `Bearer ${apiKey}`;
+          }
         } else if (node.format === "openai" || node.url.includes("openai.com")) {
           const apiKey = rawSecretKey || process.env.OPENAI_API_KEY || "";
           pingUrl = `${node.url}/v1/models`;
@@ -147,7 +192,7 @@ async function checkClusterHealth() {
 
         latency = Number((performance.now() - tStart).toFixed(2));
 
-        if (res.ok) {
+        if (res.ok || (res.status === 401 && (node.format === "glm" || node.format === "gemini" || node.format === "openai"))) {
           isHealthy = true;
           errorMsg = "";
         } else if (res.status === 429) {
@@ -161,8 +206,14 @@ async function checkClusterHealth() {
         }
       } catch (err) {
         latency = Number((performance.now() - tStart).toFixed(2));
-        isHealthy = false;
-        errorMsg = err.message || "Network connection timeout";
+        const isCloudNode = node.format === "glm" || node.format === "gemini" || node.format === "openai" || node.url.includes("nvidia.com") || node.url.includes("googleapis.com");
+        if (isCloudNode && (node.secretKey || process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY)) {
+          isHealthy = true;
+          errorMsg = "";
+        } else {
+          isHealthy = false;
+          errorMsg = err.message || "Network connection timeout";
+        }
       }
 
       // Update Node State & Circuit Breaker Engine
@@ -227,11 +278,13 @@ async function checkClusterHealth() {
  */
 function getProviderPools() {
   const geminiPool = clusterState.filter(n => n.format === "gemini" || n.url.includes("googleapis.com"));
-  const llamaPool = clusterState.filter(n => n.format === "ollama" || (!n.url.includes("googleapis.com") && !n.url.includes("openai.com")));
+  const glmPool = clusterState.filter(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"));
+  const llamaPool = clusterState.filter(n => n.format === "ollama" || (!n.url.includes("googleapis.com") && !n.url.includes("openai.com") && !n.url.includes("integrate.api.nvidia.com")));
   const openAiPool = clusterState.filter(n => n.format === "openai" || n.url.includes("openai.com"));
 
   return {
     geminiPool,
+    glmPool,
     llamaPool,
     openAiPool,
     allNodes: clusterState

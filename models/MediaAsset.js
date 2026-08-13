@@ -20,7 +20,7 @@ const mediaAssetSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["AVATAR_IMAGE", "AVATAR_3D_MODEL", "AVATAR_VIDEO", "SPEECH_AUDIO", "OTHER"],
+      enum: ["AVATAR_IMAGE", "AVATAR_3D_MODEL", "AVATAR_VIDEO", "SPEECH_AUDIO", "VOICE_SAMPLE", "OTHER"],
       default: "OTHER"
     },
     botId: {

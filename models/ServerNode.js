@@ -19,7 +19,7 @@ const ServerNodeSchema = new mongoose.Schema(
     },
     format: {
       type: String,
-      enum: ["openai", "ollama", "gemini"],
+      enum: ["openai", "ollama", "gemini", "glm"],
       default: "openai"
     },
     secretKey: {

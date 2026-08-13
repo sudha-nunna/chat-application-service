@@ -15,8 +15,62 @@
  */
 
 const { performance } = require("perf_hooks");
+const https = require("https");
+const http = require("http");
+const { Readable } = require("stream");
 const { selectBestClusterNode, clusterState } = require("./ollamaHelper");
 const { selectBestClusterNodeWithPreemption, registerActiveJob, unregisterActiveJob } = require("./priorityDispatcher");
+
+function safeFetch(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    try {
+      const parsedUrl = new URL(url);
+      const isHttps = parsedUrl.protocol === "https:";
+      const client = isHttps ? https : http;
+
+      const reqHeaders = { ...(options.headers || {}) };
+      if (!reqHeaders["User-Agent"]) {
+        reqHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+      }
+
+      if (options.body && !reqHeaders["Content-Length"]) {
+        reqHeaders["Content-Length"] = Buffer.byteLength(options.body);
+      }
+
+      const reqOptions = {
+        method: options.method || "GET",
+        headers: reqHeaders
+      };
+
+      const req = client.request(parsedUrl, reqOptions, (res) => {
+        const webStream = Readable.toWeb(res);
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          headers: res.headers,
+          body: webStream
+        });
+      });
+
+      req.on("error", (err) => reject(err));
+
+      if (options.signal) {
+        if (options.signal.aborted) {
+          req.destroy();
+          return reject(new Error("Request aborted"));
+        }
+        options.signal.addEventListener("abort", () => req.destroy(), { once: true });
+      }
+
+      if (options.body) {
+        req.write(options.body);
+      }
+      req.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
 
 /**
  * Helper to determine if a node or provider is a Local Model vs Cloud Model
@@ -25,20 +79,20 @@ function isLocalNodeOrProvider(nodeOrProvider) {
   if (!nodeOrProvider) return true;
   if (typeof nodeOrProvider === "string") {
     const prov = nodeOrProvider.toLowerCase();
-    if (prov === "openai" || prov === "gemini" || prov === "claude" || prov === "anthropic") return false;
+    if (prov === "openai" || prov === "gemini" || prov === "glm" || prov === "nvidia" || prov === "claude" || prov === "anthropic") return false;
     return true;
   }
 
   const format = (nodeOrProvider.format || "").toLowerCase();
   const url = (nodeOrProvider.url || "").toLowerCase();
 
-  if (format === "openai" || format === "gemini") {
-    if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("anthropic.com")) {
+  if (format === "openai" || format === "gemini" || format === "glm") {
+    if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("integrate.api.nvidia.com") || url.includes("anthropic.com")) {
       return false;
     }
   }
 
-  if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("anthropic.com") || url.includes("trycloudflare.com")) {
+  if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("integrate.api.nvidia.com") || url.includes("anthropic.com") || url.includes("trycloudflare.com")) {
     return false;
   }
 
@@ -46,7 +100,7 @@ function isLocalNodeOrProvider(nodeOrProvider) {
     return true;
   }
 
-  return format !== "gemini" && format !== "openai";
+  return format !== "gemini" && format !== "openai" && format !== "glm";
 }
 
 /**
@@ -159,6 +213,16 @@ class AIGateway {
       });
     }
 
+    if (providerLower === "glm" || providerLower === "nvidia") {
+      return await this._streamCloudGLM({
+        model: model === "best" ? "z-ai/glm-5.2" : model,
+        messages,
+        conversationSummary,
+        res,
+        onToken
+      });
+    }
+
     throw new Error(`Unsupported AI Provider: ${provider}`);
   }
 
@@ -171,10 +235,10 @@ class AIGateway {
     await refreshClusterNodesFromDB();
 
     const ServerNode = require("../models/ServerNode");
-    const { geminiPool, llamaPool, openAiPool, allNodes } = getProviderPools();
+    const { geminiPool, glmPool, llamaPool, openAiPool, allNodes } = getProviderPools();
 
-    // Group Provider Pools in Priority Fallback Hierarchy: Gemini Pool -> LLaMA Pool -> OpenAI Pool
-    const poolsHierarchy = [geminiPool, llamaPool, openAiPool];
+    // Group Provider Pools in Priority Fallback Hierarchy: Gemini Pool -> GLM Pool -> LLaMA Pool -> OpenAI Pool
+    const poolsHierarchy = [geminiPool, glmPool, llamaPool, openAiPool];
 
     let selectedNode = null;
     let response = null;
@@ -227,17 +291,23 @@ class AIGateway {
         currentNode.lastUsedAt = new Date();
 
         const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
+        const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
         if (isCurrentGemini && (!currentModel || currentModel === "gemini-2.0-flash" || currentModel === "best")) {
           currentModel = "gemini-2.5-flash";
         }
+        if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
+          currentModel = "z-ai/glm-5.2";
+        }
 
         const nodeUrl = customUrl ? customUrl.trim().replace(/\/$/, "") : currentNode.url;
-        const isCloudOrOpenAI = currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("trycloudflare.com");
+        const isCloudOrOpenAI = currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.format === "glm" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("integrate.api.nvidia.com") || currentNode.url.includes("trycloudflare.com");
 
         let currentPath;
         if (isCurrentGemini) {
           currentPath = nodeUrl.endsWith("/openai") ? "/chat/completions" : "/v1/chat/completions";
+        } else if (isCurrentGLM) {
+          currentPath = nodeUrl.endsWith("/v1") ? "/chat/completions" : "/v1/chat/completions";
         } else if (isCloudOrOpenAI) {
           currentPath = "/v1/chat/completions";
         } else {
@@ -245,12 +315,20 @@ class AIGateway {
         }
 
         let resolvedApiKey = currentNode.secretKey;
-        if (!resolvedApiKey || typeof resolvedApiKey !== "string" || !resolvedApiKey.trim()) {
+        if (!resolvedApiKey || typeof resolvedApiKey !== "string" || !resolvedApiKey.trim() || /[\u2022\*]/.test(resolvedApiKey)) {
           if (isCurrentGemini) {
             resolvedApiKey = process.env.GEMINI_API_KEY || "";
+          } else if (isCurrentGLM) {
+            resolvedApiKey = process.env.NVIDIA_API_KEY || "";
           } else if (currentNode.format === "openai" || currentNode.url.includes("openai.com")) {
             resolvedApiKey = process.env.OPENAI_API_KEY || "";
           }
+        }
+
+        if (isCloudOrOpenAI && (!resolvedApiKey || !resolvedApiKey.trim())) {
+          console.warn(`⚠️ [AI GATEWAY DISPATCH SKIPPED] Cloud node ${currentNode.name} (${currentNode.format}) has no API Key configured. Rotating to next pool...`);
+          currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
+          continue;
         }
 
         const nodeHeaders = { ...headers };
@@ -269,9 +347,11 @@ class AIGateway {
           abortController
         });
 
-        // High Availability Model Fallback Tiers for Google Gemini (prioritizing 100% active models)
+        // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM
         const modelsToTry = isCurrentGemini
           ? ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
+          : isCurrentGLM
+          ? ["z-ai/glm-5.2", currentModel]
           : [currentModel];
 
         let modelSuccess = false;
@@ -295,7 +375,7 @@ class AIGateway {
           try {
             console.log(`🚀 [AI GATEWAY DISPATCH] RequestId: ${activeJobId} | Provider: ${currentNode.format || "auto"} | Node: ${currentNode.name} (${currentNode.id}) | Priority: ${currentNode.priorityScore} | Model: ${candidateModel}`);
 
-            response = await fetch(targetFetchUrl, {
+            response = await safeFetch(targetFetchUrl, {
               method: "POST",
               headers: nodeHeaders,
               body: JSON.stringify(payload),
@@ -347,6 +427,9 @@ class AIGateway {
           if (response && response.status === 429) {
             currentNode.status = "RATE_LIMITED";
             currentNode.retryAfter = new Date(Date.now() + 60 * 1000);
+          } else if (response && (response.status === 401 || response.status === 403)) {
+            console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} returned HTTP ${response.status} (Invalid or Unauthorized API Key). Rotating to next pool...`);
+            response = null; // Clear failing response to allow next pool execution
           }
 
           if (currentNode.id && currentNode.id.length === 24) {
@@ -480,10 +563,12 @@ class AIGateway {
   /**
    * Cloud Google Gemini Stream Fallback Implementation
    */
-  async _streamCloudGemini({ model, messages, conversationSummary = null, res, onToken }) {
-    const apiKey = process.env.GEMINI_API_KEY;
+  async _streamCloudGemini({ model, messages, conversationSummary = null, res, onToken, secretKey = null }) {
+    const { clusterState } = require("./ollamaHelper");
+    const geminiNode = clusterState.find(n => n.format === "gemini" || n.url.includes("googleapis.com"));
+    const apiKey = secretKey || (geminiNode ? geminiNode.secretKey : "") || process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      throw new Error("GEMINI_API_KEY environment variable is not configured.");
+      throw new Error("Gemini API Key is missing. Please add a secret key to your Gemini Server Node in Admin Dashboard.");
     }
 
     const providerMessages = buildProviderAwareContextPayload({
@@ -502,6 +587,47 @@ class AIGateway {
     const streamBuffer = new ActionStreamBuffer(res, onToken);
     for await (const chunk of responseStream) {
       const chunkText = chunk.text || "";
+      if (chunkText) {
+        streamBuffer.push(chunkText);
+      }
+    }
+    streamBuffer.flush();
+
+    return { success: true, text: streamBuffer.cleanText };
+  }
+
+  /**
+   * Cloud NVIDIA GLM Stream Implementation
+   */
+  async _streamCloudGLM({ model, messages, conversationSummary = null, res, onToken, secretKey = null }) {
+    const { clusterState } = require("./ollamaHelper");
+    const glmNode = clusterState.find(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"));
+    const apiKey = secretKey || (glmNode ? glmNode.secretKey : "") || process.env.NVIDIA_API_KEY;
+    if (!apiKey) {
+      throw new Error("NVIDIA GLM API Key is missing. Please add a secret key to your GLM Server Node in Admin Dashboard.");
+    }
+
+    const providerMessages = buildProviderAwareContextPayload({
+      messages,
+      conversationSummary,
+      isLocal: false
+    });
+
+    const { OpenAI } = require("openai");
+    const nvidia = new OpenAI({
+      apiKey,
+      baseURL: "https://integrate.api.nvidia.com/v1"
+    });
+
+    const stream = await nvidia.chat.completions.create({
+      model: model || "z-ai/glm-5.2",
+      messages: providerMessages,
+      stream: true
+    });
+
+    const streamBuffer = new ActionStreamBuffer(res, onToken);
+    for await (const chunk of stream) {
+      const chunkText = chunk.choices[0]?.delta?.content || "";
       if (chunkText) {
         streamBuffer.push(chunkText);
       }

@@ -35,6 +35,17 @@ const userSchema = new mongoose.Schema(
       ref: "Subscription",
       default: null,
     },
+
+    voiceSampleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "MediaAsset",
+      default: null,
+    },
+
+    voiceSampleUrl: {
+      type: String,
+      default: "",
+    },
   },
   {
     timestamps: true,

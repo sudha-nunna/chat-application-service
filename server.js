@@ -61,7 +61,6 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const projectRoutes = require("./routes/projectRoutes");
-
 app.use("/chats", chatRoutes);
 app.use("/auth", authRoutes);
 app.use("/ollama", ollamaRoutes);
@@ -80,6 +79,64 @@ app.listen(process.env.PORT, () => {
   console.log(
     `Server running on port ${process.env.PORT}`
   );
+
+  // Auto-spawn Python F5-TTS Voice Engine as child process
+  try {
+    const { spawn } = require("child_process");
+    
+    // Resolve Python binary path with fallback sequence:
+    // 1. process.env.PYTHON_PATH (if set)
+    // 2. Local venv path for Windows (venv/Scripts/python.exe) or Linux (venv/bin/python)
+    // 3. System python / python3 binary
+    let venvPythonPath = process.env.PYTHON_PATH;
+    const defaultWinPath = path.join(__dirname, "venv/Scripts/python.exe");
+    const defaultUnixPath = path.join(__dirname, "venv/bin/python");
+    const f5ScriptPath = path.join(__dirname, "voice_engine/f5_service.py");
+
+    if (!venvPythonPath) {
+      if (fs.existsSync(defaultWinPath)) {
+        venvPythonPath = defaultWinPath;
+      } else if (fs.existsSync(defaultUnixPath)) {
+        venvPythonPath = defaultUnixPath;
+      } else {
+        venvPythonPath = process.platform === "win32" ? "python" : "python3";
+      }
+    } else if (!path.isAbsolute(venvPythonPath) && (venvPythonPath.includes("/") || venvPythonPath.includes("\\"))) {
+      venvPythonPath = path.resolve(__dirname, venvPythonPath);
+    }
+
+    const pyExists = fs.existsSync(venvPythonPath) || (!venvPythonPath.includes("/") && !venvPythonPath.includes("\\"));
+
+    if (pyExists && fs.existsSync(f5ScriptPath)) {
+      console.log(`🚀 Spawning Python F5-TTS Voice Engine (${venvPythonPath})...`);
+      const pyProc = spawn(venvPythonPath, [f5ScriptPath], {
+        env: { ...process.env, PYTHONUNBUFFERED: "1", VOICE_ENGINE_PORT: "8000", PORT: "8000" }
+      });
+
+      pyProc.stdout.on("data", (data) => {
+        const msg = data.toString().trim();
+        if (msg) console.log(`[F5-TTS] ${msg}`);
+      });
+
+      pyProc.stderr.on("data", (data) => {
+        const msg = data.toString().trim();
+        if (msg && !msg.includes("DeprecationWarning")) console.log(`[F5-TTS LOG] ${msg}`);
+      });
+
+      const killPyProc = () => {
+        if (pyProc && !pyProc.killed) {
+          console.log("Shutting down Python F5-TTS Engine...");
+          pyProc.kill("SIGTERM");
+        }
+      };
+
+      process.on("exit", killPyProc);
+      process.on("SIGINT", () => { killPyProc(); process.exit(); });
+      process.on("SIGTERM", () => { killPyProc(); process.exit(); });
+    }
+  } catch (pyErr) {
+    console.warn("Notice: Python F5-TTS child process spawn notice:", pyErr.message);
+  }
 
   warmOllamaConnection().then((success) => {
     if (!success) {

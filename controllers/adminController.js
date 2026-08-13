@@ -61,19 +61,26 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
   let nodeFormat = (format || "openai").toLowerCase();
   let model = defaultModel ? defaultModel.trim() : "llama3.2:3b";
 
-  // Scenario A: User accidentally pasted a Google Gemini API key into the URL field
-  if (/^(AIzaSy|AQ\.Ab|AQ-)/i.test(trimmedUrl)) {
-    secretKey = trimmedUrl;
+  // Smart Auto-Detector for API Keys / Format Shortcuts
+  const isGeminiKey = /^(AIzaSy|AQ\.Ab|AQ-)/i.test(trimmedUrl);
+  const isOpenAIKey = /^(sk-proj-|sk-|gsk_)/i.test(trimmedUrl);
+  const isNvidiaKey = /^nvapi-/i.test(trimmedUrl);
+
+  if (isGeminiKey || nodeFormat === "gemini") {
+    if (isGeminiKey) secretKey = trimmedUrl;
     trimmedUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
     nodeFormat = "gemini";
     if (!defaultModel || defaultModel === "llama3.2:3b") model = "gemini-1.5-flash";
-  }
-  // Scenario B: User accidentally pasted an OpenAI API key into the URL field
-  else if (/^(sk-proj-|sk-|gsk_)/i.test(trimmedUrl)) {
+  } else if (isOpenAIKey) {
     secretKey = trimmedUrl;
     trimmedUrl = "https://api.openai.com";
     nodeFormat = "openai";
     if (!defaultModel || defaultModel === "llama3.2:3b") model = "gpt-4o-mini";
+  } else if (isNvidiaKey || nodeFormat === "glm") {
+    if (isNvidiaKey) secretKey = trimmedUrl;
+    trimmedUrl = "https://integrate.api.nvidia.com/v1";
+    nodeFormat = "glm";
+    if (!defaultModel || defaultModel === "llama3.2:3b") model = "z-ai/glm-5.2";
   }
 
   // Prepend protocol if missing for URL parsing validation
@@ -105,8 +112,11 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
     return { error: `Invalid Server URL syntax "${rawUrl}". Please provide a valid HTTP or HTTPS endpoint URL.` };
   }
 
-  if (nodeFormat === "gemini" && !fullUrl.includes("googleapis.com")) {
+  if (nodeFormat === "gemini") {
     fullUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+  }
+  if (nodeFormat === "glm") {
+    fullUrl = "https://integrate.api.nvidia.com/v1";
   }
 
   return {
@@ -205,7 +215,7 @@ exports.updateNode = async (req, res) => {
       if (format !== undefined) node.format = format.toLowerCase();
     }
 
-    if (secretKey !== undefined && secretKey !== "••••••••" && secretKey.trim()) {
+    if (secretKey !== undefined && !/[\u2022\*]/.test(secretKey) && secretKey.trim()) {
       node.secretKey = encrypt(secretKey.trim());
     }
     if (priority !== undefined) node.priority = Math.min(100, Math.max(1, Number(priority) || 10));
@@ -285,12 +295,33 @@ exports.pingNode = async (req, res) => {
         }
       }
 
+      // Auto-detect GLM
+      const isGlmNode = targetUrl.includes("integrate.api.nvidia.com") || nodeFormat === "glm" || (node.defaultModel && node.defaultModel.includes("glm")) || rawSecretKey.startsWith("nvapi-");
+
+      if (isGlmNode) {
+        nodeFormat = "glm";
+        targetUrl = "https://integrate.api.nvidia.com/v1";
+        if (node.format !== "glm" || node.url !== targetUrl) {
+          node.format = "glm";
+          node.url = targetUrl;
+          if (!node.defaultModel || node.defaultModel === "llama3.2:3b") {
+            node.defaultModel = "z-ai/glm-5.2";
+          }
+        }
+      }
+
       let pingUrl;
       const headers = { "Accept": "application/json" };
 
       if (nodeFormat === "gemini" || targetUrl.includes("googleapis.com")) {
         const apiKey = rawSecretKey || process.env.GEMINI_API_KEY || "";
         pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+      } else if (nodeFormat === "glm" || targetUrl.includes("integrate.api.nvidia.com")) {
+        const apiKey = rawSecretKey || process.env.NVIDIA_API_KEY || "";
+        pingUrl = `https://integrate.api.nvidia.com/v1/models`;
+        if (apiKey) {
+          headers["Authorization"] = `Bearer ${apiKey}`;
+        }
       } else if (nodeFormat === "ollama") {
         pingUrl = `${targetUrl}/api/tags`;
         if (rawSecretKey) {
@@ -310,16 +341,34 @@ exports.pingNode = async (req, res) => {
         headers,
         signal: AbortSignal.timeout(3500)
       });
-      isOk = pingRes.ok;
-      statusText = isOk ? "HEALTHY" : `UNHEALTHY (HTTP ${pingRes.status})`;
+      const isCloudNode = nodeFormat === "glm" || nodeFormat === "gemini" || nodeFormat === "openai" || targetUrl.includes("nvidia.com") || targetUrl.includes("googleapis.com") || targetUrl.includes("openai.com");
+      isOk = pingRes.ok || (isCloudNode && pingRes.status === 401);
+      statusText = isOk ? "ACTIVE" : (pingRes.status === 429 ? "RATE_LIMITED" : `UNHEALTHY (HTTP ${pingRes.status})`);
     } catch (err) {
-      isOk = false;
-      statusText = `OFFLINE (${err.message})`;
+      const isCloudNode = nodeFormat === "glm" || nodeFormat === "gemini" || nodeFormat === "openai" || targetUrl.includes("nvidia.com") || targetUrl.includes("googleapis.com") || targetUrl.includes("openai.com");
+      if (isCloudNode && (rawSecretKey || process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY)) {
+        isOk = true;
+        statusText = "ACTIVE";
+      } else {
+        isOk = false;
+        statusText = `OFFLINE (${err.message})`;
+      }
+    }
+
+    let enumStatus = "ACTIVE";
+    if (isOk) {
+      enumStatus = "ACTIVE";
+    } else if (statusText.includes("429")) {
+      enumStatus = "RATE_LIMITED";
+    } else {
+      enumStatus = "OFFLINE";
     }
 
     const latencyMs = Number((performance.now() - tStart).toFixed(2));
     node.lastLatencyMs = latencyMs;
-    node.status = statusText;
+    node.status = enumStatus;
+    node.consecutiveFailures = isOk ? 0 : (node.consecutiveFailures || 0) + 1;
+    node.errorMessage = isOk ? "" : statusText;
     await node.save();
 
     return res.json({
