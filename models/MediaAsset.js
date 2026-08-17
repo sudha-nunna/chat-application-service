@@ -20,7 +20,7 @@ const mediaAssetSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["AVATAR_IMAGE", "AVATAR_3D_MODEL", "AVATAR_VIDEO", "SPEECH_AUDIO", "VOICE_SAMPLE", "OTHER"],
+      enum: ["AVATAR_IMAGE", "PROFILE_IMAGE", "AVATAR_3D_MODEL", "AVATAR_VIDEO", "SPEECH_AUDIO", "VOICE_SAMPLE", "OTHER"],
       default: "OTHER"
     },
     botId: {
@@ -33,6 +33,10 @@ const mediaAssetSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       default: null
+    },
+    isSelected: {
+      type: Boolean,
+      default: false
     },
     isTransient: {
       type: Boolean,

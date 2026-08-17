@@ -36,6 +36,17 @@ const userSchema = new mongoose.Schema(
       default: null,
     },
 
+    avatarImageId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "MediaAsset",
+      default: null,
+    },
+
+    avatarUrl: {
+      type: String,
+      default: "",
+    },
+
     voiceSampleId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "MediaAsset",
@@ -45,6 +56,11 @@ const userSchema = new mongoose.Schema(
     voiceSampleUrl: {
       type: String,
       default: "",
+    },
+
+    isProfileSetup: {
+      type: Boolean,
+      default: false,
     },
   },
   {

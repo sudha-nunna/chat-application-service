@@ -44,12 +44,12 @@ async function refreshClusterNodesFromDB() {
 
         if (isGeminiNode) {
           nodeFormat = "gemini";
-          nodeUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-1.5-flash" || defaultModel === "gemini-2.0-flash" || defaultModel === "gemini-2.5-flash") {
-            defaultModel = "gemini-flash-latest";
+          nodeUrl = "https://generativelanguage.googleapis.com/v1beta";
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-1.5-flash") {
+            defaultModel = "gemini-2.5-flash";
           }
-          if (n.format !== "gemini" || n.url !== nodeUrl || n.defaultModel !== defaultModel) {
-            ServerNode.findByIdAndUpdate(n._id, { format: "gemini", url: nodeUrl, defaultModel }).catch(() => { });
+          if (n.format !== "gemini" || n.defaultModel !== defaultModel) {
+            ServerNode.findByIdAndUpdate(n._id, { format: "gemini", defaultModel }).catch(() => { });
           }
         }
 

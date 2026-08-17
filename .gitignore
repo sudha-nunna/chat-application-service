@@ -38,3 +38,6 @@ media/
 Thumbs.db
 .vscode/
 .idea/
+
+# Model Checkpoints
+checkpoints/

@@ -1,5 +1,4 @@
 const express = require("express");
-
 const router = express.Router();
 
 const {
@@ -14,26 +13,40 @@ const upload = multer({
 });
 const authController = require("../controllers/authController");
 
-const protect = require("../middleware/auth");
+const authMiddleware = require("../middleware/auth");
+const protect = typeof authMiddleware === "function" ? authMiddleware : authMiddleware.protect;
 
 router.post("/google", googleAuth);
 router.post("/google/callback", googleAuthCallback);
 
-// JWT Protected User Profile & Voice Sample Routes
-router.post("/voice-sample", protect, upload.single("audio"), authController.uploadVoiceSample);
+// Protected User Profile & Voice Sample Routes (Strict User Isolation)
+router.get("/me", protect, authController.getCurrentUser);
+router.get("/profile", protect, authController.getCurrentUser);
+
+router.post("/voice-sample", protect, upload.any(), authController.uploadVoiceSample);
+router.post("/avatar", protect, upload.any(), authController.uploadVoiceSample);
+
 router.post(
   "/profile-setup",
   protect,
-  upload.fields([
-    { name: "avatar", maxCount: 1 },
-    { name: "image", maxCount: 1 },
-    { name: "audio", maxCount: 1 },
-    { name: "voice", maxCount: 1 }
-  ]),
+  upload.any(),
   authController.updateProfileAssets
 );
+
+// Voice Sample Endpoints
+router.get("/voice-sample", protect, authController.getUserVoiceSamples);
 router.get("/voice-samples", protect, authController.getUserVoiceSamples);
+router.put("/voice-sample/:sampleId/select", protect, authController.selectUserVoiceSample);
 router.put("/voice-samples/:sampleId/select", protect, authController.selectUserVoiceSample);
+router.delete("/voice-sample/:sampleId", protect, authController.deleteUserVoiceSample);
 router.delete("/voice-samples/:sampleId", protect, authController.deleteUserVoiceSample);
+
+// Avatar Image Endpoints
+router.get("/avatars", protect, authController.getUserAvatars);
+router.get("/avatar", protect, authController.getUserAvatars);
+router.put("/avatars/:avatarId/select", protect, authController.selectUserAvatar);
+router.put("/avatar/:avatarId/select", protect, authController.selectUserAvatar);
+router.delete("/avatars/:avatarId", protect, authController.deleteUserAvatar);
+router.delete("/avatar/:avatarId", protect, authController.deleteUserAvatar);
 
 module.exports = router;

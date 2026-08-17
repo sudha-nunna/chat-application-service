@@ -1092,10 +1092,22 @@ exports.sendBotChatMessage = async (req, res) => {
 
   try {
     const { botId } = req.params;
-    const { message, conversationId } = req.body;
+    let { message, conversationId } = req.body;
 
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Message content is required." });
+    const botFilesArray = Array.isArray(req.files) ? req.files : [];
+    const botFilesMap = !Array.isArray(req.files) ? (req.files || {}) : {};
+    let audioUploadedFile = botFilesMap.audio?.[0] || botFilesMap.audioFile?.[0] || botFilesArray[0] || req.file;
+    if (audioUploadedFile || (req.body?.audio && typeof req.body.audio === "string" && req.body.audio.startsWith("data:audio"))) {
+      const voiceService = require("../services/voiceService");
+      const sttInput = audioUploadedFile || req.body.audio;
+      const transcribed = await voiceService.convertSpeechToText(sttInput);
+      if (transcribed && transcribed.trim()) {
+        message = transcribed.trim();
+      }
+    }
+
+    if (!message || typeof message !== "string" || !message.trim()) {
+      message = "Hello! Please assist me.";
     }
 
     const tDbStart = performance.now();

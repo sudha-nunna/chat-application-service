@@ -75,6 +75,24 @@ app.get("/", (req, res) => {
   res.send("Server Running");
 });
 
+// Express Global Error Handler (Handles Multer errors gracefully without stack trace crashes)
+const multer = require("multer");
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError || err?.name === "MulterError") {
+    console.warn("⚠️ [MULTER HANDLER] Managed file upload notice:", err.message, err.field ? `(field: ${err.field})` : "");
+    return res.status(400).json({
+      error: `File upload error: ${err.message}${err.field ? ` (field '${err.field}')` : ""}`
+    });
+  }
+  if (err) {
+    console.error("⚠️ [UNHANDLED ERROR]", err.stack || err);
+    return res.status(err.status || 500).json({
+      error: err.message || "Internal Server Error"
+    });
+  }
+  next();
+});
+
 app.listen(process.env.PORT, () => {
   console.log(
     `Server running on port ${process.env.PORT}`
@@ -91,7 +109,7 @@ app.listen(process.env.PORT, () => {
     let venvPythonPath = process.env.PYTHON_PATH;
     const defaultWinPath = path.join(__dirname, "venv/Scripts/python.exe");
     const defaultUnixPath = path.join(__dirname, "venv/bin/python");
-    const f5ScriptPath = path.join(__dirname, "voice_engine/f5_service.py");
+    const openvoiceScriptPath = path.join(__dirname, "voice_engine/openvoice_service.py");
 
     if (!venvPythonPath) {
       if (fs.existsSync(defaultWinPath)) {
@@ -107,20 +125,22 @@ app.listen(process.env.PORT, () => {
 
     const pyExists = fs.existsSync(venvPythonPath) || (!venvPythonPath.includes("/") && !venvPythonPath.includes("\\"));
 
-    if (pyExists && fs.existsSync(f5ScriptPath)) {
-      console.log(`🚀 Spawning Python F5-TTS Voice Engine (${venvPythonPath})...`);
-      const pyProc = spawn(venvPythonPath, [f5ScriptPath], {
-        env: { ...process.env, PYTHONUNBUFFERED: "1", VOICE_ENGINE_PORT: "8000", PORT: "8000" }
+    if (pyExists && fs.existsSync(openvoiceScriptPath)) {
+      console.log(`🚀 Spawning Python OpenVoice V2 Engine (${venvPythonPath})...`);
+      const pyProc = spawn(venvPythonPath, [openvoiceScriptPath], {
+        env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8", VOICE_ENGINE_PORT: "8000", PORT: "8000" }
       });
 
       pyProc.stdout.on("data", (data) => {
         const msg = data.toString().trim();
-        if (msg) console.log(`[F5-TTS] ${msg}`);
+        if (msg) console.log(`[OpenVoice V2] ${msg}`);
       });
 
       pyProc.stderr.on("data", (data) => {
         const msg = data.toString().trim();
-        if (msg && !msg.includes("DeprecationWarning")) console.log(`[F5-TTS LOG] ${msg}`);
+        if (msg && !msg.includes("DeprecationWarning") && !msg.includes("unauthenticated requests") && !msg.includes("HF_TOKEN")) {
+          console.log(`[OpenVoice LOG] ${msg}`);
+        }
       });
 
       const killPyProc = () => {

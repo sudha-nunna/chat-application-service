@@ -18,7 +18,7 @@ module.exports = {
     },
     {
       name: "voice-engine",
-      script: "voice_engine/f5_service.py",
+      script: "voice_engine/openvoice_service.py",
       interpreter: "./venv/Scripts/python.exe",
       cwd: "./",
       instances: 1,

@@ -230,7 +230,7 @@ class AIGateway {
    * Streams response from Cluster Server Nodes with Provider Pools, Priority Routing,
    * Least-Loaded Balancing, Intra-Pool & Cross-Pool Failover, and Observability Metrics.
    */
-  async _streamOllamaCluster({ model, customUrl, messages, conversationSummary = null, res, userPriority, jobId, userId, onToken }) {
+  async _streamOllamaCluster({ model, customUrl, messages, conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null }) {
     const { getProviderPools, refreshClusterNodesFromDB } = require("./ollamaHelper");
     await refreshClusterNodesFromDB();
 
@@ -293,8 +293,8 @@ class AIGateway {
         const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
         const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
-        if (isCurrentGemini && (!currentModel || currentModel === "gemini-2.0-flash" || currentModel === "best")) {
-          currentModel = "gemini-2.5-flash";
+        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash")) {
+          currentModel = "gemini-2.0-flash";
         }
         if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
           currentModel = "z-ai/glm-5.2";
@@ -337,7 +337,9 @@ class AIGateway {
           nodeHeaders["X-Internal-Secret"] = resolvedApiKey;
         }
 
-        const targetFetchUrl = `${nodeUrl}${currentPath}`;
+        const targetFetchUrl = isCurrentGemini
+          ? "https://generativelanguage.googleapis.com/v1beta/chat/completions"
+          : `${nodeUrl}${currentPath}`;
 
         registerActiveJob(activeJobId, {
           userId,
@@ -349,7 +351,7 @@ class AIGateway {
 
         // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM
         const modelsToTry = isCurrentGemini
-          ? ["gemini-flash-latest", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
+          ? ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
           : isCurrentGLM
           ? ["z-ai/glm-5.2", currentModel]
           : [currentModel];
@@ -368,6 +370,9 @@ class AIGateway {
 
         for (const candidateModel of modelsToTry) {
           const payload = { model: candidateModel, messages: providerMessages, stream: true };
+          if (maxTokens) {
+            payload.max_tokens = Number(maxTokens);
+          }
           if (currentNode.format === "ollama") payload.keep_alive = "24h";
 
           const dispatchStartTime = performance.now();
@@ -403,12 +408,18 @@ class AIGateway {
               }
 
               break; // Model success! Exit candidate model loop
-            } else if (response.status === 429 || response.status === 404) {
-              console.warn(`⚠️ [AI GATEWAY MODEL ROTATION] Model '${candidateModel}' returned HTTP ${response.status}. Rotating to next model tier...`);
-              errorMessage = `Provider API Rate Limit Exceeded (HTTP ${response.status}) on ${currentNode.name} (${candidateModel}).`;
+            } else if (response.status === 429) {
+              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP 429 Quota Limit. Rotating to next cluster node...`);
+              errorMessage = `Provider API Rate Limit Exceeded (HTTP 429) on ${currentNode.name}.`;
+              currentNode.status = "RATE_LIMITED";
+              currentNode.retryAfter = new Date(Date.now() + 60 * 1000);
+              break; // Key rate limited! Break model loop to rotate to NEXT cluster node immediately
+            } else if (response.status === 404) {
+              console.warn(`⚠️ [AI GATEWAY MODEL 404] Model '${candidateModel}' not found on ${currentNode.name}. Trying next model...`);
+              errorMessage = `Model ${candidateModel} not found (HTTP 404).`;
             } else {
               errorMessage = `Server Node ${currentNode.name} returned HTTP ${response.status}.`;
-              break; // Non-404/429 HTTP error, try next node
+              break; // Non-404 HTTP error, try next node
             }
           } catch (err) {
             errorMessage = `Network connection error on ${currentNode.name}: ${err.message}`;
@@ -513,6 +524,43 @@ class AIGateway {
       }
     }
 
+    if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
+      console.warn("⚠️ [AI GATEWAY FALLBACK] Cluster node streaming yielded empty text. Attempting direct Cloud AI Provider fallbacks...");
+      if (process.env.GEMINI_API_KEY) {
+        try {
+          const cloudRes = await this._streamCloudGemini({ model, messages, conversationSummary, res, onToken });
+          if (cloudRes && cloudRes.text) {
+            accumulatedResponseText = cloudRes.text;
+            streamedSuccessfully = true;
+          }
+        } catch (fErr) {
+          console.warn("Direct Gemini fallback notice:", fErr.message);
+        }
+      }
+      if ((!accumulatedResponseText || !accumulatedResponseText.trim()) && process.env.NVIDIA_API_KEY) {
+        try {
+          const cloudRes = await this._streamCloudGLM({ model, messages, conversationSummary, res, onToken });
+          if (cloudRes && cloudRes.text) {
+            accumulatedResponseText = cloudRes.text;
+            streamedSuccessfully = true;
+          }
+        } catch (fErr) {
+          console.warn("Direct GLM fallback notice:", fErr.message);
+        }
+      }
+      if ((!accumulatedResponseText || !accumulatedResponseText.trim()) && process.env.OPENAI_API_KEY) {
+        try {
+          const cloudRes = await this._streamCloudOpenAI({ model, messages, conversationSummary, res, onToken });
+          if (cloudRes && cloudRes.text) {
+            accumulatedResponseText = cloudRes.text;
+            streamedSuccessfully = true;
+          }
+        } catch (fErr) {
+          console.warn("Direct OpenAI fallback notice:", fErr.message);
+        }
+      }
+    }
+
     const totalDurationMs = performance.now() - llmStartTime;
 
     return {
@@ -563,13 +611,33 @@ class AIGateway {
   /**
    * Cloud Google Gemini Stream Fallback Implementation
    */
-  async _streamCloudGemini({ model, messages, conversationSummary = null, res, onToken, secretKey = null }) {
+  async _streamCloudGemini({ model, messages = [], conversationSummary = null, res, onToken, secretKey = null }) {
     const { clusterState } = require("./ollamaHelper");
     const geminiNode = clusterState.find(n => n.format === "gemini" || n.url.includes("googleapis.com"));
-    const apiKey = secretKey || (geminiNode ? geminiNode.secretKey : "") || process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error("Gemini API Key is missing. Please add a secret key to your Gemini Server Node in Admin Dashboard.");
+
+    let geminiNodes = [];
+    try {
+      const ServerNode = require("../models/ServerNode");
+      geminiNodes = await ServerNode.find({
+        $or: [{ format: "gemini" }, { url: /googleapis\.com/i }],
+        isActive: true,
+        secretKey: { $exists: true, $ne: "" }
+      });
+    } catch (e) {}
+
+    const candidateApiKeys = [...new Set([
+      secretKey,
+      process.env.GEMINI_API_KEY,
+      geminiNode?.secretKey,
+      ...geminiNodes.map(n => n.secretKey)
+    ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
+
+    if (candidateApiKeys.length === 0) {
+      throw new Error("Gemini API Key is missing. Please configure GEMINI_API_KEY or add a Gemini Server Node.");
     }
+
+    const axios = require("axios");
+    const streamBuffer = new ActionStreamBuffer(res, onToken);
 
     const providerMessages = buildProviderAwareContextPayload({
       messages,
@@ -577,23 +645,48 @@ class AIGateway {
       isLocal: false
     });
 
-    const { GoogleGenAI } = require("@google/genai");
-    const ai = new GoogleGenAI({ apiKey });
-    const responseStream = await ai.models.generateContentStream({
-      model: model || "gemini-1.5-flash",
-      contents: providerMessages.map(m => `${m.role}: ${m.content}`).join("\n")
-    });
+    const candidateModels = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"];
 
-    const streamBuffer = new ActionStreamBuffer(res, onToken);
-    for await (const chunk of responseStream) {
-      const chunkText = chunk.text || "";
-      if (chunkText) {
-        streamBuffer.push(chunkText);
+    for (const gKey of candidateApiKeys) {
+      for (const gModel of candidateModels) {
+        try {
+          const fetchUrl = "https://generativelanguage.googleapis.com/v1beta/chat/completions";
+          const payload = {
+            model: gModel,
+            messages: providerMessages.map(m => ({
+              role: m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user",
+              content: String(m.content || "")
+            })),
+            stream: false
+          };
+
+          const response = await axios.post(fetchUrl, payload, {
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${gKey}`
+            },
+            timeout: 20000
+          });
+
+          const responseText = response.data?.choices?.[0]?.message?.content || "";
+          if (responseText && responseText.trim()) {
+            streamBuffer.push(responseText.trim());
+            streamBuffer.flush();
+            return { success: true, text: streamBuffer.cleanText };
+          }
+        } catch (apiErr) {
+          const errStatus = apiErr.response?.status;
+          if (errStatus === 429) {
+            console.warn(`⚠️ [CLOUD GEMINI KEY RATE LIMIT] Key starting with '${gKey.substring(0, 6)}...' hit 429 Quota Limit. Rotating to next API key...`);
+            break;
+          } else {
+            console.warn(`Gemini cloud model ${gModel} notice:`, apiErr.response?.data?.error?.message || apiErr.message);
+          }
+        }
       }
     }
-    streamBuffer.flush();
 
-    return { success: true, text: streamBuffer.cleanText };
+    return { success: false, text: "" };
   }
 
   /**

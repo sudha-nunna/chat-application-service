@@ -188,9 +188,9 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
   let fullAudioUrl = "";
 
   const VOICE_ENGINE_URL = process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
-  const targetEngine = (options.engine || options.voiceEngine || process.env.VOICE_CLONE_ENGINE || "F5").toUpperCase();
-  const primaryEndpoint = targetEngine === "OPENVOICE" ? "/openvoice-clone" : "/f5-clone";
-  const secondaryEndpoint = targetEngine === "OPENVOICE" ? "/f5-clone" : "/openvoice-clone";
+  const targetEngine = "OPENVOICE";
+  const primaryEndpoint = "/openvoice-clone";
+  const secondaryEndpoint = "/clone-tts";
 
   if (userAudioBuffer && userAudioBuffer.length > 0) {
     try {
@@ -311,12 +311,64 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
 }
 
 /**
- * Decodes audio buffer (WAV/WebM/PCM) into 16kHz Float32Array for Node.js ONNX transformers.
+ * Converts any input audio buffer (MP4, M4A, MP3, WEBM, OGG, Opus, AAC) to 16kHz Mono 16-bit PCM WAV using static FFmpeg.
+ */
+function convertAudioToWavBuffer(audioBuffer) {
+  return new Promise((resolve) => {
+    try {
+      const { spawn } = require("child_process");
+      const path = require("path");
+      const fs = require("fs");
+
+      let ffmpegBin = "ffmpeg";
+      const staticFfmpegPath = path.join(__dirname, "../venv/Lib/site-packages/static_ffmpeg/bin/win32/ffmpeg.exe");
+      if (fs.existsSync(staticFfmpegPath)) {
+        ffmpegBin = staticFfmpegPath;
+      }
+
+      const proc = spawn(ffmpegBin, [
+        "-i", "pipe:0",
+        "-f", "wav",
+        "-ar", "16000",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        "pipe:1"
+      ]);
+
+      const chunks = [];
+      proc.stdout.on("data", chunk => chunks.push(chunk));
+      proc.on("close", (code) => {
+        if (code === 0 && chunks.length > 0) {
+          resolve(Buffer.concat(chunks));
+        } else {
+          resolve(null);
+        }
+      });
+      proc.on("error", () => resolve(null));
+      proc.stdin.write(audioBuffer);
+      proc.stdin.end();
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Decodes audio buffer (WAV/MP4/M4A/WebM/MP3/OGG) into 16kHz Float32Array for Node.js ONNX transformers.
  */
 async function decodeAudioToFloat32(audioBuffer) {
+  let pcmWavBuffer = audioBuffer;
   try {
+    const strHeader = audioBuffer.slice(0, 12).toString("utf8");
+    if (!strHeader.startsWith("RIFF")) {
+      const converted = await convertAudioToWavBuffer(audioBuffer);
+      if (converted && converted.length > 44) {
+        pcmWavBuffer = converted;
+      }
+    }
+
     const { WaveFile } = require("wavefile");
-    const wav = new WaveFile(audioBuffer);
+    const wav = new WaveFile(pcmWavBuffer);
     wav.toBitDepth("32f");
     wav.toSampleRate(16000);
     let audioData = wav.getSamples();
@@ -325,11 +377,10 @@ async function decodeAudioToFloat32(audioBuffer) {
     }
     return new Float32Array(audioData);
   } catch (err) {
-    // Fallback: Convert buffer directly to 16kHz Float32Array
-    const sampleCount = Math.floor(audioBuffer.length / 2);
+    const sampleCount = Math.floor(pcmWavBuffer.length / 2);
     const float32 = new Float32Array(sampleCount);
     for (let i = 0; i < sampleCount; i++) {
-      const int16 = audioBuffer.readInt16LE(i * 2);
+      const int16 = pcmWavBuffer.readInt16LE(i * 2);
       float32[i] = int16 / 32768.0;
     }
     return float32;
@@ -348,15 +399,17 @@ async function convertSpeechToText(input) {
   let audioBuffer = null;
 
   if (typeof input === "string") {
-    // If input is plain text (not audio data), return directly
-    if (!input.startsWith("data:audio") && !input.startsWith("http") && !/^[A-Za-z0-9+/=]{100,}$/.test(input)) {
-      return input.trim();
-    }
-    if (input.startsWith("data:audio")) {
-      const base64Content = input.split(",")[1] || "";
+    const trimmedInput = input.trim();
+    if (trimmedInput.startsWith("data:audio")) {
+      const base64Content = trimmedInput.split(",")[1] || "";
       if (base64Content) {
         audioBuffer = Buffer.from(base64Content, "base64");
       }
+    } else if (!trimmedInput.startsWith("http") && (trimmedInput.length > 200 || /^[A-Za-z0-9+/=\s\r\n]{100,}$/.test(trimmedInput))) {
+      // Direct raw Base64 string from React Native / Expo FileSystem
+      audioBuffer = Buffer.from(trimmedInput.replace(/\s+/g, ""), "base64");
+    } else {
+      return trimmedInput;
     }
   } else if (Buffer.isBuffer(input)) {
     audioBuffer = input;
@@ -365,57 +418,93 @@ async function convertSpeechToText(input) {
   }
 
   if (audioBuffer && audioBuffer.length > 0) {
-    // 1. Primary: High-Speed Multimodal Gemini STT (Fast & 100% Accurate)
-    if (process.env.GEMINI_API_KEY) {
+    // 1. Primary: High-Speed Multimodal Gemini STT (Fast & 100% Accurate with Key Pool Rotation)
+    const { clusterState } = require("../utils/ollamaHelper");
+    let geminiNodes = [];
+    try {
+      const ServerNode = require("../models/ServerNode");
+      geminiNodes = await ServerNode.find({
+        $or: [{ format: "gemini" }, { url: /googleapis\.com/i }],
+        isActive: true,
+        secretKey: { $exists: true, $ne: "" }
+      });
+    } catch (e) {}
+
+    const candidateApiKeys = [...new Set([
+      process.env.GEMINI_API_KEY,
+      ...(Array.isArray(clusterState) ? clusterState.map(n => n.secretKey) : []),
+      ...geminiNodes.map(n => n.secretKey)
+    ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
+
+    if (candidateApiKeys.length > 0) {
       try {
         const axios = require("axios");
         const base64Data = audioBuffer.toString("base64");
-        
+
         let mimeType = "audio/wav";
+        if (input && typeof input === "object") {
+          if (input.mimetype && (input.mimetype.startsWith("audio/") || input.mimetype.startsWith("video/"))) {
+            mimeType = input.mimetype === "video/mp4" ? "audio/mp4" : input.mimetype;
+          } else if (input.originalname) {
+            const ext = input.originalname.toLowerCase();
+            if (ext.endsWith(".mp4") || ext.endsWith(".m4a") || ext.endsWith(".aac")) mimeType = "audio/mp4";
+            else if (ext.endsWith(".mp3")) mimeType = "audio/mp3";
+            else if (ext.endsWith(".webm")) mimeType = "audio/webm";
+            else if (ext.endsWith(".ogg") || ext.endsWith(".opus")) mimeType = "audio/ogg";
+            else if (ext.endsWith(".wav")) mimeType = "audio/wav";
+          }
+        }
+
         if (audioBuffer.length > 4) {
-          const hex = audioBuffer.slice(0, 4).toString("hex").toLowerCase();
-          if (hex.startsWith("494433") || hex.startsWith("fffb")) mimeType = "audio/mp3";
+          const hex = audioBuffer.slice(0, 16).toString("hex").toLowerCase();
+          const strHeader = audioBuffer.slice(0, 16).toString("utf8");
+          if (hex.includes("66747970") || strHeader.includes("ftyp") || strHeader.includes("m4a")) mimeType = "audio/mp4";
+          else if (hex.startsWith("494433") || hex.startsWith("fffb") || hex.startsWith("fffa")) mimeType = "audio/mp3";
           else if (hex.startsWith("1a45dfa3")) mimeType = "audio/webm";
           else if (hex.startsWith("4f676753")) mimeType = "audio/ogg";
+          else if (strHeader.startsWith("RIFF")) mimeType = "audio/wav";
         }
 
-        let geminiRes = null;
-        try {
-          geminiRes = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-            {
-              contents: [
-                {
-                  parts: [
-                    { text: "Transcribe the spoken words in this audio clip. Return ONLY the raw transcribed text string without quotes, formatting, or extra commentary." },
-                    { inlineData: { mimeType, data: base64Data } }
-                  ]
-                }
-              ]
-            },
-            { timeout: 12000 }
-          );
-        } catch (e1) {
-          geminiRes = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-            {
-              contents: [
-                {
-                  parts: [
-                    { text: "Transcribe the spoken words in this audio clip. Return ONLY the raw transcribed text string without quotes, formatting, or extra commentary." },
-                    { inlineData: { mimeType, data: base64Data } }
-                  ]
-                }
-              ]
-            },
-            { timeout: 12000 }
-          );
+        // Force valid audio mimeType if input passed text/plain or invalid type
+        if (!mimeType.startsWith("audio/") && !mimeType.startsWith("video/")) {
+          mimeType = "audio/wav";
         }
 
-        const transcribed = geminiRes.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (transcribed) {
-          console.log(`🎤 [STT TRANSCRIBED SUCCESS] Audio content: "${transcribed}"`);
-          return transcribed;
+        const sttModelsToTry = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"];
+
+        for (const currentApiKey of candidateApiKeys) {
+          for (const sttModel of sttModelsToTry) {
+            try {
+              const geminiRes = await axios.post(
+                `https://generativelanguage.googleapis.com/v1beta/models/${sttModel}:generateContent?key=${currentApiKey}`,
+                {
+                  contents: [
+                    {
+                      parts: [
+                        { text: "Transcribe the spoken words in this audio clip accurately. Return ONLY the raw transcribed text string without quotes, formatting, or extra commentary." },
+                        { inlineData: { mimeType, data: base64Data } }
+                      ]
+                    }
+                  ]
+                },
+                { timeout: 15000 }
+              );
+
+              const transcribed = geminiRes?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+              if (transcribed) {
+                console.log(`🎤 [STT TRANSCRIBED SUCCESS] Audio content: "${transcribed}"`);
+                return transcribed;
+              }
+            } catch (mErr) {
+              const errStatus = mErr.response?.status;
+              if (errStatus === 429) {
+                console.warn(`⚠️ [STT KEY RATE LIMIT] Gemini Key starting with '${currentApiKey.substring(0, 6)}...' hit 429 Quota Limit. Rotating to next API key...`);
+                break; // Key rate limited, break model loop and switch to next API key immediately!
+              } else {
+                console.warn(`Gemini STT notice on ${sttModel}:`, mErr.response?.data?.error?.message || mErr.message);
+              }
+            }
+          }
         }
       } catch (gemErr) {
         console.warn("Gemini STT notice (trying next provider):", gemErr.message);
@@ -424,18 +513,24 @@ async function convertSpeechToText(input) {
 
     // 2. Secondary: Node.js STT using @xenova/transformers (Whisper ONNX)
     try {
-      const { pipeline } = require("@xenova/transformers");
-      if (!global.nodeTranscriber) {
-        console.log("Loading Node.js Whisper STT model (@xenova/transformers)...");
-        global.nodeTranscriber = await pipeline("automatic-speech-recognition", "Xenova/whisper-tiny");
-        console.log("Node.js Whisper STT model loaded successfully.");
-      }
+      let pipeline = null;
+      try {
+        pipeline = require("@xenova/transformers").pipeline;
+      } catch (tErr) {}
 
-      const pcmData = await decodeAudioToFloat32(audioBuffer);
-      const result = await global.nodeTranscriber(pcmData);
+      if (pipeline) {
+        if (!global.nodeTranscriber) {
+          console.log("Loading Node.js Whisper STT model (@xenova/transformers)...");
+          global.nodeTranscriber = await pipeline("automatic-speech-recognition", "Xenova/whisper-tiny");
+          console.log("Node.js Whisper STT model loaded successfully.");
+        }
 
-      if (result && result.text) {
-        return result.text.trim();
+        const pcmData = await decodeAudioToFloat32(audioBuffer);
+        const result = await global.nodeTranscriber(pcmData);
+
+        if (result && result.text) {
+          return result.text.trim();
+        }
       }
     } catch (err) {
       console.warn("Node.js Transformers.js STT notice:", err.message);

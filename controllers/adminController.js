@@ -68,9 +68,9 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
 
   if (isGeminiKey || nodeFormat === "gemini") {
     if (isGeminiKey) secretKey = trimmedUrl;
-    trimmedUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+    trimmedUrl = "https://generativelanguage.googleapis.com/v1beta";
     nodeFormat = "gemini";
-    if (!defaultModel || defaultModel === "llama3.2:3b") model = "gemini-1.5-flash";
+    if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-1.5-flash") model = "gemini-2.5-flash";
   } else if (isOpenAIKey) {
     secretKey = trimmedUrl;
     trimmedUrl = "https://api.openai.com";
@@ -113,7 +113,7 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
   }
 
   if (nodeFormat === "gemini") {
-    fullUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+    fullUrl = "https://generativelanguage.googleapis.com/v1beta";
   }
   if (nodeFormat === "glm") {
     fullUrl = "https://integrate.api.nvidia.com/v1";

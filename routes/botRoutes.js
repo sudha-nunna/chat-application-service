@@ -29,11 +29,20 @@ const optionalAuth = (req, res, next) => {
   next();
 };
 
+const handleMulterFields = (req, res, next) => {
+  upload.any()(req, res, (err) => {
+    if (err) {
+      console.warn("Multer upload notice:", err.message);
+    }
+    next();
+  });
+};
+
 // Avatar Chat Endpoint (Supports optional JWT Bearer token; accepts both audio and audioFile field names)
 router.post(
   "/avatar/chat",
   optionalAuth,
-  upload.fields([{ name: "audio", maxCount: 1 }, { name: "audioFile", maxCount: 1 }]),
+  handleMulterFields,
   avatarController.handleAvatarChat
 );
 
@@ -51,8 +60,8 @@ router.post("/:botId/keys/generate", protect, botController.generateBotKeys);  /
 
 // Knowledge Upload, Avatars & Media Assets
 router.get("/media/:assetId", botController.streamMediaAsset);
-router.post("/:botId/upload", protect, botController.uploadBotFile);
-router.post("/:botId/avatar", protect, botController.uploadBotAvatar);
+router.post("/:botId/upload", protect, handleMulterFields, botController.uploadBotFile);
+router.post("/:botId/avatar", protect, handleMulterFields, botController.uploadBotAvatar);
 router.get("/:botId/files", protect, botController.getBotFiles);
 router.put("/:botId/files/:fileId", protect, botController.replaceBotFile);
 router.delete("/:botId/files/:fileId", protect, botController.deleteBotFile);

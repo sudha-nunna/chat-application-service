@@ -25,27 +25,71 @@ exports.handleAvatarChat = async (req, res) => {
 
     let textPrompt = message || req.body?.messageText || req.body?.prompt || req.body?.text || req.body?.userMessage || req.body?.query || "";
 
-    let audioUploadedFile = req.files?.audio?.[0] || req.files?.audioFile?.[0] || req.file;
+    const avatarFilesArray = Array.isArray(req.files) ? req.files : [];
+    const avatarFilesMap = !Array.isArray(req.files) ? (req.files || {}) : {};
+    let audioUploadedFile = avatarFilesMap.audio?.[0] || avatarFilesMap.audioFile?.[0] || (avatarFilesArray[0] && avatarFilesArray[0].buffer ? avatarFilesArray[0] : null) || req.file;
+
+    if (audioUploadedFile && (!audioUploadedFile.buffer || audioUploadedFile.buffer.length === 0)) {
+      audioUploadedFile = null;
+    }
+
     let rawSpeechInput = speech || audio || req.body?.audioFile || audioUploadedFile;
     let rawSpeechBuffer = null;
 
-    if (audioUploadedFile && audioUploadedFile.buffer) {
+    if (audioUploadedFile && audioUploadedFile.buffer && audioUploadedFile.buffer.length > 0) {
       rawSpeechBuffer = audioUploadedFile.buffer;
-    } else if (typeof rawSpeechInput === "string" && rawSpeechInput.startsWith("data:audio")) {
-      const base64Content = rawSpeechInput.split(",")[1] || "";
-      if (base64Content) {
-        rawSpeechBuffer = Buffer.from(base64Content, "base64");
+    } else if (typeof rawSpeechInput === "string" && rawSpeechInput.trim().length > 100) {
+      const trimmed = rawSpeechInput.trim();
+      if (trimmed.startsWith("data:audio")) {
+        const base64Content = trimmed.split(",")[1] || "";
+        if (base64Content) {
+          rawSpeechBuffer = Buffer.from(base64Content, "base64");
+        }
+      } else if (!trimmed.startsWith("http") && /^[A-Za-z0-9+/=\s\r\n]+$/.test(trimmed.substring(0, 100))) {
+        rawSpeechBuffer = Buffer.from(trimmed.replace(/\s+/g, ""), "base64");
       }
     }
 
-    if ((!textPrompt || typeof textPrompt !== "string" || !textPrompt.trim()) && (rawSpeechInput || rawSpeechBuffer)) {
-      textPrompt = await voiceService.convertSpeechToText(rawSpeechBuffer || rawSpeechInput);
+    const hasValidAudio = (rawSpeechBuffer && rawSpeechBuffer.length > 0) || (typeof rawSpeechInput === "string" && rawSpeechInput.length > 100 && !rawSpeechInput.startsWith("http"));
+
+    console.log(`\n==================================================`);
+    console.log(`🤖 [AVATAR CHAT INCOMING PAYLOAD] User ID: ${req.user?.id || "Guest/Anonymous"} | Bot ID: ${botId || "Default"}`);
+    console.log(`📋 Content-Type: ${req.headers["content-type"] || "unknown"}`);
+    console.log(`📦 Body Parameters:`, JSON.stringify(req.body || {}));
+    if (avatarFilesArray.length > 0) {
+      console.log(`📁 Uploaded Files (${avatarFilesArray.length}):`, avatarFilesArray.map(f => ({
+        fieldname: f.fieldname,
+        originalname: f.originalname,
+        mimetype: f.mimetype,
+        size: f.size
+      })));
+    } else {
+      console.log(`📁 Uploaded Files: None (JSON / Text payload)`);
+    }
+    console.log(`📍 Request Type: ${hasValidAudio ? "🎤 AUDIO (VOICE RECORDING)" : "💬 TEXT MESSAGE"}`);
+    if (hasValidAudio) {
+      console.log(`🔊 Attached Audio Buffer: ${rawSpeechBuffer?.length || 0} bytes | MIME: ${audioUploadedFile?.mimetype || "audio/wav"}`);
+    } else {
+      console.log(`💬 Input Text Message: "${textPrompt}"`);
+    }
+
+    if (hasValidAudio) {
+      const sttInput = audioUploadedFile || rawSpeechBuffer || rawSpeechInput;
+      console.log("🎤 [AVATAR CHAT STT] Transcribing audio recording into text...");
+      const transcribedText = await voiceService.convertSpeechToText(sttInput);
+      if (transcribedText && transcribedText.trim()) {
+        console.log(`✅ [AVATAR CHAT STT SUCCESS] Transcribed Spoken Text: "${transcribedText.trim()}"`);
+        textPrompt = transcribedText.trim();
+      } else {
+        console.warn("⚠️ [AVATAR CHAT STT NOTICE] Could not transcribe audio clip into text.");
+      }
     }
 
     if (!textPrompt || typeof textPrompt !== "string" || !textPrompt.trim()) {
       textPrompt = "Hello! Please assist me.";
     }
     message = textPrompt;
+    console.log(`💬 Final Prompt Sent To LLM: "${message}"`);
 
     let bot = null;
     if (botId) {
@@ -166,6 +210,7 @@ exports.handleAvatarChat = async (req, res) => {
       model: bot.model || "best",
       messages: ollamaMessages,
       userPriority,
+      maxTokens: 60,
       jobId: `avatar_chat_${Date.now()}`
     });
 
@@ -229,35 +274,79 @@ exports.handleAvatarChat = async (req, res) => {
     // Voice & Viseme generation (Production Voice Profile Architecture)
     const reqHost = `${req.protocol}://${req.get("host")}`;
     let speechData = null;
+    let usedVoiceSampleId = "";
+    let usedVoiceSampleUrl = "";
+
     try {
       const User = require("../models/User");
       const MediaAsset = require("../models/MediaAsset");
 
-      // 1. Resolve Target Voice Sample Buffer for Voice Cloning:
-      // Priority 1: User's saved profile voice sample from DB (e.g. the male voice uploaded at profile setup)
-      let cloneVoiceBuffer = null;
+      const getBufferData = (asset) => {
+        if (!asset || !asset.data) return null;
+        if (Buffer.isBuffer(asset.data)) return asset.data;
+        if (asset.data.buffer) return Buffer.from(asset.data.buffer);
+        if (asset.data.data) return Buffer.from(asset.data.data);
+        return Buffer.from(asset.data);
+      };
 
-      if (req.user?.id) {
-        const userDoc = await User.findById(req.user.id).catch(() => null);
-        if (userDoc?.voiceSampleId) {
-          const assetDoc = await MediaAsset.findById(userDoc.voiceSampleId).catch(() => null);
-          if (assetDoc && assetDoc.data && assetDoc.data.length > 0) {
-            cloneVoiceBuffer = assetDoc.data;
+      // 1. Resolve Target Voice Sample Buffer for Voice Cloning:
+      let cloneVoiceBuffer = null;
+      let targetUserId = req.user?.id || req.body?.userId;
+
+      if (!targetUserId && req.body?.email) {
+        const u = await User.findOne({ email: req.body.email }).catch(() => null);
+        if (u) targetUserId = u._id;
+      }
+
+      let activeAsset = null;
+
+      // Priority 1: User's explicitly selected active voice sample (userId AND isSelected: true)
+      if (targetUserId) {
+        activeAsset = await MediaAsset.findOne({ userId: targetUserId, type: "VOICE_SAMPLE", isSelected: true }).sort({ updatedAt: -1 }).catch(() => null);
+        if (!activeAsset) {
+          const userDoc = await User.findById(targetUserId).catch(() => null);
+          if (userDoc?.voiceSampleId) {
+            activeAsset = await MediaAsset.findById(userDoc.voiceSampleId).catch(() => null);
           }
         }
       }
 
-      // Priority 2: If user has no saved profile voice sample in DB, fallback to bot's custom voice sample
-      if ((!cloneVoiceBuffer || cloneVoiceBuffer.length === 0) && bot?.voiceSampleId) {
-        const botAssetDoc = await MediaAsset.findById(bot.voiceSampleId).catch(() => null);
-        if (botAssetDoc && botAssetDoc.data && botAssetDoc.data.length > 0) {
-          cloneVoiceBuffer = botAssetDoc.data;
+      // Priority 2: Any MediaAsset marked with isSelected: true in MongoDB
+      if (!activeAsset) {
+        activeAsset = await MediaAsset.findOne({ type: "VOICE_SAMPLE", isSelected: true }).sort({ updatedAt: -1 }).catch(() => null);
+      }
+
+      // Priority 3: Any User in DB with a linked voiceSampleId
+      if (!activeAsset) {
+        const userWithVoice = await User.findOne({ voiceSampleId: { $ne: null } }).sort({ updatedAt: -1 }).catch(() => null);
+        if (userWithVoice?.voiceSampleId) {
+          activeAsset = await MediaAsset.findById(userWithVoice.voiceSampleId).catch(() => null);
         }
       }
 
-      // Priority 3: If no saved profile or bot voice sample exists, use incoming request audio as fallback
-      if ((!cloneVoiceBuffer || cloneVoiceBuffer.length === 0) && rawSpeechBuffer && rawSpeechBuffer.length > 0) {
-        cloneVoiceBuffer = rawSpeechBuffer;
+      // Priority 4: Explicit voiceSampleId passed in body
+      if (!activeAsset && req.body?.voiceSampleId) {
+        activeAsset = await MediaAsset.findById(req.body.voiceSampleId).catch(() => null);
+      }
+
+      // Priority 5: Bot's custom voice sample
+      if (!activeAsset && bot?.voiceSampleId) {
+        activeAsset = await MediaAsset.findById(bot.voiceSampleId).catch(() => null);
+      }
+
+      // Priority 6: Latest VOICE_SAMPLE uploaded to MongoDB
+      if (!activeAsset) {
+        activeAsset = await MediaAsset.findOne({ type: "VOICE_SAMPLE" }).sort({ createdAt: -1 }).catch(() => null);
+      }
+
+      if (activeAsset) {
+        const buf = getBufferData(activeAsset);
+        if (buf && buf.length > 0) {
+          cloneVoiceBuffer = buf;
+          usedVoiceSampleId = String(activeAsset._id);
+          usedVoiceSampleUrl = `${reqHost}/bots/media/${activeAsset._id}`;
+          console.log(`🎤 [VOICE RESOLVED] Active Voice Sample ID: ${activeAsset._id} (${activeAsset.filename})`);
+        }
       }
 
       // Generate cloned speech using cloneVoiceBuffer
@@ -292,12 +381,21 @@ exports.handleAvatarChat = async (req, res) => {
       }
     };
 
+    const durationMs = Date.now() - reqStartTime;
+    console.log(`🚀 [AVATAR CHAT RESPONSE GENERATED] (${durationMs}ms)`);
+    console.log(`💬 Generated AI Response: "${responseText}"`);
+    console.log(`🔊 Spoken Audio URL: ${speechData?.audioUrl || "None"}`);
+    console.log(`🎙️ Voice Profile Applied: ${usedVoiceSampleId ? `ID: ${usedVoiceSampleId}` : "Default TTS Tone"}`);
+    console.log(`==================================================\n`);
+
     return res.json({
       success: true,
       conversationId: activeConvId,
       response: responseText,
       message: responseText,
       audioUrl: speechData?.audioUrl || "",
+      activeVoiceSampleId: usedVoiceSampleId || "",
+      activeVoiceSampleUrl: usedVoiceSampleUrl || "",
       visemes: speechData?.visemes || [],
       botId: effectiveBotId,
       avatar: avatarMetadata,
