@@ -18,9 +18,28 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import torch
+import torch.hub
+
 try:
-    if hasattr(torch.hub, "_trust_repositories"):
-        torch.hub._trust_repositories = True
+    # 1. Write trusted_list file to PyTorch hub cache directory
+    torch_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "torch", "hub")
+    os.makedirs(torch_cache_dir, exist_ok=True)
+    trusted_file = os.path.join(torch_cache_dir, "trusted_list")
+    with open(trusted_file, "a+") as f:
+        f.seek(0)
+        content = f.read()
+        if "snakers4_silero-vad" not in content:
+            f.write("snakers4_silero-vad\nsnakers4/silero-vad\n")
+except Exception:
+    pass
+
+try:
+    # 2. Monkey-patch torch.hub.load to force trust_repo=True automatically
+    _orig_torch_hub_load = torch.hub.load
+    def _patched_torch_hub_load(*args, **kwargs):
+        kwargs["trust_repo"] = True
+        return _orig_torch_hub_load(*args, **kwargs)
+    torch.hub.load = _patched_torch_hub_load
 except Exception:
     pass
 
