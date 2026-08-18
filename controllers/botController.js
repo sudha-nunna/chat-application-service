@@ -1995,12 +1995,16 @@ exports.streamMediaAsset = async (req, res) => {
     const { assetId } = req.params;
     const MediaAsset = require("../models/MediaAsset");
 
-    const asset = await MediaAsset.findById(assetId);
+    if (!mongoose.Types.ObjectId.isValid(assetId)) {
+      return res.status(400).json({ error: "Invalid media asset ID format." });
+    }
+
+    const asset = await MediaAsset.findById(assetId).select("data contentType size isTransient").lean();
     if (!asset || !asset.data) {
       return res.status(404).json({ error: "Media asset not found." });
     }
 
-    res.set("Content-Type", asset.contentType || "application/octet-stream");
+    res.set("Content-Type", asset.contentType || "audio/wav");
     res.set("Content-Length", asset.size || asset.data.length);
 
     if (asset.isTransient) {
