@@ -13,9 +13,12 @@ os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["PYTHONWARNINGS"] = "ignore"
 
+from fastapi import FastAPI, UploadFile, Form, File, HTTPException
+from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 import torch
 try:
-    # Auto-trust torch hub repositories to prevent interactive stdin prompts
     if hasattr(torch.hub, "_trust_repositories"):
         torch.hub._trust_repositories = True
 except Exception:
