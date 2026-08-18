@@ -24,6 +24,7 @@ connectDB().then(() => {
 });
 
 const app = express();
+app.set("trust proxy", 1);
 
 // 1. Public External Bot & Avatar CORS (Allows third-party websites/apps without token requirements)
 app.use(["/api/v1/external/bots", "/api/v1/avatar"], cors({

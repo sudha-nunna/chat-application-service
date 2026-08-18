@@ -249,7 +249,7 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
         clonedRes = await axios.post(`${VOICE_ENGINE_URL}${primaryEndpoint}`, form, {
           headers: form.getHeaders(),
           responseType: "arraybuffer",
-          timeout: 60000
+          timeout: 2500
         });
       } catch (primaryErr) {
         console.warn(`Notice: Primary Voice Engine (${primaryEndpoint}) notice (${primaryErr.message}), trying secondary endpoint (${secondaryEndpoint})...`);
@@ -257,7 +257,7 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
           clonedRes = await axios.post(`${VOICE_ENGINE_URL}${secondaryEndpoint}`, form, {
             headers: form.getHeaders(),
             responseType: "arraybuffer",
-            timeout: 60000
+            timeout: 2500
           });
           engineUsed = targetEngine === "OPENVOICE" ? "F5" : "OPENVOICE";
         } catch (secondaryErr) {
@@ -265,7 +265,7 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
           clonedRes = await axios.post(`${VOICE_ENGINE_URL}/clone-tts`, form, {
             headers: form.getHeaders(),
             responseType: "arraybuffer",
-            timeout: 60000
+            timeout: 2500
           });
         }
       }

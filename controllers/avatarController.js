@@ -335,7 +335,8 @@ Answer the user's prompt or question directly in 1 to 2 short, concise sentences
     }
 
     // Voice & Viseme generation (Production Voice Profile Architecture)
-    const reqHost = `${req.protocol}://${req.get("host")}`;
+    const proto = (req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim();
+    const reqHost = `${proto}://${req.get("host")}`.replace(/\/$/, "");
     let speechData = null;
     let usedVoiceSampleId = "";
     let usedVoiceSampleUrl = "";
