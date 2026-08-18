@@ -418,7 +418,28 @@ async function convertSpeechToText(input) {
   }
 
   if (audioBuffer && audioBuffer.length > 0) {
-    // 1. Primary: High-Speed Multimodal Gemini STT (Fast & 100% Accurate with Key Pool Rotation)
+    // 1. PRIORITY #1: 100% Free, High-Speed Local Offline Whisper STT (Zero Cloud API Keys Required)
+    try {
+      const axios = require("axios");
+      const FormData = require("form-data");
+      const form = new FormData();
+      form.append("file", audioBuffer, { filename: "speech.wav", contentType: "audio/wav" });
+
+      const VOICE_ENGINE_URL = process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
+      const localSttRes = await axios.post(`${VOICE_ENGINE_URL}/transcribe`, form, {
+        headers: form.getHeaders(),
+        timeout: 8000
+      });
+
+      if (localSttRes.data && localSttRes.data.success && localSttRes.data.text) {
+        console.log(`🎤 [LOCAL WHISPER STT SUCCESS] Audio content: "${localSttRes.data.text.trim()}"`);
+        return localSttRes.data.text.trim();
+      }
+    } catch (localSttErr) {
+      console.warn("Notice: Local Whisper STT notice (falling back to cloud pool):", localSttErr.message);
+    }
+
+    // 2. Secondary: High-Speed Multimodal Gemini STT (Cloud Fallback Pool)
     const { clusterState } = require("../utils/ollamaHelper");
     let geminiNodes = [];
     try {
@@ -470,7 +491,7 @@ async function convertSpeechToText(input) {
           mimeType = "audio/wav";
         }
 
-        const sttModelsToTry = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"];
+        const sttModelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
 
         for (const currentApiKey of candidateApiKeys) {
           for (const sttModel of sttModelsToTry) {
@@ -536,31 +557,54 @@ async function convertSpeechToText(input) {
       console.warn("Node.js Transformers.js STT notice:", err.message);
     }
 
-    // 2. Fallback: OpenAI Whisper API if OPENAI_API_KEY is configured
-    if (process.env.OPENAI_API_KEY) {
-      try {
-        const axios = require("axios");
-        const FormData = require("form-data");
-        const form = new FormData();
-        form.append("file", audioBuffer, { filename: "speech.wav", contentType: "audio/wav" });
-        form.append("model", "whisper-1");
+    // 3. Fallback: OpenAI Whisper API with active key pool
+    try {
+      const ServerNode = require("../models/ServerNode");
+      const openAiNodes = await ServerNode.find({
+        $or: [{ format: "openai" }, { url: /openai\.com/i }],
+        isActive: true,
+        secretKey: { $exists: true, $ne: "" }
+      }).catch(() => []);
 
-        const whisperRes = await axios.post("https://api.openai.com/v1/audio/transcriptions", form, {
-          headers: {
-            ...form.getHeaders(),
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+      const openAiKeys = [...new Set([
+        process.env.OPENAI_API_KEY,
+        ...openAiNodes.map(n => n.secretKey)
+      ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
+
+      for (const openAiKey of openAiKeys) {
+        try {
+          const axios = require("axios");
+          const FormData = require("form-data");
+          const form = new FormData();
+          form.append("file", audioBuffer, { filename: "speech.wav", contentType: mimeType || "audio/wav" });
+          form.append("model", "whisper-1");
+
+          const whisperRes = await axios.post("https://api.openai.com/v1/audio/transcriptions", form, {
+            headers: {
+              ...form.getHeaders(),
+              Authorization: `Bearer ${openAiKey}`
+            },
+            timeout: 12000
+          });
+          if (whisperRes.data?.text) {
+            console.log(`🎤 [STT WHISPER SUCCESS] Audio content: "${whisperRes.data.text.trim()}"`);
+            return whisperRes.data.text.trim();
           }
-        });
-        if (whisperRes.data?.text) {
-          return whisperRes.data.text.trim();
+        } catch (e) {
+          const errStatus = e.response?.status;
+          if (errStatus === 429) {
+            console.warn(`⚠️ [STT WHISPER KEY RATE LIMIT] Key starting with '${openAiKey.substring(0, 6)}...' hit 429.`);
+          } else {
+            console.warn("Whisper STT cloud fallback notice:", e.response?.data?.error?.message || e.message);
+          }
         }
-      } catch (e) {
-        console.warn("Whisper STT cloud fallback notice:", e.message);
       }
+    } catch (e) {
+      console.warn("Whisper STT fallback outer notice:", e.message);
     }
 
-    // Default audio prompt fallback if audio buffer exists but STT model is offline
-    return "Hello! Can you help me?";
+    // Return empty string if STT model cannot transcribe audio so caller uses text prompt fallback
+    return "";
   }
 
   return typeof input === "string" ? input.trim() : "";

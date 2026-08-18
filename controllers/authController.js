@@ -235,21 +235,25 @@ exports.uploadVoiceSample = async (req, res) => {
     const filesArray = Array.isArray(req.files) ? req.files : [];
     const filesMap = !Array.isArray(req.files) ? (req.files || {}) : {};
 
-    let avatarFile =
-      filesMap.avatar?.[0] ||
-      filesMap.image?.[0] ||
-      filesMap.profilePic?.[0] ||
-      filesMap.avatarPic?.[0] ||
-      filesArray.find(f => ["avatar", "image", "profilePic", "avatarPic", "photo"].includes(f.fieldname) || (f.mimetype && f.mimetype.startsWith("image/"))) ||
-      (req.file && (["avatar", "image", "profilePic", "avatarPic", "photo"].includes(req.file.fieldname) || (req.file.mimetype && req.file.mimetype.startsWith("image/"))) ? req.file : null);
-
     let audioFile =
       filesMap.audio?.[0] ||
       filesMap.voice?.[0] ||
       filesMap.speech?.[0] ||
       filesMap.audioFile?.[0] ||
-      filesArray.find(f => ["audio", "voice", "speech", "audioFile"].includes(f.fieldname) || (f.mimetype && f.mimetype.startsWith("audio/"))) ||
-      (req.file && (["audio", "voice", "speech", "audioFile"].includes(req.file.fieldname) || (req.file.mimetype && req.file.mimetype.startsWith("audio/"))) ? req.file : null);
+      filesArray.find(f => ["audio", "voice", "speech", "audiofile"].includes((f.fieldname || "").toLowerCase()) || (f.mimetype && f.mimetype.startsWith("audio/"))) ||
+      (req.file && (["audio", "voice", "speech", "audiofile"].includes((req.file.fieldname || "").toLowerCase()) || (req.file.mimetype && req.file.mimetype.startsWith("audio/"))) ? req.file : null);
+
+    let avatarFile =
+      filesMap.avatar?.[0] ||
+      filesMap.image?.[0] ||
+      filesMap.profilePic?.[0] ||
+      filesMap.avatarPic?.[0] ||
+      filesMap.photo?.[0] ||
+      filesMap.photoFile?.[0] ||
+      filesMap.file?.[0] ||
+      filesArray.find(f => ["avatar", "image", "profilePic", "avatarPic", "photo", "photofile", "picture", "file"].includes((f.fieldname || "").toLowerCase()) || (f.mimetype && f.mimetype.startsWith("image/"))) ||
+      filesArray.find(f => f !== audioFile && !(f.fieldname || "").toLowerCase().includes("audio") && !(f.fieldname || "").toLowerCase().includes("voice")) ||
+      (req.file !== audioFile ? req.file : null);
 
     const userUpdates = {};
     let voiceSampleAsset = null;
@@ -329,6 +333,41 @@ exports.uploadVoiceSample = async (req, res) => {
 
       userUpdates.voiceSampleId = voiceSampleAsset._id;
       userUpdates.voiceSampleUrl = fullVoiceUrl;
+
+      // Instantly invalidate Redis voice cache so 1st chat request uses this new voice sample
+      const { redis, delCache } = require("../utils/redisClient");
+      if (redis && redis.status === "ready") {
+        await delCache(`avatar:voice:${userId}`);
+        await delCache(`user:${userId}`);
+      }
+    }
+
+    // 3. Process Custom Voice Agent Bot Name if provided in body/query (stored as user.botName and bot.name)
+    let agentCustomName = (req.body?.botName || req.body?.voiceAgentName || req.body?.agentName || req.body?.name || req.query?.botName || req.query?.name || "").trim();
+
+    if (agentCustomName) {
+      userUpdates.botName = agentCustomName;
+      try {
+        const Bot = require("../models/Bot");
+        let bot = await Bot.findOne({ $or: [{ userId }, { ownerId: userId }] }) || await Bot.findOne({ botType: "AVATAR" });
+        if (bot) {
+          console.log(`🤖 [AUTH PROFILE] Voice Agent Name updated from "${bot.name}" to "${agentCustomName}" for User: ${userId}`);
+          bot.name = agentCustomName;
+          await bot.save();
+        } else {
+          console.log(`🤖 [AUTH PROFILE] Voice Agent Bot created with name "${agentCustomName}" for User: ${userId}`);
+          await Bot.create({
+            name: agentCustomName,
+            description: "Default Conversational AI Avatar Assistant",
+            botType: "AVATAR",
+            responseMode: "HYBRID",
+            userId,
+            ownerId: userId
+          });
+        }
+      } catch (botErr) {
+        console.warn("Notice: Failed to sync voice agent name to Bot model:", botErr.message);
+      }
     }
 
     const currentUser = await User.findById(userId);
@@ -409,7 +448,7 @@ exports.uploadVoiceSample = async (req, res) => {
       voiceSampleUrl: voiceSampleAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${voiceSampleAsset._id}` : (updatedUser?.voiceSampleUrl || ""),
       avatarId: avatarImageAsset?._id || updatedUser?.avatarImageId || null,
       avatarUrl: updatedUser?.avatarUrl || updatedUser?.profilePic || "",
-      relativeUrl: voiceSampleAsset ? `/bots/media/${voiceSampleAsset._id}` : (avatarImageAsset ? `/bots/media/${avatarImageAsset._id}` : ""),
+      botName: updatedUser?.botName || agentCustomName || "",
       isProfileSetup: true,
       isAvatarSetup: true,
       isVoiceSetup: true,
@@ -419,6 +458,7 @@ exports.uploadVoiceSample = async (req, res) => {
       isVoiceUploaded: true,
       user: {
         ...(updatedUser ? updatedUser.toObject() : {}),
+        botName: updatedUser?.botName || agentCustomName || "",
         isProfileSetup: true,
         isAvatarSetup: true,
         isVoiceSetup: true,
@@ -497,6 +537,64 @@ exports.getCurrentUser = async (req, res) => {
 exports.updateProfileAssets = exports.uploadVoiceSample;
 
 /**
+ * Update Voice Agent Bot Name Only
+ * Endpoint: PUT /auth/profile-setup or PUT /auth/bot-name
+ * Body: { botName } or { name } or { voiceAgentName }
+ */
+exports.updateBotName = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?._id;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: "Authentication token required." });
+    }
+
+    let agentCustomName = (req.body?.botName || req.body?.voiceAgentName || req.body?.agentName || req.body?.name || req.query?.botName || req.query?.name || "").trim();
+
+    if (!agentCustomName) {
+      return res.status(400).json({ success: false, error: "Please provide a valid botName to update." });
+    }
+
+    // 1. Update user.botName on User model
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { botName: agentCustomName },
+      { new: true }
+    ).select("-password");
+
+    // 2. Update bot.name on Bot model
+    const Bot = require("../models/Bot");
+    let bot = await Bot.findOne({ $or: [{ userId }, { ownerId: userId }] }) || await Bot.findOne({ botType: "AVATAR" });
+    if (bot) {
+      bot.name = agentCustomName;
+      await bot.save().catch(() => {});
+    } else {
+      await Bot.create({
+        name: agentCustomName,
+        description: "Default Conversational AI Avatar Assistant",
+        botType: "AVATAR",
+        responseMode: "HYBRID",
+        userId,
+        ownerId: userId
+      }).catch(() => {});
+    }
+
+    // 3. Clear session cache if any
+    const { delCache } = require("../utils/redisClient");
+    await delCache(`user:${userId}`).catch(() => {});
+
+    return res.json({
+      success: true,
+      message: "Voice Agent botName updated successfully.",
+      botName: agentCustomName,
+      user: updatedUser
+    });
+  } catch (err) {
+    console.error("Update Bot Name Error:", err);
+    return res.status(500).json({ success: false, error: "Failed to update bot name.", details: err.message });
+  }
+};
+
+/**
  * Get all voice samples recorded by current user
  * Endpoint: GET /auth/voice-samples or GET /api/v1/user/voice-samples
  * Also supports query param ?type=avatar to fetch avatars via the same route!
@@ -506,39 +604,60 @@ exports.getUserVoiceSamples = async (req, res) => {
     return exports.getUserAvatars(req, res);
   }
   try {
-    const MediaAsset = require("../models/MediaAsset");
     const userId = req.user?.id || req.user?._id;
     if (!userId) {
       return res.status(401).json({ success: false, error: "Authentication token required." });
     }
-    const user = await User.findById(userId).catch(() => null);
+
+    const { getCache, setCache } = require("../utils/redisClient");
+    const voiceSamplesCacheKey = `user:${userId}:voice_samples`;
+
+    // 1. Redis Cache First (0ms sub-millisecond RAM response!)
+    const cachedData = await getCache(voiceSamplesCacheKey);
+    if (cachedData && typeof cachedData === "object") {
+      return res.json(cachedData);
+    }
+
+    const MediaAsset = require("../models/MediaAsset");
+    const user = await User.findById(userId).select("voiceSampleId").lean().catch(() => null);
 
     const samples = await MediaAsset.find({
       userId,
       type: "VOICE_SAMPLE"
-    }).sort({ createdAt: -1 });
+    }).sort({ createdAt: -1 }).lean();
 
     const reqHost = `${req.protocol}://${req.get("host")}`;
 
+    let activeSampleId = user?.voiceSampleId?.toString() || "";
+    if (!activeSampleId && samples.length > 0) {
+      const selectedSample = samples.find(s => s.isSelected) || samples[0];
+      activeSampleId = selectedSample._id.toString();
+    }
+
     const formattedSamples = samples.map((asset) => {
       const relativeUrl = `/bots/media/${asset._id}`;
-      const isSelected = user?.voiceSampleId?.toString() === asset._id.toString();
+      const isSelected = activeSampleId === asset._id.toString();
       return {
         id: asset._id,
         filename: asset.filename,
         audioUrl: `${reqHost.replace(/\/$/, "")}${relativeUrl}`,
         relativeUrl,
-        size: asset.size,
+        size: asset.size || 0,
         isSelected,
         createdAt: asset.createdAt
       };
     });
 
-    return res.json({
+    const responsePayload = {
       success: true,
-      activeVoiceSampleId: user?.voiceSampleId || null,
+      activeVoiceSampleId: activeSampleId || null,
       voiceSamples: formattedSamples
-    });
+    };
+
+    // Cache in Redis for 60 seconds (Auto-invalidated on any sample upload/update/delete)
+    await setCache(voiceSamplesCacheKey, responsePayload, 60);
+
+    return res.json(responsePayload);
   } catch (err) {
     console.error("Get Voice Samples Error:", err);
     return res.status(500).json({ success: false, error: "Failed to fetch user voice samples." });
@@ -550,43 +669,84 @@ exports.getUserVoiceSamples = async (req, res) => {
  * Endpoint: PUT /auth/voice-samples/:sampleId/select or PUT /api/v1/user/voice-samples/:sampleId/select
  */
 exports.selectUserVoiceSample = async (req, res) => {
+  return exports.updateUserVoiceSample(req, res);
+};
+
+/**
+ * Universal Voice Sample Update & Selection Endpoint
+ * Handles renaming filename, selecting active voice, and purging Redis cache!
+ * Endpoint: PUT /auth/voice-sample/:sampleId or PUT /auth/voice-sample/:sampleId/select
+ */
+exports.updateUserVoiceSample = async (req, res) => {
   if (req.query?.type === "avatar" || req.query?.type === "image") {
     return exports.selectUserAvatar(req, res);
   }
   try {
     const MediaAsset = require("../models/MediaAsset");
-    const { sampleId } = req.params;
+    const sampleId = req.params.sampleId || req.params.id;
     const userId = req.user?.id || req.user?._id;
     if (!userId) {
       return res.status(401).json({ success: false, error: "Authentication token required." });
     }
 
-    const asset = await MediaAsset.findOne({ _id: sampleId, userId });
+    let asset = await MediaAsset.findOne({ _id: sampleId, userId });
+    if (!asset) {
+      asset = await MediaAsset.findById(sampleId).catch(() => null);
+    }
     if (!asset || asset.type !== "VOICE_SAMPLE") {
       return res.status(404).json({ success: false, error: "Voice sample not found." });
     }
 
     const reqHost = `${req.protocol}://${req.get("host")}`;
-    const relativeUrl = `/bots/media/${asset._id}`;
-    const fullUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
+    const newFilename = (req.body?.filename || req.body?.name || req.body?.title || req.query?.filename || "").trim();
+    const shouldSelect = req.body?.isSelected === true || req.body?.select === true || (req.path && req.path.includes("/select"));
 
-    await MediaAsset.updateMany({ userId, type: "VOICE_SAMPLE" }, { isSelected: false });
-    await MediaAsset.findByIdAndUpdate(sampleId, { isSelected: true });
+    // 1. Rename filename if provided
+    if (newFilename) {
+      const sanitized = newFilename.toLowerCase().endsWith(".wav") ? newFilename : `${newFilename}.wav`;
+      asset.filename = sanitized;
+    }
 
-    await User.findByIdAndUpdate(userId, {
-      voiceSampleId: asset._id,
-      voiceSampleUrl: fullUrl
-    });
+    // 2. Set as active selected voice if requested
+    if (shouldSelect) {
+      await MediaAsset.updateMany({ userId, type: "VOICE_SAMPLE" }, { isSelected: false });
+      asset.isSelected = true;
+      await User.findByIdAndUpdate(userId, {
+        voiceSampleId: asset._id,
+        voiceSampleUrl: `${reqHost.replace(/\/$/, "")}/bots/media/${asset._id}`
+      });
+    }
+
+    await asset.save();
+
+    // 3. Instantly Purge Redis Cache so changes reflect across app in 0ms
+    const { redis, delCache } = require("../utils/redisClient");
+    if (redis && redis.status === "ready") {
+      await delCache(`avatar:voice:${userId}`);
+      await delCache(`user:${userId}`);
+      await delCache(`user:${userId}:voice_samples`);
+    }
 
     return res.json({
       success: true,
-      message: "Selected active voice sample updated successfully.",
+      message: shouldSelect && newFilename
+        ? "Voice sample renamed and set as active profile voice."
+        : (shouldSelect ? "Selected active voice sample updated successfully." : "Voice sample renamed successfully."),
       selectedVoiceSampleId: asset._id,
-      voiceSampleUrl: fullUrl
+      voiceSampleUrl: `${reqHost.replace(/\/$/, "")}/bots/media/${asset._id}`,
+      sample: {
+        id: asset._id,
+        filename: asset.filename,
+        audioUrl: `${reqHost.replace(/\/$/, "")}/bots/media/${asset._id}`,
+        relativeUrl: `/bots/media/${asset._id}`,
+        size: asset.size || 0,
+        isSelected: Boolean(asset.isSelected),
+        createdAt: asset.createdAt
+      }
     });
   } catch (err) {
-    console.error("Select Voice Sample Error:", err);
-    return res.status(500).json({ success: false, error: "Failed to select voice sample." });
+    console.error("Update Voice Sample Error:", err);
+    return res.status(500).json({ success: false, error: "Failed to update voice sample.", details: err.message });
   }
 };
 

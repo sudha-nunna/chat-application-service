@@ -52,13 +52,7 @@ const mediaAssetSchema = new mongoose.Schema(
   }
 );
 
-// TTL Index: Automatically expire transient files (e.g. temporary speech WAVs) after 24 hours (86400s)
-mediaAssetSchema.index(
-  { createdAt: 1 },
-  {
-    expireAfterSeconds: 86400,
-    partialFilterExpression: { isTransient: true }
-  }
-);
+mediaAssetSchema.index({ userId: 1, type: 1, createdAt: -1 });
+mediaAssetSchema.index({ userId: 1, isSelected: 1 });
 
 module.exports = mongoose.model("MediaAsset", mediaAssetSchema);

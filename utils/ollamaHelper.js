@@ -59,8 +59,8 @@ async function refreshClusterNodesFromDB() {
         if (isGlmNode) {
           nodeFormat = "glm";
           nodeUrl = "https://integrate.api.nvidia.com/v1";
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel.includes("gemini")) {
-            defaultModel = "z-ai/glm-5.2";
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "z-ai/glm-5.2" || defaultModel.includes("gemini")) {
+            defaultModel = "glm-4-flash";
           }
           if (n.format !== "glm" || n.url !== nodeUrl || n.defaultModel !== defaultModel) {
             ServerNode.findByIdAndUpdate(n._id, { format: "glm", url: nodeUrl, defaultModel }).catch(() => { });
@@ -69,6 +69,13 @@ async function refreshClusterNodesFromDB() {
 
         const priorityScore = typeof n.priorityScore === "number" ? n.priorityScore : (n.priority || 10);
 
+        let nodeStatus = n.status || "ACTIVE";
+        // Auto-recover INACTIVE or RATE_LIMITED nodes after 30 seconds
+        if ((nodeStatus === "INACTIVE" || nodeStatus === "RATE_LIMITED") && n.updatedAt && (new Date() - new Date(n.updatedAt)) > 30000) {
+          nodeStatus = "ACTIVE";
+          ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" }).catch(() => {});
+        }
+
         return {
           id: String(n._id),
           name: n.name,
@@ -76,7 +83,7 @@ async function refreshClusterNodesFromDB() {
           secretKey: rawSecretKey,
           defaultModel,
           format: nodeFormat,
-          status: n.status || "ACTIVE",
+          status: nodeStatus,
           priority: priorityScore,
           priorityScore: priorityScore,
           activeRequests: activeMap.get(String(n._id)) || 0,
@@ -94,6 +101,32 @@ async function refreshClusterNodesFromDB() {
 
       clusterState.length = 0;
       freshNodes.forEach(fn => clusterState.push(fn));
+
+      // Append Local Ollama Fallback Candidate (http://127.0.0.1:11434) if not already in DB
+      const hasLocalNode = freshNodes.some(n => n.url.includes("127.0.0.1:11434") || n.url.includes("localhost:11434"));
+      if (!hasLocalNode) {
+        clusterState.push({
+          id: "local_ollama_11434",
+          name: "Local Ollama Engine",
+          url: "http://127.0.0.1:11434",
+          secretKey: "",
+          defaultModel: process.env.OLLAMA_MODEL || "qwen2.5:1.5b",
+          format: "ollama",
+          status: "ACTIVE",
+          priority: 5,
+          priorityScore: 5,
+          activeRequests: 0,
+          successRequests: 0,
+          failedRequests: 0,
+          consecutiveFailures: 0,
+          retryAfter: null,
+          lastLatencyMs: 0,
+          latency: 0,
+          lastChecked: new Date(),
+          lastUsedAt: null,
+          errorMessage: ""
+        });
+      }
 
       // Auto-seed default GLM node in MongoDB if no GLM node exists
       const hasGlmNode = freshNodes.some(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"));
@@ -152,7 +185,18 @@ async function checkClusterHealth() {
         continue;
       }
 
-      const tStart = performance.now();
+      // On-Demand Failover Strategy: Skip background pings for Cloud API nodes (Gemini/OpenAI/GLM)
+      // to preserve 100% of API rate-limit quota for real user chat requests!
+      const isCloudNode = node.format === "gemini" || node.format === "glm" || (node.format === "openai" && node.url.includes("openai.com")) || node.url.includes("googleapis.com") || node.url.includes("nvidia.com");
+      if (isCloudNode) {
+        if (node.status !== "RATE_LIMITED" || (node.retryAfter && new Date(node.retryAfter) <= now)) {
+          node.status = "ACTIVE";
+          node.consecutiveFailures = 0;
+          node.errorMessage = "";
+        }
+        console.log(`  ├── 🟢 ${node.id} (${node.name}): On-Demand Cloud Node (${node.format.toUpperCase()}) | Status: ACTIVE`);
+        continue;
+      }
       let isHealthy = false;
       let latency = 0;
       let errorMsg = "";
@@ -165,8 +209,9 @@ async function checkClusterHealth() {
           signal: AbortSignal.timeout(3500)
         };
         const rawSecretKey = node.secretKey || "";
+        const nodeFormat = (node.format || "openai").toLowerCase();
 
-        if (node.format === "gemini" || node.url.includes("googleapis.com")) {
+        if (nodeFormat === "gemini" || node.url.includes("googleapis.com")) {
           const apiKey = rawSecretKey || process.env.GEMINI_API_KEY || "";
           pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
         } else if (node.format === "glm" || node.url.includes("integrate.api.nvidia.com")) {

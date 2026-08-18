@@ -16,6 +16,18 @@ const authController = require("../controllers/authController");
 const authMiddleware = require("../middleware/auth");
 const protect = typeof authMiddleware === "function" ? authMiddleware : authMiddleware.protect;
 
+const handleMulterFields = (req, res, next) => {
+  const cType = (req.headers["content-type"] || "").toLowerCase();
+  if (cType.includes("multipart") || cType.includes("form-data")) {
+    upload.any()(req, res, (err) => {
+      if (err) console.warn("Multer notice:", err.message);
+      next();
+    });
+  } else {
+    next();
+  }
+};
+
 router.post("/google", googleAuth);
 router.post("/google/callback", googleAuthCallback);
 
@@ -23,21 +35,22 @@ router.post("/google/callback", googleAuthCallback);
 router.get("/me", protect, authController.getCurrentUser);
 router.get("/profile", protect, authController.getCurrentUser);
 
-router.post("/voice-sample", protect, upload.any(), authController.uploadVoiceSample);
-router.post("/avatar", protect, upload.any(), authController.uploadVoiceSample);
+router.post("/voice-sample", protect, handleMulterFields, authController.uploadVoiceSample);
+router.post("/avatar", protect, handleMulterFields, authController.uploadVoiceSample);
 
-router.post(
-  "/profile-setup",
-  protect,
-  upload.any(),
-  authController.updateProfileAssets
-);
+router.post("/profile-setup", protect, handleMulterFields, authController.updateProfileAssets);
+router.put("/profile-setup", protect, handleMulterFields, authController.updateBotName);
 
-// Voice Sample Endpoints
+// Voice Sample Endpoints (GET / PUT / DELETE)
 router.get("/voice-sample", protect, authController.getUserVoiceSamples);
 router.get("/voice-samples", protect, authController.getUserVoiceSamples);
+
 router.put("/voice-sample/:sampleId/select", protect, authController.selectUserVoiceSample);
 router.put("/voice-samples/:sampleId/select", protect, authController.selectUserVoiceSample);
+
+router.put("/voice-sample/:sampleId", protect, handleMulterFields, authController.updateUserVoiceSample);
+router.put("/voice-samples/:sampleId", protect, handleMulterFields, authController.updateUserVoiceSample);
+
 router.delete("/voice-sample/:sampleId", protect, authController.deleteUserVoiceSample);
 router.delete("/voice-samples/:sampleId", protect, authController.deleteUserVoiceSample);
 

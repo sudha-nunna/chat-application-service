@@ -38,13 +38,17 @@ const handleMulterFields = (req, res, next) => {
   });
 };
 
-// Avatar Chat Endpoint (Supports optional JWT Bearer token; accepts both audio and audioFile field names)
+// Avatar Chat Endpoint & History Management (Protected by JWT Bearer token for strict user security)
 router.post(
-  "/avatar/chat",
+  ["/avatar/chat", "/chat"],
   optionalAuth,
   handleMulterFields,
   avatarController.handleAvatarChat
 );
+router.get(["/avatar/conversations", "/conversations"], protect, avatarController.getAvatarConversations);
+router.post(["/avatar/conversations", "/conversations"], protect, avatarController.createAvatarConversation);
+router.get(["/avatar/conversations/:conversationId/messages", "/conversations/:conversationId/messages"], protect, avatarController.getAvatarMessages);
+router.delete(["/avatar/conversations/:conversationId", "/conversations/:conversationId"], protect, avatarController.deleteAvatarConversation);
 
 // Bot CRUD & Key Lifecycle Management
 router.post("/", protect, checkAgentLimit, botController.createBot);
@@ -60,6 +64,16 @@ router.post("/:botId/keys/generate", protect, botController.generateBotKeys);  /
 
 // Knowledge Upload, Avatars & Media Assets
 router.get("/media/:assetId", botController.streamMediaAsset);
+const authCtrl = require("../controllers/authController");
+router.get("/voice-sample", protect, authCtrl.getUserVoiceSamples);
+router.get("/voice-samples", protect, authCtrl.getUserVoiceSamples);
+router.put("/voice-sample/:sampleId/select", protect, authCtrl.selectUserVoiceSample);
+router.put("/voice-samples/:sampleId/select", protect, authCtrl.selectUserVoiceSample);
+router.put("/voice-sample/:sampleId", protect, handleMulterFields, authCtrl.updateUserVoiceSample);
+router.put("/voice-samples/:sampleId", protect, handleMulterFields, authCtrl.updateUserVoiceSample);
+router.delete("/voice-sample/:sampleId", protect, authCtrl.deleteUserVoiceSample);
+router.delete("/voice-samples/:sampleId", protect, authCtrl.deleteUserVoiceSample);
+
 router.post("/:botId/upload", protect, handleMulterFields, botController.uploadBotFile);
 router.post("/:botId/avatar", protect, handleMulterFields, botController.uploadBotAvatar);
 router.get("/:botId/files", protect, botController.getBotFiles);

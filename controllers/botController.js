@@ -1387,20 +1387,21 @@ exports.sendBotChatMessage = async (req, res) => {
       isGeneralQuery = false;
     }
 
-    let ragResult = { isFound: true, chunks: [] };
+    // Execute parallel fetches: Has Files count, RAG chunks (if intent !== GREETING), and cached Bot Rules
+    const rulesCacheKey = `bot:${botId}:rules`;
+    const [hasFilesCount, fetchedRagResult, cachedRulesObj] = await Promise.all([
+      BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] }),
+      intent !== "GREETING"
+        ? retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary)
+        : Promise.resolve({ isFound: true, chunks: [] }),
+      getCache(rulesCacheKey)
+    ]);
+    const ragResult = fetchedRagResult || { isFound: true, chunks: [] };
 
-    // Check if bot has uploaded document files
-    const hasFilesCount = await BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] });
     const hasUploadedFiles = hasFilesCount > 0;
+    const ragSearchTime = 0;
 
-    if (intent !== "GREETING" && hasUploadedFiles) {
-      // Multi-tenant Isolated Knowledge Retrieval for Document / API questions
-      const tRagStart = performance.now();
-      ragResult = await retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary);
-      ragSearchTime = performance.now() - tRagStart;
-    }
-
-    const sourcesMeta = ragResult.isFound && ragResult.chunks.length > 0
+    const sourcesMeta = ragResult.isFound && ragResult.chunks && ragResult.chunks.length > 0
       ? ragResult.chunks.map(c => ({ fileName: c.fileName, snippet: c.snippet.substring(0, 100) + "..." }))
       : [];
 
@@ -1412,19 +1413,12 @@ exports.sendBotChatMessage = async (req, res) => {
   💬 User Prompt:        "${message}"
   🏷️ Classified Intent:   ${intent}
   📂 Uploaded Files:      ${hasUploadedFiles ? `YES (${hasFilesCount} Files)` : "NO"}
-  ${hasUploadedFiles && intent !== "GREETING"
-        ? `📄 RAG Decision:        [EXECUTED] Document Grounding Search (${ragSearchTime.toFixed(2)} ms | Chunks: ${ragResult.chunks?.length || 0})`
-        : `⚡ RAG Decision:        [BYPASSED] General Conversation Mode (0ms DB Overhead)`}
   🧠 System Prompt:       ${(hasUploadedFiles || ragResult.chunks?.length > 0) ? "buildRagSystemPrompt (Strict Grounding + Sources)" : `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})`}
 ========================================================================\n`);
 
     if (sourcesMeta.length > 0 && isStreamRequested) {
       res.write(`event: sources\ndata: ${JSON.stringify({ type: "sources", sources: sourcesMeta })}\n\n`);
     }
-
-    // Fetch compiled rules object from Redis cache (bot:${botId}:rules) with 0ms runtime overhead
-    const rulesCacheKey = `bot:${botId}:rules`;
-    let cachedRulesObj = await getCache(rulesCacheKey);
 
     if (!cachedRulesObj) {
       const rawText = (bot.rulesConfig?.rulesText || "").trim();

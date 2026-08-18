@@ -65,6 +65,7 @@ app.use("/chats", chatRoutes);
 app.use("/auth", authRoutes);
 app.use("/ollama", ollamaRoutes);
 app.use("/bots", botRoutes);
+app.use("/api/v1/avatar", botRoutes);
 app.use("/projects", projectRoutes);
 app.use("/api/v1/external/bots", externalBotRoutes);
 app.use("/subscription", subscriptionRoutes);
@@ -101,7 +102,7 @@ app.listen(process.env.PORT, () => {
   // Auto-spawn Python F5-TTS Voice Engine as child process
   try {
     const { spawn } = require("child_process");
-    
+
     // Resolve Python binary path with fallback sequence:
     // 1. process.env.PYTHON_PATH (if set)
     // 2. Local venv path for Windows (venv/Scripts/python.exe) or Linux (venv/bin/python)
@@ -126,6 +127,16 @@ app.listen(process.env.PORT, () => {
     const pyExists = fs.existsSync(venvPythonPath) || (!venvPythonPath.includes("/") && !venvPythonPath.includes("\\"));
 
     if (pyExists && fs.existsSync(openvoiceScriptPath)) {
+      // Auto-cleanup orphan sockets on port 8000 to ensure fresh attached process with live terminal logs
+      try {
+        const { execSync } = require("child_process");
+        if (process.platform === "win32") {
+          execSync('powershell -Command "Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }"', { stdio: "ignore" });
+        } else {
+          execSync("fuser -k 8000/tcp || true", { stdio: "ignore" });
+        }
+      } catch (e) { }
+
       console.log(`🚀 Spawning Python OpenVoice V2 Engine (${venvPythonPath})...`);
       const pyProc = spawn(venvPythonPath, [openvoiceScriptPath], {
         env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8", VOICE_ENGINE_PORT: "8000", PORT: "8000" }
@@ -145,7 +156,7 @@ app.listen(process.env.PORT, () => {
 
       const killPyProc = () => {
         if (pyProc && !pyProc.killed) {
-          console.log("Shutting down Python F5-TTS Engine...");
+          console.log("Shutting down Python OpenVoice Engine...");
           pyProc.kill("SIGTERM");
         }
       };

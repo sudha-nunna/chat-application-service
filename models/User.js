@@ -58,6 +58,11 @@ const userSchema = new mongoose.Schema(
       default: "",
     },
 
+    botName: {
+      type: String,
+      default: "",
+    },
+
     isProfileSetup: {
       type: Boolean,
       default: false,
@@ -67,5 +72,31 @@ const userSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+userSchema.post(["findOneAndDelete", "deleteOne", "remove"], async function(doc) {
+  try {
+    const userId = doc?._id || this.getQuery()?._id;
+    if (userId) {
+      const uStr = userId.toString();
+      // 1. Delete associated media assets
+      const MediaAsset = mongoose.model("MediaAsset");
+      if (MediaAsset) {
+        await MediaAsset.deleteMany({ userId }).catch(() => {});
+      }
+
+      // 2. Invalidate Redis session & purge user caches
+      const { redis, delCache } = require("../utils/redisClient");
+      if (redis && redis.status === "ready") {
+        await redis.set(`user:session:${uStr}`, "0", "EX", 86400).catch(() => {});
+        const keys = await redis.keys(`*${uStr}*`).catch(() => []);
+        if (keys.length > 0) {
+          await redis.del(keys).catch(() => {});
+        }
+      }
+    }
+  } catch (err) {
+    console.error("User deletion cascade hook error:", err);
+  }
+});
 
 module.exports = mongoose.model("User", userSchema);

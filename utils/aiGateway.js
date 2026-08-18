@@ -21,6 +21,46 @@ const { Readable } = require("stream");
 const { selectBestClusterNode, clusterState } = require("./ollamaHelper");
 const { selectBestClusterNodeWithPreemption, registerActiveJob, unregisterActiveJob } = require("./priorityDispatcher");
 
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
+
+// Global API Key Pool Index Trackers for Cloud Providers (Gemini, GLM/NVIDIA, OpenAI)
+const keyPoolIndexes = {
+  gemini: 0,
+  glm: 0,
+  openai: 0
+};
+
+/**
+ * Gets next active API key for a provider from environment pool or node configuration
+ */
+function getProviderApiKey(provider, fallbackNodeKey) {
+  let keysEnv = "";
+  if (provider === "gemini") keysEnv = process.env.GEMINI_API_KEY || "";
+  else if (provider === "glm") keysEnv = process.env.NVIDIA_API_KEY || "";
+  else if (provider === "openai") keysEnv = process.env.OPENAI_API_KEY || "";
+
+  const keys = [
+    ...(fallbackNodeKey && typeof fallbackNodeKey === "string" && !/[\u2022\*]/.test(fallbackNodeKey) ? [fallbackNodeKey] : []),
+    ...keysEnv.split(",").map(k => k.trim())
+  ].filter(k => k && k.length > 5 && !/[\u2022\*]/.test(k));
+
+  const uniqueKeys = [...new Set(keys)];
+  if (uniqueKeys.length === 0) return fallbackNodeKey || "";
+
+  const currentIdx = (keyPoolIndexes[provider] || 0) % uniqueKeys.length;
+  return uniqueKeys[currentIdx];
+}
+
+/**
+ * Rotates API key index for a provider upon 429 Rate Limit or 401 Auth Failure
+ */
+function rotateProviderApiKey(provider) {
+  if (typeof keyPoolIndexes[provider] !== "number") keyPoolIndexes[provider] = 0;
+  keyPoolIndexes[provider]++;
+  console.warn(`🔄 [API KEY ROTATED] Rotated ${provider.toUpperCase()} API key pool to key index #${keyPoolIndexes[provider]}`);
+}
+
 function safeFetch(url, options = {}) {
   return new Promise((resolve, reject) => {
     try {
@@ -39,7 +79,8 @@ function safeFetch(url, options = {}) {
 
       const reqOptions = {
         method: options.method || "GET",
-        headers: reqHeaders
+        headers: reqHeaders,
+        agent: isHttps ? httpsAgent : httpAgent
       };
 
       const req = client.request(parsedUrl, reqOptions, (res) => {
@@ -50,6 +91,10 @@ function safeFetch(url, options = {}) {
           headers: res.headers,
           body: webStream
         });
+      });
+
+      req.setTimeout(3500, () => {
+        req.destroy(new Error("Node connection timeout (3.5s)"));
       });
 
       req.on("error", (err) => reject(err));
@@ -265,12 +310,22 @@ class AIGateway {
     for (const currentPool of poolsHierarchy) {
       if (streamedSuccessfully || (response && response.ok)) break;
 
-      // Filter available non-rate-limited and active candidates in current pool
       let poolCandidates = currentPool.filter(n =>
         !triedNodeIds.has(n.id) &&
         n.status !== "INACTIVE" &&
         !(n.status === "RATE_LIMITED" && n.retryAfter && new Date(n.retryAfter) > now)
       );
+
+      // High Availability Recovery: If all nodes in pool were marked INACTIVE, force-recover active nodes
+      if (poolCandidates.length === 0) {
+        poolCandidates = currentPool.filter(n => !triedNodeIds.has(n.id));
+        poolCandidates.forEach(n => {
+          n.status = "ACTIVE";
+          if (n.id && n.id.length === 24) {
+            ServerNode.findByIdAndUpdate(n.id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null }).catch(() => { });
+          }
+        });
+      }
 
       if (poolCandidates.length === 0) continue;
 
@@ -293,15 +348,16 @@ class AIGateway {
         const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
         const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
-        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash")) {
-          currentModel = "gemini-2.0-flash";
+        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash")) {
+          currentModel = "gemini-2.5-flash";
         }
         if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
           currentModel = "z-ai/glm-5.2";
         }
 
         const nodeUrl = customUrl ? customUrl.trim().replace(/\/$/, "") : currentNode.url;
-        const isCloudOrOpenAI = currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.format === "glm" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("integrate.api.nvidia.com") || currentNode.url.includes("trycloudflare.com");
+        const isOllamaNode = currentNode.format === "ollama" || (!currentNode.format && !currentNode.url.includes("openai.com") && !currentNode.url.includes("googleapis.com") && !currentNode.url.includes("nvidia.com"));
+        const isCloudOrOpenAI = !isOllamaNode && (currentNode.format === "openai" || currentNode.format === "gemini" || currentNode.format === "glm" || currentNode.url.includes("googleapis.com") || currentNode.url.includes("openai.com") || currentNode.url.includes("integrate.api.nvidia.com"));
 
         let currentPath;
         if (isCurrentGemini) {
@@ -314,19 +370,13 @@ class AIGateway {
           currentPath = "/api/chat";
         }
 
-        let resolvedApiKey = currentNode.secretKey;
-        if (!resolvedApiKey || typeof resolvedApiKey !== "string" || !resolvedApiKey.trim() || /[\u2022\*]/.test(resolvedApiKey)) {
-          if (isCurrentGemini) {
-            resolvedApiKey = process.env.GEMINI_API_KEY || "";
-          } else if (isCurrentGLM) {
-            resolvedApiKey = process.env.NVIDIA_API_KEY || "";
-          } else if (currentNode.format === "openai" || currentNode.url.includes("openai.com")) {
-            resolvedApiKey = process.env.OPENAI_API_KEY || "";
-          }
-        }
+        const providerName = isCurrentGemini ? "gemini" : isCurrentGLM ? "glm" : (currentNode.format === "openai" || currentNode.url.includes("openai.com")) ? "openai" : "";
+        let resolvedApiKey = getProviderApiKey(providerName, currentNode.secretKey);
 
-        if (isCloudOrOpenAI && (!resolvedApiKey || !resolvedApiKey.trim())) {
-          console.warn(`⚠️ [AI GATEWAY DISPATCH SKIPPED] Cloud node ${currentNode.name} (${currentNode.format}) has no API Key configured. Rotating to next pool...`);
+        const isOfficialCloudService = currentNode.url.includes("api.openai.com") || currentNode.url.includes("googleapis.com") || currentNode.url.includes("integrate.api.nvidia.com");
+
+        if (isOfficialCloudService && (!resolvedApiKey || !resolvedApiKey.trim())) {
+          console.warn(`⚠️ [AI GATEWAY DISPATCH SKIPPED] Official cloud node ${currentNode.name} (${currentNode.format}) has no API Key configured. Rotating to next pool...`);
           currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
           continue;
         }
@@ -338,7 +388,7 @@ class AIGateway {
         }
 
         const targetFetchUrl = isCurrentGemini
-          ? "https://generativelanguage.googleapis.com/v1beta/chat/completions"
+          ? (nodeUrl.includes("/openai") ? `${nodeUrl}/chat/completions` : "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
           : `${nodeUrl}${currentPath}`;
 
         registerActiveJob(activeJobId, {
@@ -349,11 +399,13 @@ class AIGateway {
           abortController
         });
 
-        // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM
+        // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM / Local Ollama
         const modelsToTry = isCurrentGemini
-          ? ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+          ? ["gemini-2.5-flash"]
           : isCurrentGLM
-          ? ["z-ai/glm-5.2", currentModel]
+          ? [currentModel && currentModel !== "z-ai/glm-5.2" ? currentModel : "z-ai/glm-5.2", "meta/llama-3.3-70b-instruct"]
+          : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
+          ? Array.from(new Set([currentModel, "models/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2", "gemma:2b"])).filter(Boolean)
           : [currentModel];
 
         let modelSuccess = false;
@@ -362,11 +414,24 @@ class AIGateway {
         // Local Models: System Prompt + RAG + Recent Messages (NO Summary)
         // Cloud Models: System Prompt + RAG + Recent Messages + Rolling Summary
         const isLocal = isLocalNodeOrProvider(currentNode);
-        const providerMessages = buildProviderAwareContextPayload({
+        let providerMessages = buildProviderAwareContextPayload({
           messages,
           conversationSummary,
           isLocal
         });
+
+        // Gemini OpenAI compatibility endpoint obeys system instructions best when prepended to user prompt
+        if (isCurrentGemini) {
+          const sysMsg = providerMessages.find(m => m.role === "system");
+          const userMsgs = providerMessages.filter(m => m.role !== "system");
+          if (sysMsg && userMsgs.length > 0) {
+            const firstUser = userMsgs.find(m => m.role === "user");
+            if (firstUser) {
+              firstUser.content = `Instruction: ${sysMsg.content}\n\nUser Question: ${firstUser.content}`;
+            }
+            providerMessages = userMsgs;
+          }
+        }
 
         for (const candidateModel of modelsToTry) {
           const payload = { model: candidateModel, messages: providerMessages, stream: true };
@@ -408,9 +473,11 @@ class AIGateway {
               }
 
               break; // Model success! Exit candidate model loop
-            } else if (response.status === 429) {
-              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP 429 Quota Limit. Rotating to next cluster node...`);
-              errorMessage = `Provider API Rate Limit Exceeded (HTTP 429) on ${currentNode.name}.`;
+            } else if (response.status === 429 || response.status === 401) {
+              const provType = isCurrentGemini ? "gemini" : isCurrentGLM ? "glm" : "openai";
+              rotateProviderApiKey(provType);
+              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP ${response.status}. Rotated API key pool & moving to next cluster node...`);
+              errorMessage = `Provider API Rate Limit Exceeded (HTTP ${response.status}) on ${currentNode.name}.`;
               currentNode.status = "RATE_LIMITED";
               currentNode.retryAfter = new Date(Date.now() + 60 * 1000);
               break; // Key rate limited! Break model loop to rotate to NEXT cluster node immediately
@@ -526,18 +593,16 @@ class AIGateway {
 
     if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
       console.warn("⚠️ [AI GATEWAY FALLBACK] Cluster node streaming yielded empty text. Attempting direct Cloud AI Provider fallbacks...");
-      if (process.env.GEMINI_API_KEY) {
-        try {
-          const cloudRes = await this._streamCloudGemini({ model, messages, conversationSummary, res, onToken });
-          if (cloudRes && cloudRes.text) {
-            accumulatedResponseText = cloudRes.text;
-            streamedSuccessfully = true;
-          }
-        } catch (fErr) {
-          console.warn("Direct Gemini fallback notice:", fErr.message);
+      try {
+        const cloudRes = await this._streamCloudGemini({ model, messages, conversationSummary, res, onToken });
+        if (cloudRes && cloudRes.text) {
+          accumulatedResponseText = cloudRes.text;
+          streamedSuccessfully = true;
         }
+      } catch (fErr) {
+        console.warn("Direct Gemini fallback notice:", fErr.message);
       }
-      if ((!accumulatedResponseText || !accumulatedResponseText.trim()) && process.env.NVIDIA_API_KEY) {
+      if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
         try {
           const cloudRes = await this._streamCloudGLM({ model, messages, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
@@ -548,7 +613,7 @@ class AIGateway {
           console.warn("Direct GLM fallback notice:", fErr.message);
         }
       }
-      if ((!accumulatedResponseText || !accumulatedResponseText.trim()) && process.env.OPENAI_API_KEY) {
+      if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
         try {
           const cloudRes = await this._streamCloudOpenAI({ model, messages, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
@@ -625,11 +690,18 @@ class AIGateway {
       });
     } catch (e) {}
 
+    const { decrypt } = require("./encryption");
     const candidateApiKeys = [...new Set([
       secretKey,
       process.env.GEMINI_API_KEY,
       geminiNode?.secretKey,
-      ...geminiNodes.map(n => n.secretKey)
+      ...geminiNodes.map(n => {
+        try {
+          return n.secretKey ? decrypt(n.secretKey) : "";
+        } catch (e) {
+          return n.secretKey;
+        }
+      })
     ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
 
     if (candidateApiKeys.length === 0) {
@@ -639,38 +711,31 @@ class AIGateway {
     const axios = require("axios");
     const streamBuffer = new ActionStreamBuffer(res, onToken);
 
-    const providerMessages = buildProviderAwareContextPayload({
-      messages,
-      conversationSummary,
-      isLocal: false
-    });
-
-    const candidateModels = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"];
+    const candidateModels = ["gemini-2.5-flash"];
 
     for (const gKey of candidateApiKeys) {
       for (const gModel of candidateModels) {
         try {
-          const fetchUrl = "https://generativelanguage.googleapis.com/v1beta/chat/completions";
-          const payload = {
-            model: gModel,
-            messages: providerMessages.map(m => ({
-              role: m.role === "assistant" ? "assistant" : m.role === "system" ? "system" : "user",
-              content: String(m.content || "")
-            })),
-            stream: false
-          };
+          const sysMsg = messages.find(m => m.role === "system")?.content || "";
+          const userMsg = [...messages].reverse().find(m => m.role === "user")?.content || "";
+          const combinedPrompt = (sysMsg && sysMsg.includes("BOT RULES")) ? `${sysMsg}\n\nUser Request: ${userMsg}` : userMsg;
 
-          const response = await axios.post(fetchUrl, payload, {
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${gKey}`
+          const response = await axios.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/${gModel}:generateContent?key=${gKey}`,
+            {
+              contents: [
+                { parts: [{ text: combinedPrompt }] }
+              ]
             },
-            timeout: 20000
-          });
+            {
+              headers: { "Content-Type": "application/json" },
+              timeout: 15000
+            }
+          );
 
-          const responseText = response.data?.choices?.[0]?.message?.content || "";
-          if (responseText && responseText.trim()) {
-            streamBuffer.push(responseText.trim());
+          const responseText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+          if (responseText) {
+            streamBuffer.push(responseText);
             streamBuffer.flush();
             return { success: true, text: streamBuffer.cleanText };
           }
