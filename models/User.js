@@ -74,6 +74,16 @@ const userSchema = new mongoose.Schema(
       default: "",
     },
 
+    audioUrl: {
+      type: String,
+      default: "",
+    },
+
+    voiceUrl: {
+      type: String,
+      default: "",
+    },
+
     botName: {
       type: String,
       default: "",

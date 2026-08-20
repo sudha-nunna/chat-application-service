@@ -91,7 +91,33 @@ function generateEmbeddingVector(text) {
   return vector;
 }
 
-const embeddingCache = new Map();
+class BoundedMap {
+  constructor(maxSize = 500) {
+    this.maxSize = maxSize;
+    this.map = new Map();
+  }
+  get(key) {
+    if (!this.map.has(key)) return undefined;
+    const value = this.map.get(key);
+    this.map.delete(key);
+    this.map.set(key, value);
+    return value;
+  }
+  set(key, value) {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.maxSize) {
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey !== undefined) this.map.delete(oldestKey);
+    }
+    this.map.set(key, value);
+  }
+  has(key) {
+    return this.map.has(key);
+  }
+}
+
+const embeddingCache = new BoundedMap(500);
 
 /**
  * Generates high-density semantic vector embeddings via Ollama nomic-embed-text API.
@@ -520,6 +546,19 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
     }
   }
 
+  // 1. High-Speed Redis Query Caching Check (< 5ms response)
+  const { getCache, setCache } = require("./redisClient");
+  const crypto = require("crypto");
+  const queryHash = crypto.createHash("md5").update(`${targetBotId || "global"}_${(queryText || "").trim().toLowerCase()}`).digest("hex");
+  const cacheKey = `rag:cache:${targetBotId || "global"}:${queryHash}`;
+
+  try {
+    const cachedResult = await getCache(cacheKey);
+    if (cachedResult && typeof cachedResult === "object" && cachedResult.isFound !== undefined) {
+      return cachedResult;
+    }
+  } catch (cErr) {}
+
   let filter = { botId: targetBotId };
   if (targetBotId && mongoose.Types.ObjectId.isValid(targetBotId)) {
     const Bot = require("../models/Bot");
@@ -547,24 +586,43 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
     }
   }
 
-  const rawChunks = await BotChunk.find(filter).populate("fileId", "fileName fileType fileCategory");
-  const chunks = (rawChunks || []).filter(c => c.fileId && (!c.fileId.fileCategory || c.fileId.fileCategory === "knowledge"));
+  const queryTokens = tokenize(queryText);
+
+  // 2. Stage 1: Candidate Chunk Prefiltering (Indexed Search Optimization)
+  let chunks = [];
+  if (queryTokens.length > 0) {
+    const candidateFilter = { ...filter, keywords: { $in: queryTokens } };
+    const candidateChunks = await BotChunk.find(candidateFilter)
+      .limit(40)
+      .populate("fileId", "fileName fileType fileCategory");
+    chunks = (candidateChunks || []).filter(c => c.fileId && (!c.fileId.fileCategory || c.fileId.fileCategory === "knowledge"));
+  }
+
+  // Fallback: If keyword prefiltering yields fewer than 5 candidates, pull default bot chunks up to limit(100)
+  if (!chunks || chunks.length < 5) {
+    const rawChunks = await BotChunk.find(filter)
+      .limit(100)
+      .populate("fileId", "fileName fileType fileCategory");
+    chunks = (rawChunks || []).filter(c => c.fileId && (!c.fileId.fileCategory || c.fileId.fileCategory === "knowledge"));
+  }
 
   if (!chunks || chunks.length === 0) {
-    return {
+    const emptyRes = {
       isFound: false,
       chunks: [],
       reason: "NO_DOCUMENTS"
     };
+    try { await setCache(cacheKey, emptyRes, 300); } catch (e) {}
+    return emptyRes;
   }
 
   const queryVector = await generateEmbeddingVectorAsync(queryText);
-  const queryTokens = tokenize(queryText);
   const isOverview = isKnowledgeOverviewQuestion(queryText);
   const isDiscovery = isKnowledgeDiscoveryQuestion(queryText);
   const metadataMatch = Boolean(botMetadata && matchQueryToMetadata(queryText, botMetadata));
   const scoredChunks = [];
 
+  // Stage 2: Cosine Similarity Scoring ONLY on candidate chunks
   const chunkEmbeddings = await BotEmbedding.find({ chunkId: { $in: chunks.map(c => c._id) } });
   const embeddingMap = new Map(chunkEmbeddings.map(e => [String(e.chunkId), e.embedding]));
 
@@ -622,8 +680,9 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
 
   const accepted = !!best && (similarityAccepted || lexicalAccepted || scoreAccepted || metadataRescue);
 
+  let finalResult;
   if (!accepted) {
-    return {
+    finalResult = {
       isFound: false,
       chunks: [],
       reason: metadataMatch ? "METADATA_MATCH_BUT_LOW_RELEVANCE" : (hasRelevantToken ? "LOW_RELEVANCE" : "UNGROUNDED_TOPIC_MISSING_KEYWORDS"),
@@ -638,21 +697,26 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
         topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
       }
     };
+  } else {
+    finalResult = {
+      isFound: true,
+      chunks: topScored,
+      metadataMatch,
+      debug: {
+        queryText,
+        queryTokens,
+        isOverview,
+        isDiscovery,
+        metadataMatch,
+        topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
+      }
+    };
   }
 
-  return {
-    isFound: true,
-    chunks: topScored,
-    metadataMatch,
-    debug: {
-      queryText,
-      queryTokens,
-      isOverview,
-      isDiscovery,
-      metadataMatch,
-      topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
-    }
-  };
+  // Cache grounded RAG result in Redis for 10 minutes (600s)
+  try { await setCache(cacheKey, finalResult, 600); } catch (e) {}
+
+  return finalResult;
 }
 
 function generateConversationalResponse(intent, message, history = [], chunks = [], bot = {}) {

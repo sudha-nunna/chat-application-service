@@ -348,8 +348,8 @@ class AIGateway {
         const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
         const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
-        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash")) {
-          currentModel = "gemini-2.5-flash";
+        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash" || currentModel === "gemini-2.5-flash")) {
+          currentModel = "gemini-1.5-flash";
         }
         if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
           currentModel = "z-ai/glm-5.2";
@@ -401,7 +401,7 @@ class AIGateway {
 
         // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM / Local Ollama
         const modelsToTry = isCurrentGemini
-          ? ["gemini-2.5-flash"]
+          ? ["gemini-1.5-flash", "gemini-2.0-flash"]
           : isCurrentGLM
           ? [currentModel && currentModel !== "z-ai/glm-5.2" ? currentModel : "z-ai/glm-5.2", "meta/llama-3.3-70b-instruct"]
           : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
@@ -425,11 +425,13 @@ class AIGateway {
           const sysMsg = providerMessages.find(m => m.role === "system");
           const userMsgs = providerMessages.filter(m => m.role !== "system");
           if (sysMsg && userMsgs.length > 0) {
-            const firstUser = userMsgs.find(m => m.role === "user");
-            if (firstUser) {
-              firstUser.content = `Instruction: ${sysMsg.content}\n\nUser Question: ${firstUser.content}`;
-            }
-            providerMessages = userMsgs;
+            const sysContent = sysMsg.content;
+            providerMessages = userMsgs.map((m, idx) => {
+              if (idx === 0 && m.role === "user") {
+                return { role: "user", content: `Instruction: ${sysContent}\n\nUser Question: ${m.content}` };
+              }
+              return { role: m.role, content: m.content };
+            });
           }
         }
 
@@ -708,44 +710,52 @@ class AIGateway {
       throw new Error("Gemini API Key is missing. Please configure GEMINI_API_KEY or add a Gemini Server Node.");
     }
 
-    const axios = require("axios");
     const streamBuffer = new ActionStreamBuffer(res, onToken);
+    const candidateModels = ["gemini-1.5-flash", "gemini-2.0-flash"];
 
-    const candidateModels = ["gemini-2.5-flash"];
+    const { GoogleGenAI } = require("@google/genai");
 
     for (const gKey of candidateApiKeys) {
       for (const gModel of candidateModels) {
         try {
           const sysMsg = messages.find(m => m.role === "system")?.content || "";
-          const userMsg = [...messages].reverse().find(m => m.role === "user")?.content || "";
-          const combinedPrompt = (sysMsg && sysMsg.includes("BOT RULES")) ? `${sysMsg}\n\nUser Request: ${userMsg}` : userMsg;
+          const userMsgs = messages.filter(m => m.role !== "system");
 
-          const response = await axios.post(
-            `https://generativelanguage.googleapis.com/v1beta/models/${gModel}:generateContent?key=${gKey}`,
-            {
-              contents: [
-                { parts: [{ text: combinedPrompt }] }
-              ]
-            },
-            {
-              headers: { "Content-Type": "application/json" },
-              timeout: 15000
+          const contentsPayload = userMsgs.map(m => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.content || "" }]
+          }));
+
+          if (contentsPayload.length === 0) {
+            const userMsg = [...messages].reverse().find(m => m.role === "user")?.content || "Hello";
+            contentsPayload.push({ role: "user", parts: [{ text: userMsg }] });
+          }
+
+          const ai = new GoogleGenAI({ apiKey: gKey });
+          const responseStream = await ai.models.generateContentStream({
+            model: gModel,
+            contents: contentsPayload,
+            config: sysMsg ? { systemInstruction: sysMsg } : undefined
+          });
+
+          for await (const chunk of responseStream) {
+            const chunkText = chunk.text || "";
+            if (chunkText) {
+              streamBuffer.push(chunkText);
             }
-          );
+          }
+          streamBuffer.flush();
 
-          const responseText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-          if (responseText) {
-            streamBuffer.push(responseText);
-            streamBuffer.flush();
+          if (streamBuffer.cleanText && streamBuffer.cleanText.trim()) {
             return { success: true, text: streamBuffer.cleanText };
           }
         } catch (apiErr) {
-          const errStatus = apiErr.response?.status;
-          if (errStatus === 429) {
+          const errStatus = apiErr.status || apiErr.response?.status;
+          if (errStatus === 429 || apiErr.message?.includes("429")) {
             console.warn(`⚠️ [CLOUD GEMINI KEY RATE LIMIT] Key starting with '${gKey.substring(0, 6)}...' hit 429 Quota Limit. Rotating to next API key...`);
             break;
           } else {
-            console.warn(`Gemini cloud model ${gModel} notice:`, apiErr.response?.data?.error?.message || apiErr.message);
+            console.warn(`Gemini cloud model ${gModel} notice:`, apiErr.message || apiErr);
           }
         }
       }

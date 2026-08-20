@@ -1,8 +1,0 @@
-fastapi>=0.100.0
-uvicorn>=0.20.0
-soundfile>=0.12.0
-gTTS>=2.5.0
-pydub>=0.25.1
-python-multipart>=0.0.6
-static-ffmpeg>=2.0.0
-imageio-ffmpeg>=0.4.9

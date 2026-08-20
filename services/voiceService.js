@@ -187,10 +187,12 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
   let relativeUrl = "";
   let fullAudioUrl = "";
 
-  const VOICE_ENGINE_URL = process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
-  const targetEngine = "OPENVOICE";
-  const primaryEndpoint = "/openvoice-clone";
-  const secondaryEndpoint = "/clone-tts";
+  const VOICE_ENGINE_URL = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
+  const F5_TTS_API_KEY = process.env.F5_TTS_API_KEY || "";
+  const activeEngineSetting = (process.env.VOICE_CLONE_ENGINE || options.engine || "F5").toString().toUpperCase();
+  const targetEngine = (activeEngineSetting === "F5" || activeEngineSetting === "F5TTS") ? "F5" : "OPENVOICE";
+  const primaryEndpoint = targetEngine === "F5" ? "/tts" : "/openvoice-clone";
+  const secondaryEndpoint = "/f5-clone";
 
   if (userAudioBuffer && userAudioBuffer.length > 0) {
     try {
@@ -223,15 +225,15 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
       const form = new FormData();
       
       let cleanText = text.replace(/[*_#`~]/g, " ").trim();
-      if (cleanText.length > 200) {
+      if (cleanText.length > 400) {
         const sentences = cleanText.match(/[^.!?]+[.!?]+/g);
         if (sentences && sentences.length > 0) {
-          cleanText = sentences.slice(0, 2).join(" ").trim();
-          if (cleanText.length > 220) {
-            cleanText = cleanText.substring(0, 200).trim() + ".";
+          cleanText = sentences.slice(0, 4).join(" ").trim();
+          if (cleanText.length > 420) {
+            cleanText = cleanText.substring(0, 400).trim() + ".";
           }
         } else {
-          cleanText = cleanText.substring(0, 200).trim() + ".";
+          cleanText = cleanText.substring(0, 400).trim() + ".";
         }
       }
 
@@ -243,29 +245,37 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
       let clonedRes = null;
       let engineUsed = targetEngine;
 
-      console.log(`🎤 [VOICE CLONING] Requesting speech synthesis via Python engine (${primaryEndpoint})...`);
+      const headers = form.getHeaders();
+      headers["ngrok-skip-browser-warning"] = "true";
+      headers["Bypass-Tunnel-Remainder"] = "true";
+      if (F5_TTS_API_KEY) {
+        headers["Authorization"] = `Bearer ${F5_TTS_API_KEY}`;
+      }
+
+      console.log(`🎤 [VOICE CLONING (${targetEngine}-TTS)] Requesting speech synthesis via F5-TTS Server (${VOICE_ENGINE_URL}${primaryEndpoint})...`);
 
       try {
-        clonedRes = await axios.post(`${VOICE_ENGINE_URL}${primaryEndpoint}`, form, {
-          headers: form.getHeaders(),
+        clonedRes = await axios.post(`${VOICE_ENGINE_URL.replace(/\/$/, "")}${primaryEndpoint}`, form, {
+          headers: headers,
           responseType: "arraybuffer",
-          timeout: 2500
+          timeout: 15000
         });
       } catch (primaryErr) {
-        console.warn(`Notice: Primary Voice Engine (${primaryEndpoint}) notice (${primaryErr.message}), trying secondary endpoint (${secondaryEndpoint})...`);
+        console.warn(`Notice: Primary F5-TTS Engine (${primaryEndpoint}) notice (${primaryErr.message}), trying secondary endpoint (${secondaryEndpoint})...`);
         try {
-          clonedRes = await axios.post(`${VOICE_ENGINE_URL}${secondaryEndpoint}`, form, {
-            headers: form.getHeaders(),
+          clonedRes = await axios.post(`${VOICE_ENGINE_URL.replace(/\/$/, "")}${secondaryEndpoint}`, form, {
+            headers: headers,
             responseType: "arraybuffer",
-            timeout: 2500
+            timeout: 15000
           });
-          engineUsed = targetEngine === "OPENVOICE" ? "F5" : "OPENVOICE";
         } catch (secondaryErr) {
-          // Fallback legacy route check
-          clonedRes = await axios.post(`${VOICE_ENGINE_URL}/clone-tts`, form, {
-            headers: form.getHeaders(),
+          if (targetEngine === "F5" && process.env.ENABLE_EDGE_FALLBACK !== "true") {
+            throw new Error(`F5-TTS Inference Server unavailable at ${VOICE_ENGINE_URL}: ${secondaryErr.message}`);
+          }
+          clonedRes = await axios.post(`${VOICE_ENGINE_URL.replace(/\/$/, "")}/clone-tts`, form, {
+            headers: headers,
             responseType: "arraybuffer",
-            timeout: 2500
+            timeout: 15000
           });
         }
       }
@@ -275,11 +285,15 @@ async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "
         const audioBuffer = Buffer.from(clonedRes.data);
         const crypto = require("crypto");
         const fileHash = crypto.randomBytes(8).toString("hex");
-        const fileName = `cloned_speech_${Date.now()}_${fileHash}.mp3`;
+        const headerHex = audioBuffer.length >= 4 ? audioBuffer.slice(0, 4).toString("hex").toLowerCase() : "";
+        const isWav = targetEngine === "F5" || headerHex.startsWith("52494646");
+        const audioExt = isWav ? "wav" : "mp3";
+        const mimeType = isWav ? "audio/wav" : "audio/mp3";
+        const fileName = `cloned_speech_${Date.now()}_${fileHash}.${audioExt}`;
 
         const mediaAsset = await MediaAsset.create({
           filename: fileName,
-          contentType: "audio/mp3",
+          contentType: mimeType,
           data: audioBuffer,
           size: audioBuffer.length,
           type: "SPEECH_AUDIO",

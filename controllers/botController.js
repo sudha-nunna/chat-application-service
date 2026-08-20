@@ -1450,32 +1450,19 @@ exports.sendBotChatMessage = async (req, res) => {
     const User = require("../models/User");
 
     const userId = req.user?.id || req.user?._id;
-    const userDoc = userId ? await User.findById(userId) : null;
-    const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
-    
-    // Check if user has enough credits
-    if (userDoc && userDoc.credits <= 0) {
-      if (!res.headersSent) {
-        if (isStreamRequested) {
-          res.write(`event: metadata\ndata: ${JSON.stringify({ type: "error", message: "You have run out of credits. Please purchase a credit package to continue." })}\n\n`);
-          res.write("event: done\ndata: [DONE]\n\n");
-          return res.end();
-        } else {
-          return res.status(402).json({ 
-            success: false, 
-            error: "You have run out of credits. Please purchase a credit package to continue chatting." 
-          });
-        }
-      } else {
-        if (isStreamRequested) {
-          res.write(`event: metadata\ndata: ${JSON.stringify({ type: "error", message: "You have run out of credits. Please purchase a credit package to continue." })}\n\n`);
-          res.write("event: done\ndata: [DONE]\n\n");
-        }
-        return res.end();
+    let userPlan = req.user?.plan || req.headers["x-user-plan"];
+
+    if (!userPlan && userId) {
+      const planCacheKey = `user:plan:${userId}`;
+      userPlan = await getCache(planCacheKey);
+      if (!userPlan) {
+        const userDoc = await User.findById(userId).select("plan").lean();
+        userPlan = userDoc?.plan || "free";
+        await setCache(planCacheKey, userPlan, 900);
       }
     }
 
-    const userPriority = await calculatePriority(userPlan);
+    const userPriority = await calculatePriority(userPlan || "free");
 
     const jobId = `bot_${botId}_${Date.now()}`;
     const targetModel = bot.model || "best";
@@ -2026,6 +2013,7 @@ exports.uploadBotAvatar = async (req, res) => {
 /**
  * Stream binary media asset from MongoDB MediaAsset collection
  * Endpoint: GET /bots/media/:assetId
+ * Supports HTTP 206 Range Requests for HTML5 Audio & Video Players (Chrome, Edge, Safari, iOS)
  */
 exports.streamMediaAsset = async (req, res) => {
   try {
@@ -2036,13 +2024,49 @@ exports.streamMediaAsset = async (req, res) => {
       return res.status(400).json({ error: "Invalid media asset ID format." });
     }
 
-    const asset = await MediaAsset.findById(assetId).select("data contentType size isTransient").lean();
+    const asset = await MediaAsset.findById(assetId).catch(() => null);
     if (!asset || !asset.data) {
       return res.status(404).json({ error: "Media asset not found." });
     }
 
-    res.set("Content-Type", asset.contentType || "audio/wav");
-    res.set("Content-Length", asset.size || asset.data.length);
+    // Convert BSON Binary / MongoDB Object to true Node.js Buffer
+    let buffer = asset.data;
+    if (!Buffer.isBuffer(buffer)) {
+      if (buffer.buffer) buffer = Buffer.from(buffer.buffer);
+      else if (buffer.data) buffer = Buffer.from(buffer.data);
+      else buffer = Buffer.from(buffer);
+    }
+
+    if (!buffer || buffer.length === 0) {
+      return res.status(404).json({ error: "Media asset data is empty." });
+    }
+
+    // Auto-detect MIME type from audio/image binary magic numbers if missing or generic
+    let mimeType = asset.contentType || "audio/wav";
+    if (buffer.length > 4) {
+      const hex = buffer.slice(0, 8).toString("hex").toLowerCase();
+      const str = buffer.slice(0, 12).toString("utf8");
+      if (hex.startsWith("494433") || hex.startsWith("fffb") || hex.startsWith("fffe") || hex.startsWith("fffa")) {
+        mimeType = "audio/mp3";
+      } else if (hex.startsWith("1a45dfa3")) {
+        mimeType = "audio/webm";
+      } else if (hex.startsWith("4f676753")) {
+        mimeType = "audio/ogg";
+      } else if (str.startsWith("RIFF")) {
+        mimeType = "audio/wav";
+      } else if (hex.includes("66747970") || str.includes("ftyp")) {
+        mimeType = "audio/mp4";
+      } else if (hex.startsWith("89504e47")) {
+        mimeType = "image/png";
+      } else if (hex.startsWith("ffd8ffe0") || hex.startsWith("ffd8ffe1") || hex.startsWith("ffd8ffe2")) {
+        mimeType = "image/jpeg";
+      }
+    }
+
+    const totalSize = buffer.length;
+    res.set("Accept-Ranges", "bytes");
+    res.set("Content-Type", mimeType);
+    res.set("Content-Disposition", `inline; filename="${asset.filename || 'media'}"`);
 
     if (asset.isTransient) {
       res.set("Cache-Control", "public, max-age=86400");
@@ -2050,7 +2074,29 @@ exports.streamMediaAsset = async (req, res) => {
       res.set("Cache-Control", "public, max-age=31536000, immutable");
     }
 
-    return res.send(asset.data);
+    // Support HTTP Range Requests for HTML5 Audio/Video Players
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+
+      if (start >= totalSize || end >= totalSize) {
+        res.set("Content-Range", `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+
+      const chunkSize = (end - start) + 1;
+      const subBuffer = buffer.slice(start, end + 1);
+
+      res.status(206);
+      res.set("Content-Range", `bytes ${start}-${end}/${totalSize}`);
+      res.set("Content-Length", chunkSize);
+      return res.end(subBuffer);
+    } else {
+      res.set("Content-Length", totalSize);
+      return res.end(buffer);
+    }
   } catch (err) {
     console.error("Stream Media Asset error:", err);
     return res.status(500).json({ error: "Failed to stream media asset." });

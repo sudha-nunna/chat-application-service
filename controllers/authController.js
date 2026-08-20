@@ -33,6 +33,8 @@ exports.googleAuth = async (req, res) => {
     }
 
     const { email, name, picture } = payload;
+    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com"];
+    const isSuperAdmin = email && SUPER_ADMIN_EMAILS.includes(email.toLowerCase().trim());
     let user = await User.findOne({ email });
 
     if (!user) {
@@ -42,12 +44,14 @@ exports.googleAuth = async (req, res) => {
         password: undefined,
         profilePic: picture || "",
         authType: "google",
+        role: isSuperAdmin ? "admin" : "user",
       });
     } else {
       const updates = {};
       if (!user.name && name) updates.name = name;
       if (!user.profilePic && picture) updates.profilePic = picture;
       if (!user.authType) updates.authType = "google";
+      if (isSuperAdmin && user.role !== "admin") updates.role = "admin";
 
       if (Object.keys(updates).length > 0) {
         user = await User.findByIdAndUpdate(user._id, updates, { new: true });
@@ -67,6 +71,8 @@ exports.googleAuth = async (req, res) => {
     );
     const isVoiceSetup = Boolean(user.voiceSampleId || user.voiceSampleUrl);
     const isProfileSetup = Boolean(isAvatarSetup && isVoiceSetup);
+    const activeVoiceUrl = user.voiceSampleUrl || "";
+    const activeVoiceId = user.voiceSampleId || null;
 
     res.json({
       success: true,
@@ -78,6 +84,7 @@ exports.googleAuth = async (req, res) => {
         profilePic: user.profilePic,
         avatarUrl: user.avatarUrl || user.profilePic || "",
         avatarImageId: user.avatarImageId || null,
+        botName: user.botName || "",
         plan: user.plan,
         isProfileSetup,
         isAvatarSetup,
@@ -86,8 +93,8 @@ exports.googleAuth = async (req, res) => {
         hasVoice: isVoiceSetup,
         isAvatarUploaded: isAvatarSetup,
         isVoiceUploaded: isVoiceSetup,
-        voiceSampleId: user.voiceSampleId,
-        voiceSampleUrl: user.voiceSampleUrl
+        voiceSampleId: activeVoiceId,
+        voiceSampleUrl: activeVoiceUrl
       },
     });
   } catch (error) {
@@ -179,8 +186,10 @@ exports.googleAuthCallback = async (req, res) => {
       user.avatarUrl ||
       (user.profilePic && !user.profilePic.includes("googleusercontent"))
     );
-    const isVoiceSetup = Boolean(user.voiceSampleId || user.voiceSampleUrl);
+    const isVoiceSetup = Boolean(user.voiceSampleId || user.voiceSampleUrl || user.audioUrl);
     const isProfileSetup = Boolean(isAvatarSetup && isVoiceSetup);
+    const activeVoiceUrl = user.voiceSampleUrl || user.audioUrl || user.voiceUrl || "";
+    const activeVoiceId = user.voiceSampleId || null;
 
     res.json({
       success: true,
@@ -192,6 +201,7 @@ exports.googleAuthCallback = async (req, res) => {
         profilePic: user.profilePic,
         avatarUrl: user.avatarUrl || user.profilePic || "",
         avatarImageId: user.avatarImageId || null,
+        botName: user.botName || "",
         plan: user.plan,
         isProfileSetup,
         isAvatarSetup,
@@ -200,8 +210,13 @@ exports.googleAuthCallback = async (req, res) => {
         hasVoice: isVoiceSetup,
         isAvatarUploaded: isAvatarSetup,
         isVoiceUploaded: isVoiceSetup,
-        voiceSampleId: user.voiceSampleId,
-        voiceSampleUrl: user.voiceSampleUrl
+        voiceSampleId: activeVoiceId,
+        audioId: activeVoiceId,
+        voiceId: activeVoiceId,
+        voiceSampleUrl: activeVoiceUrl,
+        audioUrl: activeVoiceUrl,
+        voiceUrl: activeVoiceUrl,
+        audioSampleUrl: activeVoiceUrl
       },
     });
   } catch (error) {
@@ -339,6 +354,12 @@ exports.uploadVoiceSample = async (req, res) => {
       if (redis && redis.status === "ready") {
         await delCache(`avatar:voice:${userId}`);
         await delCache(`user:${userId}`);
+        await delCache(`user:${userId}:voice_samples`);
+        await delCache(`user:${userId}:active_voice_asset_id`);
+        const keys = await redis.keys("avatar:tts:*").catch(() => []);
+        if (keys.length > 0) {
+          await redis.del(keys).catch(() => {});
+        }
       }
     }
 
@@ -371,7 +392,7 @@ exports.uploadVoiceSample = async (req, res) => {
     }
 
     const currentUser = await User.findById(userId);
-    const hasExistingVoice = Boolean(currentUser?.voiceSampleId || currentUser?.voiceSampleUrl);
+    const hasExistingVoice = Boolean(currentUser?.voiceSampleId || currentUser?.voiceSampleUrl || currentUser?.audioUrl);
     const hasExistingAvatar = Boolean(currentUser?.avatarImageId || (currentUser?.profilePic && !currentUser.profilePic.includes("googleusercontent")));
 
     const hasNewAvatar = Boolean(avatarBuffer && avatarBuffer.length > 0);
@@ -397,16 +418,21 @@ exports.uploadVoiceSample = async (req, res) => {
       });
     }
 
+    const activeVoiceUrl = voiceSampleAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${voiceSampleAsset._id}` : (updatedUser?.voiceSampleUrl || "");
+    const activeVoiceId = voiceSampleAsset?._id || updatedUser?.voiceSampleId || null;
+    const activeAvatarUrl = updatedUser?.avatarUrl || updatedUser?.profilePic || "";
+    const activeAvatarId = avatarImageAsset?._id || updatedUser?.avatarImageId || null;
+
     if (!isBothAvailable) {
       return res.json({
         success: true,
         message: !finalAvatarAvailable
           ? "Voice sample saved successfully. An avatar photo image is still required to complete your profile setup."
           : "Avatar photo image saved successfully. A voice sample recording is still required to complete your profile setup.",
-        voiceSampleId: voiceSampleAsset?._id || updatedUser?.voiceSampleId || null,
-        voiceSampleUrl: voiceSampleAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${voiceSampleAsset._id}` : (updatedUser?.voiceSampleUrl || ""),
-        avatarId: avatarImageAsset?._id || updatedUser?.avatarImageId || null,
-        avatarUrl: updatedUser?.avatarUrl || updatedUser?.profilePic || "",
+        voiceSampleId: activeVoiceId,
+        voiceSampleUrl: activeVoiceUrl,
+        avatarId: activeAvatarId,
+        avatarUrl: activeAvatarUrl,
         relativeUrl: voiceSampleAsset ? `/bots/media/${voiceSampleAsset._id}` : (avatarImageAsset ? `/bots/media/${avatarImageAsset._id}` : ""),
         isProfileSetup: false,
         isAvatarSetup: finalAvatarAvailable,
@@ -421,6 +447,11 @@ exports.uploadVoiceSample = async (req, res) => {
         },
         user: {
           ...(updatedUser ? updatedUser.toObject() : {}),
+          botName: updatedUser?.botName || agentCustomName || "",
+          voiceSampleUrl: activeVoiceUrl,
+          voiceSampleId: activeVoiceId,
+          avatarId: activeAvatarId,
+          avatarUrl: activeAvatarUrl,
           isProfileSetup: false,
           isAvatarSetup: finalAvatarAvailable,
           isVoiceSetup: finalVoiceAvailable,
@@ -444,10 +475,10 @@ exports.uploadVoiceSample = async (req, res) => {
     return res.json({
       success: true,
       message: statusMsg,
-      voiceSampleId: voiceSampleAsset?._id || updatedUser?.voiceSampleId || null,
-      voiceSampleUrl: voiceSampleAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${voiceSampleAsset._id}` : (updatedUser?.voiceSampleUrl || ""),
-      avatarId: avatarImageAsset?._id || updatedUser?.avatarImageId || null,
-      avatarUrl: updatedUser?.avatarUrl || updatedUser?.profilePic || "",
+      voiceSampleId: activeVoiceId,
+      voiceSampleUrl: activeVoiceUrl,
+      avatarId: activeAvatarId,
+      avatarUrl: activeAvatarUrl,
       botName: updatedUser?.botName || agentCustomName || "",
       isProfileSetup: true,
       isAvatarSetup: true,
@@ -459,6 +490,10 @@ exports.uploadVoiceSample = async (req, res) => {
       user: {
         ...(updatedUser ? updatedUser.toObject() : {}),
         botName: updatedUser?.botName || agentCustomName || "",
+        voiceSampleUrl: activeVoiceUrl,
+        voiceSampleId: activeVoiceId,
+        avatarId: activeAvatarId,
+        avatarUrl: activeAvatarUrl,
         isProfileSetup: true,
         isAvatarSetup: true,
         isVoiceSetup: true,
@@ -498,6 +533,9 @@ exports.getCurrentUser = async (req, res) => {
     const isVoiceSetup = Boolean(user.voiceSampleId || user.voiceSampleUrl);
     const isProfileSetup = Boolean(isAvatarSetup && isVoiceSetup);
 
+    const activeVoiceUrl = user.voiceSampleUrl || "";
+    const activeVoiceId = user.voiceSampleId || null;
+
     return res.json({
       success: true,
       user: {
@@ -507,6 +545,7 @@ exports.getCurrentUser = async (req, res) => {
         profilePic: user.profilePic,
         avatarUrl: user.avatarUrl || user.profilePic || "",
         avatarImageId: user.avatarImageId || null,
+        botName: user.botName || "",
         authType: user.authType,
         plan: user.plan,
         isProfileSetup,
@@ -516,8 +555,8 @@ exports.getCurrentUser = async (req, res) => {
         hasVoice: isVoiceSetup,
         isAvatarUploaded: isAvatarSetup,
         isVoiceUploaded: isVoiceSetup,
-        voiceSampleId: user.voiceSampleId,
-        voiceSampleUrl: user.voiceSampleUrl,
+        voiceSampleId: activeVoiceId,
+        voiceSampleUrl: activeVoiceUrl,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt
       }
@@ -725,6 +764,11 @@ exports.updateUserVoiceSample = async (req, res) => {
       await delCache(`avatar:voice:${userId}`);
       await delCache(`user:${userId}`);
       await delCache(`user:${userId}:voice_samples`);
+      await delCache(`user:${userId}:active_voice_asset_id`);
+      const keys = await redis.keys("avatar:tts:*").catch(() => []);
+      if (keys.length > 0) {
+        await redis.del(keys).catch(() => {});
+      }
     }
 
     return res.json({

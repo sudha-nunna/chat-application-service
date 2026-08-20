@@ -32,6 +32,8 @@ temp_base_*
 # Uploaded Media Files
 uploads/
 media/
+processed/
+scratch/
 
 # OS / Editor junk
 .DS_Store

@@ -44,8 +44,8 @@ auth.requireAdmin = async (req, res, next) => {
     if (!userId) {
       return res.status(401).json({ success: false, error: "Not authorized" });
     }
-    const userDoc = await User.findById(userId);
-    const isAdmin = userDoc && (userDoc.role === "admin" || userDoc.isAdmin || userDoc.email === "sairamakrishna2@gmail.com");
+    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com"];
+    const isAdmin = userDoc && (userDoc.role === "admin" || userDoc.isAdmin || (userDoc.email && SUPER_ADMIN_EMAILS.includes(userDoc.email.toLowerCase())));
 
     if (!isAdmin) {
       return res.status(403).json({ success: false, error: "Access denied. Admin authorization required." });

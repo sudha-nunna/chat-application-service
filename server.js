@@ -100,18 +100,32 @@ app.listen(process.env.PORT, () => {
     `Server running on port ${process.env.PORT}`
   );
 
-  // Auto-spawn Python F5-TTS Voice Engine as child process
+  // Auto-spawn Python Voice Engine (F5-TTS / OpenVoice) as child process
   try {
     const { spawn } = require("child_process");
 
-    // Resolve Python binary path with fallback sequence:
+    // Resolve active voice engine based on VOICE_CLONE_ENGINE env variable ("F5" | "OPENVOICE")
+    const activeEngineType = (process.env.VOICE_CLONE_ENGINE || "F5").toUpperCase();
+    const standaloneF5Path = path.join(__dirname, "../f5-voice-service/f5_tts_service.py");
+    const localF5Path = path.join(__dirname, "voice_engine_f5/f5_tts_service.py");
+    const f5ScriptPath = fs.existsSync(standaloneF5Path) ? standaloneF5Path : localF5Path;
+    const openvoiceScriptPath = path.join(__dirname, "voice_engine/openvoice_service.py");
+
+    let voiceScriptPath = (activeEngineType === "F5" || activeEngineType === "F5TTS") ? f5ScriptPath : openvoiceScriptPath;
+    let engineLabel = (activeEngineType === "F5" || activeEngineType === "F5TTS") ? "F5-TTS" : "OpenVoice V2";
+
+    if (!fs.existsSync(voiceScriptPath)) {
+      voiceScriptPath = fs.existsSync(f5ScriptPath) ? f5ScriptPath : openvoiceScriptPath;
+      engineLabel = voiceScriptPath === f5ScriptPath ? "F5-TTS" : "OpenVoice V2";
+    }
+
+    // Resolve Python binary path sequence:
     // 1. process.env.PYTHON_PATH (if set)
     // 2. Local venv path for Windows (venv/Scripts/python.exe) or Linux (venv/bin/python)
     // 3. System python / python3 binary
     let venvPythonPath = process.env.PYTHON_PATH;
     const defaultWinPath = path.join(__dirname, "venv/Scripts/python.exe");
     const defaultUnixPath = path.join(__dirname, "venv/bin/python");
-    const openvoiceScriptPath = path.join(__dirname, "voice_engine/openvoice_service.py");
 
     if (!venvPythonPath) {
       if (fs.existsSync(defaultWinPath)) {
@@ -127,8 +141,8 @@ app.listen(process.env.PORT, () => {
 
     const pyExists = fs.existsSync(venvPythonPath) || (!venvPythonPath.includes("/") && !venvPythonPath.includes("\\"));
 
-    if (pyExists && fs.existsSync(openvoiceScriptPath)) {
-      // Auto-cleanup orphan sockets on port 8000 to ensure fresh attached process with live terminal logs
+    if (pyExists && fs.existsSync(voiceScriptPath)) {
+      // Auto-cleanup orphan sockets on port 8000 to ensure attached process starts cleanly with live terminal logs
       try {
         const { execSync } = require("child_process");
         if (process.platform === "win32") {
@@ -138,36 +152,45 @@ app.listen(process.env.PORT, () => {
         }
       } catch (e) { }
 
-      console.log(`🚀 Spawning Python OpenVoice V2 Engine (${venvPythonPath})...`);
-      const pyProc = spawn(venvPythonPath, [openvoiceScriptPath], {
-        env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8", VOICE_ENGINE_PORT: "8000", PORT: "8000" }
+      console.log(`🚀 Spawning Python ${engineLabel} Engine (${venvPythonPath})...`);
+      const pyProc = spawn(venvPythonPath, [voiceScriptPath], {
+        env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8", VOICE_ENGINE_PORT: "8000", PORT: "8000", VOICE_CLONE_ENGINE: activeEngineType }
       });
 
       pyProc.stdout.on("data", (data) => {
         const msg = data.toString().trim();
-        if (msg) console.log(`[OpenVoice V2] ${msg}`);
+        if (msg) console.log(`[${engineLabel}] ${msg}`);
       });
 
       pyProc.stderr.on("data", (data) => {
         const msg = data.toString().trim();
         if (msg && !msg.includes("DeprecationWarning") && !msg.includes("unauthenticated requests") && !msg.includes("HF_TOKEN")) {
-          console.log(`[OpenVoice LOG] ${msg}`);
+          console.log(`[${engineLabel} LOG] ${msg}`);
         }
       });
 
       const killPyProc = () => {
         if (pyProc && !pyProc.killed) {
-          console.log("Shutting down Python OpenVoice Engine...");
-          pyProc.kill("SIGTERM");
+          console.log(`Shutting down Python ${engineLabel} Engine...`);
+          try {
+            pyProc.kill("SIGTERM");
+          } catch (e) {
+            try { pyProc.kill("SIGKILL"); } catch (err) {}
+          }
         }
       };
 
       process.on("exit", killPyProc);
       process.on("SIGINT", () => { killPyProc(); process.exit(); });
       process.on("SIGTERM", () => { killPyProc(); process.exit(); });
+      process.on("uncaughtException", (err) => {
+        console.error("Uncaught Exception in server:", err);
+        killPyProc();
+        process.exit(1);
+      });
     }
   } catch (pyErr) {
-    console.warn("Notice: Python F5-TTS child process spawn notice:", pyErr.message);
+    console.warn("Notice: Python Voice Engine child process spawn notice:", pyErr.message);
   }
 
   warmOllamaConnection().then((success) => {

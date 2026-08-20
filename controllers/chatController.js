@@ -275,23 +275,20 @@ CORE BEHAVIOR RULES:
     const User = require("../models/User");
 
     const userId = req.user?.id || req.user?._id;
-    const userDoc = userId ? await User.findById(userId) : null;
-    const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
-    
-    // Check if user has enough credits
-    if (userDoc && userDoc.credits <= 0) {
-      if (!res.headersSent) {
-        return res.status(402).json({ 
-          success: false, 
-          message: "You have run out of credits. Please purchase a credit package to continue chatting." 
-        });
-      } else {
-        res.write(`data: ${JSON.stringify({ type: "error", message: "You have run out of credits. Please purchase a credit package to continue." })}\n\n`);
-        return res.end();
+    let userPlan = req.user?.plan || req.headers["x-user-plan"];
+
+    if (!userPlan && userId) {
+      const { getCache, setCache } = require("../utils/redisClient");
+      const planCacheKey = `user:plan:${userId}`;
+      userPlan = await getCache(planCacheKey);
+      if (!userPlan) {
+        const userDoc = await User.findById(userId).select("plan").lean();
+        userPlan = userDoc?.plan || "free";
+        await setCache(planCacheKey, userPlan, 900);
       }
     }
 
-    const userPriority = await calculatePriority(userPlan);
+    const userPriority = await calculatePriority(userPlan || "free");
 
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();

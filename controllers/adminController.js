@@ -37,13 +37,13 @@ exports.googleAdminLogin = async (req, res) => {
       return res.status(400).json({ success: false, error: "Google account email is unavailable" });
     }
     
-    const userEmail = payload.email.toLowerCase().trim();
+    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com","nunnasudha03@gmail.com"];
     
     // Check if the user exists
     let user = await User.findOne({ email: userEmail });
     
     // Auto-create the super admin if they don't exist yet
-    if (!user && userEmail === "sairamakrishna2@gmail.com") {
+    if (!user && SUPER_ADMIN_EMAILS.includes(userEmail)) {
       user = await User.create({
         name: payload.name || "Super Admin",
         email: userEmail,
@@ -57,7 +57,7 @@ exports.googleAdminLogin = async (req, res) => {
       return res.status(403).json({ success: false, error: `Access denied. No account found for ${userEmail}.` });
     }
     
-    if (user.role !== "admin" && userEmail !== "sairamakrishna2@gmail.com") {
+    if (user.role !== "admin" && !SUPER_ADMIN_EMAILS.includes(userEmail)) {
       return res.status(403).json({ success: false, error: "Access denied. You do not have admin privileges." });
     }
     
