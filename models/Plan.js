@@ -25,6 +25,10 @@ const planSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    creditsGranted: {
+      type: Number,
+      default: 0, // Number of credits granted per month
+    },
     priorityScore: {
       type: Number,
       default: 10,

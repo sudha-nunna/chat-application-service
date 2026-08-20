@@ -1,8 +1,110 @@
 const ServerNode = require("../models/ServerNode");
+const User = require("../models/User");
+const Bot = require("../models/Bot");
+const Message = require("../models/Message");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 const { performance } = require("perf_hooks");
 const { encrypt, decrypt } = require("../utils/encryption");
 
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET
+);
+
 /**
+ * Admin Login via Google
+ */
+exports.googleAdminLogin = async (req, res) => {
+  try {
+    const { token } = req.body;
+    console.log("Received Admin Google Login Request!");
+    
+    if (!token) {
+      console.log("Missing token");
+      return res.status(400).json({ success: false, error: "Google token is required" });
+    }
+    
+    // Verify the Google token
+    const ticket = await googleClient.verifyIdToken({
+      idToken: token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    
+    const payload = ticket.getPayload();
+    if (!payload?.email) {
+      return res.status(400).json({ success: false, error: "Google account email is unavailable" });
+    }
+    
+    const userEmail = payload.email.toLowerCase().trim();
+    
+    // Check if the user exists
+    let user = await User.findOne({ email: userEmail });
+    
+    // Auto-create the super admin if they don't exist yet
+    if (!user && userEmail === "sairamakrishna2@gmail.com") {
+      user = await User.create({
+        name: payload.name || "Super Admin",
+        email: userEmail,
+        role: "admin",
+        authType: "google",
+        profilePic: payload.picture || ""
+      });
+    }
+    
+    if (!user) {
+      return res.status(403).json({ success: false, error: `Access denied. No account found for ${userEmail}.` });
+    }
+    
+    if (user.role !== "admin" && userEmail !== "sairamakrishna2@gmail.com") {
+      return res.status(403).json({ success: false, error: "Access denied. You do not have admin privileges." });
+    }
+    
+    const jwtToken = jwt.sign(
+      { id: user._id, email: user.email, role: "admin" },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    
+    return res.json({
+      success: true,
+      token: jwtToken,
+      user: { id: user._id, name: user.name, email: user.email, role: "admin", profilePic: user.profilePic }
+    });
+  } catch (error) {
+    console.error("Google Admin Login Error:", error);
+    return res.status(500).json({ success: false, error: "Server error during admin login" });
+  }
+};
+
+/**
+ * Get Dashboard Stats
+ */
+exports.getDashboardStats = async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments();
+    const totalBots = await Bot.countDocuments();
+    const totalMessages = await Message.countDocuments();
+    const activeNodes = await ServerNode.countDocuments({ status: "ACTIVE" });
+    const totalNodes = await ServerNode.countDocuments();
+    
+    return res.json({
+      success: true,
+      stats: {
+        totalUsers,
+        totalBots,
+        totalMessages,
+        activeNodes,
+        totalNodes,
+        systemUptime: "99.98%" // Placeholder, could calculate based on actual node uptimes
+      }
+    });
+  } catch (error) {
+    console.error("Stats Error:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch stats" });
+  }
+};/**
  * Get all AI Server Nodes with live ping status test and masked secret keys
  */
 exports.getAllNodes = async (req, res) => {
@@ -383,5 +485,121 @@ exports.pingNode = async (req, res) => {
   } catch (error) {
     console.error("Error pinging node:", error.message);
     return res.status(500).json({ success: false, error: "Failed to ping server node." });
+  }
+};
+
+/**
+ * ==========================================
+ * USER & CREDIT MANAGEMENT
+ * ==========================================
+ */
+
+exports.getAllUsers = async (req, res) => {
+  try {
+    const users = await User.find().select("-password").sort({ createdAt: -1 });
+    return res.json({ success: true, count: users.length, users });
+  } catch (error) {
+    console.error("Error fetching users:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch users." });
+  }
+};
+
+exports.updateUserCredits = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { credits, plan } = req.body;
+    
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ success: false, error: "User not found." });
+
+    if (credits !== undefined) {
+      const amountDiff = Number(credits) - user.credits;
+      
+      const CreditTransaction = require("../models/CreditTransaction");
+      await CreditTransaction.create({
+        userId: user._id,
+        amount: amountDiff,
+        type: amountDiff > 0 ? "admin_grant" : "admin_deduct",
+        description: `Admin manual balance adjustment`,
+        balanceAfter: Number(credits)
+      });
+      
+      user.credits = Number(credits);
+    }
+    
+    if (plan !== undefined) {
+      user.plan = plan;
+    }
+
+    await user.save();
+    return res.json({ success: true, user });
+  } catch (error) {
+    console.error("Error updating user credits:", error);
+    return res.status(500).json({ success: false, error: "Failed to update user." });
+  }
+};
+
+/**
+ * ==========================================
+ * SUBSCRIPTION PLANS MANAGEMENT
+ * ==========================================
+ */
+
+exports.getAllPlans = async (req, res) => {
+  try {
+    const Plan = require("../models/Plan");
+    const plans = await Plan.find().sort({ displayOrder: 1, priorityScore: 1 });
+    return res.json({ success: true, count: plans.length, plans });
+  } catch (error) {
+    console.error("Error fetching plans:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch subscription plans." });
+  }
+};
+
+exports.createPlan = async (req, res) => {
+  try {
+    const Plan = require("../models/Plan");
+    const plan = await Plan.create(req.body);
+    return res.status(201).json({ success: true, plan });
+  } catch (error) {
+    console.error("Error creating plan:", error);
+    return res.status(500).json({ success: false, error: "Failed to create subscription plan." });
+  }
+};
+
+exports.updatePlan = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const Plan = require("../models/Plan");
+    const plan = await Plan.findByIdAndUpdate(id, req.body, { new: true });
+    
+    if (!plan) return res.status(404).json({ success: false, error: "Plan not found." });
+    return res.json({ success: true, plan });
+  } catch (error) {
+    console.error("Error updating plan:", error);
+    return res.status(500).json({ success: false, error: "Failed to update subscription plan." });
+  }
+};
+
+exports.deletePlan = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const Plan = require("../models/Plan");
+    
+    // Check if users are using this plan before deleting it.
+    const User = require("../models/User");
+    const plan = await Plan.findById(id);
+    if (!plan) return res.status(404).json({ success: false, error: "Plan not found." });
+    
+    const usersCount = await User.countDocuments({ plan: plan.key });
+    if (usersCount > 0) {
+      return res.status(400).json({ success: false, error: `Cannot delete plan: ${usersCount} users are currently subscribed to it.` });
+    }
+
+    await Plan.findByIdAndDelete(id);
+    return res.json({ success: true, message: "Plan deleted successfully." });
+  } catch (error) {
+    console.error("Error deleting plan:", error);
+    return res.status(500).json({ success: false, error: "Failed to delete subscription plan." });
   }
 };

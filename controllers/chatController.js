@@ -275,8 +275,22 @@ CORE BEHAVIOR RULES:
     const User = require("../models/User");
 
     const userId = req.user?.id || req.user?._id;
-    const userDoc = userId ? await User.findById(userId).select("plan") : null;
+    const userDoc = userId ? await User.findById(userId) : null;
     const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
+    
+    // Check if user has enough credits
+    if (userDoc && userDoc.credits <= 0) {
+      if (!res.headersSent) {
+        return res.status(402).json({ 
+          success: false, 
+          message: "You have run out of credits. Please purchase a credit package to continue chatting." 
+        });
+      } else {
+        res.write(`data: ${JSON.stringify({ type: "error", message: "You have run out of credits. Please purchase a credit package to continue." })}\n\n`);
+        return res.end();
+      }
+    }
+
     const userPriority = await calculatePriority(userPlan);
 
     const jobId = `general_${chatId}_${Date.now()}`;
@@ -324,6 +338,20 @@ CORE BEHAVIOR RULES:
         role: "assistant",
         content: accumulatedResponseText,
       });
+
+      if (userDoc) {
+        userDoc.credits -= 1;
+        await userDoc.save();
+        
+        const CreditTransaction = require("../models/CreditTransaction");
+        await CreditTransaction.create({
+          userId: userDoc._id,
+          amount: -1,
+          type: "message_sent",
+          description: "1 credit deducted for general AI chat message",
+          balanceAfter: userDoc.credits
+        });
+      }
 
       res.write("data: [DONE]\n\n");
       return res.end();

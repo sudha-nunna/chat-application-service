@@ -24,10 +24,26 @@ const userSchema = new mongoose.Schema(
       default: "google",
     },
 
+    password: {
+      type: String,
+      select: false, // Don't return password by default
+    },
+
+    role: {
+      type: String,
+      enum: ["user", "admin"],
+      default: "user",
+    },
+
     plan: {
       type: String,
       enum: ["free", "pro", "enterprise"],
       default: "free",
+    },
+
+    credits: {
+      type: Number,
+      default: 100, // 100 free credits on sign up
     },
 
     activeSubscriptionId: {

@@ -1450,8 +1450,31 @@ exports.sendBotChatMessage = async (req, res) => {
     const User = require("../models/User");
 
     const userId = req.user?.id || req.user?._id;
-    const userDoc = userId ? await User.findById(userId).select("plan") : null;
+    const userDoc = userId ? await User.findById(userId) : null;
     const userPlan = userDoc?.plan || req.user?.plan || req.headers["x-user-plan"] || "free";
+    
+    // Check if user has enough credits
+    if (userDoc && userDoc.credits <= 0) {
+      if (!res.headersSent) {
+        if (isStreamRequested) {
+          res.write(`event: metadata\ndata: ${JSON.stringify({ type: "error", message: "You have run out of credits. Please purchase a credit package to continue." })}\n\n`);
+          res.write("event: done\ndata: [DONE]\n\n");
+          return res.end();
+        } else {
+          return res.status(402).json({ 
+            success: false, 
+            error: "You have run out of credits. Please purchase a credit package to continue chatting." 
+          });
+        }
+      } else {
+        if (isStreamRequested) {
+          res.write(`event: metadata\ndata: ${JSON.stringify({ type: "error", message: "You have run out of credits. Please purchase a credit package to continue." })}\n\n`);
+          res.write("event: done\ndata: [DONE]\n\n");
+        }
+        return res.end();
+      }
+    }
+
     const userPriority = await calculatePriority(userPlan);
 
     const jobId = `bot_${botId}_${Date.now()}`;
@@ -1530,6 +1553,20 @@ exports.sendBotChatMessage = async (req, res) => {
       content: accumulatedResponseText,
       sources: sourcesMeta
     });
+
+    if (userDoc && streamedSuccessfully) {
+      userDoc.credits -= 1;
+      await userDoc.save();
+      
+      const CreditTransaction = require("../models/CreditTransaction");
+      await CreditTransaction.create({
+        userId: userDoc._id,
+        amount: -1,
+        type: "bot_chat",
+        description: `1 credit deducted for bot chat (Bot ID: ${botId})`,
+        balanceAfter: userDoc.credits
+      });
+    }
 
     // Non-blocking background trigger for provider-aware rolling summary
     memoryService.triggerBackgroundSummaryUpdate(conversation._id, botId);

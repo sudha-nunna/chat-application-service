@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { redis } = require("../utils/redisClient");
+const User = require("../models/User");
 
 const auth = async (req, res, next) => {
   const authHeader = req.headers.authorization || req.headers["x-auth-token"];
@@ -66,7 +67,7 @@ const auth = async (req, res, next) => {
     const dbUser = await User.findById(userId).select("_id email name").catch(() => null);
     if (!dbUser) {
       if (redis && redis.status === "ready") {
-        await redis.set(sessionKey, "0", "EX", 300).catch(() => {});
+        await redis.set(sessionKey, "0", "EX", 300).catch(() => { });
       }
       return res.status(401).json({
         success: false,
@@ -76,7 +77,7 @@ const auth = async (req, res, next) => {
     }
 
     if (redis && redis.status === "ready") {
-      await redis.set(sessionKey, "1", "EX", 300).catch(() => {});
+      await redis.set(sessionKey, "1", "EX", 300).catch(() => { });
     }
 
     req.user = decoded;
@@ -84,6 +85,26 @@ const auth = async (req, res, next) => {
   } catch (err) {
     req.user = decoded;
     return next();
+  }
+};
+
+auth.protect = auth;
+
+auth.requireAdmin = async (req, res, next) => {
+  try {
+    const userId = req.user?.id || req.user?._id;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: "Not authorized" });
+    }
+    const userDoc = await User.findById(userId);
+    const isAdmin = userDoc && (userDoc.role === "admin" || userDoc.isAdmin || userDoc.email === "sairamakrishna2@gmail.com");
+
+    if (!isAdmin) {
+      return res.status(403).json({ success: false, error: "Access denied. Admin authorization required." });
+    }
+    next();
+  } catch (err) {
+    return res.status(500).json({ success: false, error: "Server error in admin authorization" });
   }
 };
 
