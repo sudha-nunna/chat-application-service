@@ -423,8 +423,8 @@ Answer the user's prompt or question directly in 1 to 2 short, concise sentences
       const ttsRedisKey = `avatar:tts:${textVoiceHash}`;
 
       const cachedTtsData = await getCache(ttsRedisKey).catch(() => null);
-
-      if (cachedTtsData && cachedTtsData.audioUrl && process.env.BYPASS_TTS_CACHE !== "true") {
+      const hasValidClonedBuffer = Boolean(cloneVoiceBuffer && cloneVoiceBuffer.length > 0);
+      if (cachedTtsData && cachedTtsData.audioUrl && process.env.BYPASS_TTS_CACHE !== "true" && (!hasValidClonedBuffer || cachedTtsData.isCloned)) {
         console.log(`⚡ [REDIS TTS HIT] Retrieved pre-synthesized audio URL & visemes in 0ms!`);
         speechData = cachedTtsData;
       } else {

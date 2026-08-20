@@ -1581,7 +1581,20 @@ exports.sendBotChatMessage = async (req, res) => {
       if (isAudioOrAvatarBot && accumulatedResponseText && accumulatedResponseText.trim()) {
         try {
           const voiceService = require("../services/voiceService");
-          const speechData = await voiceService.generateSpeechAndVisemes(accumulatedResponseText, bot.voiceConfig || {}, reqHost);
+          const MediaAsset = require("../models/MediaAsset");
+          let voiceBuffer = null;
+          if (req.user?.id) {
+            const activeAsset = await MediaAsset.findOne({ userId: req.user.id, type: "VOICE_SAMPLE", isSelected: true }).sort({ updatedAt: -1 }).catch(() => null);
+            if (activeAsset && activeAsset.data) {
+              voiceBuffer = Buffer.isBuffer(activeAsset.data) ? activeAsset.data : Buffer.from(activeAsset.data);
+            }
+          }
+          let speechData = null;
+          if (voiceBuffer && voiceBuffer.length > 0) {
+            speechData = await voiceService.generateClonedSpeechAndVisemes(accumulatedResponseText, voiceBuffer, reqHost, { ...(bot.voiceConfig || {}) });
+          } else {
+            speechData = await voiceService.generateSpeechAndVisemes(accumulatedResponseText, bot.voiceConfig || {}, reqHost);
+          }
           res.write(`event: speechData\ndata: ${JSON.stringify({ type: "speechData", speechData, avatarConfig: bot.avatarConfig || {} })}\n\n`);
         } catch (e) {
           console.warn("SSE Speech generation warning:", e.message);

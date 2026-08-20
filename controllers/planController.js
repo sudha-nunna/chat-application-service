@@ -45,7 +45,15 @@ exports.getPlanByKey = async (req, res) => {
 exports.createPlan = async (req, res) => {
   try {
     const planData = req.body;
-    const existingPlan = await Plan.findOne({ key: planData.key.toLowerCase() });
+    if (!planData || !planData.key) {
+      return res.status(400).json({
+        success: false,
+        message: "Plan key is required",
+      });
+    }
+
+    const keyLower = planData.key.toLowerCase();
+    const existingPlan = await Plan.findOne({ key: keyLower });
 
     if (existingPlan) {
       return res.status(400).json({
@@ -54,7 +62,7 @@ exports.createPlan = async (req, res) => {
       });
     }
 
-    const plan = await Plan.create(planData);
+    const plan = await Plan.create({ ...planData, key: keyLower });
     res.status(201).json({
       success: true,
       message: "Plan created successfully",

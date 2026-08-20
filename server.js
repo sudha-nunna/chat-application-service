@@ -36,13 +36,58 @@ app.use(["/api/v1/external/bots", "/api/v1/avatar"], cors({
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || "")
   .split(",")
-  .map((origin) => origin.trim().replace(/\/$/, ""))
+  .map((origin) => {
+    let clean = origin.trim();
+    if (!clean) return "";
+    try {
+      if (clean.startsWith("http://") || clean.startsWith("https://")) {
+        return new URL(clean).origin;
+      }
+    } catch (e) {}
+    return clean.replace(/\/$/, "");
+  })
   .filter(Boolean);
 
-// 2. Restricted CORS for internal dashboard
+// 2. Restricted CORS for internal dashboard & admin apps
 app.use(cors({
-  origin: allowedOrigins.length > 0 ? allowedOrigins : "*",
-  credentials: true
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps, curl, or Postman)
+    if (!origin) return callback(null, true);
+
+    const isAllowed = allowedOrigins.length === 0 || allowedOrigins.some((allowed) => {
+      if (allowed === "*") return true;
+      if (allowed === origin) return true;
+      try {
+        const allowedOrigin = allowed.startsWith("http") ? new URL(allowed).origin : allowed;
+        const incomingOrigin = new URL(origin).origin;
+        return allowedOrigin === incomingOrigin;
+      } catch (e) {
+        return false;
+      }
+    });
+
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      console.warn(`⚠️ [CORS BLOCK] Origin '${origin}' rejected. Allowed origins:`, allowedOrigins);
+      callback(null, false);
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Accept",
+    "X-Requested-With",
+    "X-Bot-Api-Key",
+    "X-Bot-Secret-Key",
+    "X-Visitor-Id",
+    "x-visitor-id",
+    "X-User-Plan",
+    "x-user-plan",
+    "x-auth-token"
+  ]
 }));
 
 const path = require("path");
@@ -139,9 +184,13 @@ app.listen(process.env.PORT, () => {
       venvPythonPath = path.resolve(__dirname, venvPythonPath);
     }
 
-    const pyExists = fs.existsSync(venvPythonPath) || (!venvPythonPath.includes("/") && !venvPythonPath.includes("\\"));
+    // If external F5_TTS_URL is configured (e.g. Google Colab GPU URL), use cloud GPU directly without spawning local CPU process
+    const externalF5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "";
+    const isExternalGpu = externalF5Url && !externalF5Url.includes("127.0.0.1") && !externalF5Url.includes("localhost");
 
-    if (pyExists && fs.existsSync(voiceScriptPath)) {
+    if (isExternalGpu) {
+      console.log(`🌐 [F5-TTS ENGINE] Configured to use External GPU Server (${externalF5Url})`);
+    } else if (pyExists && fs.existsSync(voiceScriptPath)) {
       // Auto-cleanup orphan sockets on port 8000 to ensure attached process starts cleanly with live terminal logs
       try {
         const { execSync } = require("child_process");

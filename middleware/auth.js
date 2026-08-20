@@ -24,10 +24,14 @@ const auth = async (req, res, next) => {
     });
   }
 
-  let decoded;
   try {
     const secret = process.env.JWT_SECRET || "mysecretkey";
-    decoded = jwt.verify(token, secret);
+    const decoded = jwt.verify(token, secret);
+    req.user = decoded;
+    if (req.user && !req.user.id && req.user._id) {
+      req.user.id = req.user._id;
+    }
+    next();
   } catch (err) {
     return res.status(401).json({
       success: false,
@@ -44,8 +48,20 @@ auth.requireAdmin = async (req, res, next) => {
     if (!userId) {
       return res.status(401).json({ success: false, error: "Not authorized" });
     }
-    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com"];
-    const isAdmin = userDoc && (userDoc.role === "admin" || userDoc.isAdmin || (userDoc.email && SUPER_ADMIN_EMAILS.includes(userDoc.email.toLowerCase())));
+
+    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com", "nunnasudha03@gmail.com"];
+
+    let userDoc = null;
+    try {
+      userDoc = await User.findById(userId);
+    } catch (e) {
+      console.warn("Could not find user in requireAdmin:", e.message);
+    }
+
+    const isAdmin =
+      (userDoc && (userDoc.role === "admin" || userDoc.isAdmin || (userDoc.email && SUPER_ADMIN_EMAILS.includes(userDoc.email.toLowerCase())))) ||
+      (req.user.role === "admin") ||
+      (req.user.email && SUPER_ADMIN_EMAILS.includes(req.user.email.toLowerCase()));
 
     if (!isAdmin) {
       return res.status(403).json({ success: false, error: "Access denied. Admin authorization required." });

@@ -37,7 +37,8 @@ exports.googleAdminLogin = async (req, res) => {
       return res.status(400).json({ success: false, error: "Google account email is unavailable" });
     }
     
-    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com","nunnasudha03@gmail.com"];
+    const userEmail = payload.email.toLowerCase().trim();
+    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com", "nunnasudha03@gmail.com"];
     
     // Check if the user exists
     let user = await User.findOne({ email: userEmail });

@@ -33,7 +33,7 @@ exports.googleAuth = async (req, res) => {
     }
 
     const { email, name, picture } = payload;
-    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com"];
+    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com", "nunnasudha03@gmail.com"];
     const isSuperAdmin = email && SUPER_ADMIN_EMAILS.includes(email.toLowerCase().trim());
     let user = await User.findOne({ email });
 
