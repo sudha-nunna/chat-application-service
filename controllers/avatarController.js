@@ -30,8 +30,12 @@ exports.handleAvatarChat = async (req, res) => {
     const avatarFilesMap = !Array.isArray(req.files) ? (req.files || {}) : {};
     let audioUploadedFile = avatarFilesMap.audio?.[0] || avatarFilesMap.audioFile?.[0] || (avatarFilesArray[0] && avatarFilesArray[0].buffer ? avatarFilesArray[0] : null) || req.file;
 
-    if (audioUploadedFile && (!audioUploadedFile.buffer || audioUploadedFile.buffer.length === 0)) {
-      audioUploadedFile = null;
+    if (audioUploadedFile) {
+      const mime = (audioUploadedFile.mimetype || "").toLowerCase();
+      const isAudioMime = mime.startsWith("audio/") || mime.startsWith("video/") || mime === "application/octet-stream" || (audioUploadedFile.originalname && /\.(wav|mp3|m4a|aac|webm|ogg|flac)$/i.test(audioUploadedFile.originalname));
+      if (!audioUploadedFile.buffer || audioUploadedFile.buffer.length < 500 || !isAudioMime) {
+        audioUploadedFile = null;
+      }
     }
 
     let rawSpeechInput = speech || audio || req.body?.audioFile || audioUploadedFile;
@@ -76,9 +80,13 @@ exports.handleAvatarChat = async (req, res) => {
 
     let explicitTextMessage = (message || req.body?.messageText || req.body?.prompt || req.body?.text || req.body?.userMessage || req.body?.query || "").trim();
 
-    // Senior Developer STT Precedence:
-    // If a valid audio recording is uploaded, ALWAYS process STT first!
-    if (hasValidAudio) {
+    // Senior Developer Dual Input Efficiency Logic:
+    // 1. If explicitTextMessage is already provided (e.g. from Browser STT or Chat Box), USE IT INSTANTLY (0ms STT delay)!
+    // 2. If text is empty BUT valid audio recording is attached, run server-side STT!
+    if (explicitTextMessage && explicitTextMessage.length > 0) {
+      textPrompt = explicitTextMessage;
+      console.log(`💬 [INSTANT TEXT PROMPT] Using explicit text prompt (0ms STT delay): "${textPrompt}"`);
+    } else if (hasValidAudio) {
       const sttInput = audioUploadedFile || rawSpeechBuffer || rawSpeechInput;
       console.log("🎤 [AVATAR CHAT STT] Transcribing microphone audio recording into text...");
       try {
@@ -86,20 +94,14 @@ exports.handleAvatarChat = async (req, res) => {
         if (transcribedText && transcribedText.trim()) {
           console.log(`✅ [AVATAR CHAT STT SUCCESS] Transcribed Spoken Text: "${transcribedText.trim()}"`);
           textPrompt = transcribedText.trim();
-        } else if (explicitTextMessage && explicitTextMessage !== "tell me one joke") {
-          textPrompt = explicitTextMessage;
         }
       } catch (sttErr) {
         console.warn("⚠️ [AVATAR CHAT STT ERROR]", sttErr.message);
-        if (explicitTextMessage) textPrompt = explicitTextMessage;
       }
-    } else if (explicitTextMessage) {
-      textPrompt = explicitTextMessage;
-      console.log(`💬 Using Explicit User Text Prompt: "${textPrompt}"`);
     }
 
     if (!textPrompt || typeof textPrompt !== "string" || !textPrompt.trim()) {
-      textPrompt = "Hello! Please assist me.";
+      textPrompt = explicitTextMessage || "Hello! Please assist me.";
     }
     message = textPrompt;
     console.log(`💬 Final Prompt Sent To LLM: "${message}"`);
@@ -352,57 +354,55 @@ Answer the user's prompt or question directly in 1 to 2 short, concise sentences
 
       // 1. Resolve Target Voice Sample Buffer for Voice Cloning:
       let cloneVoiceBuffer = null;
-      let targetUserId = req.user?.id || req.body?.userId;
+      let targetUserId = req.user?.id || req.body?.userId || req.body?.user || req.query?.userId;
 
       if (!targetUserId && req.body?.email) {
         const u = await User.findOne({ email: req.body.email }).catch(() => null);
         if (u) targetUserId = u._id;
       }
 
+      const defaultAssetId = "6a85b04c86b107f4f259929e";
       let activeAsset = null;
 
-      // Priority 0: Fast Redis Cache lookup (0ms DB overhead)
-      if (cachedVoiceAssetId && mongoose.Types.ObjectId.isValid(cachedVoiceAssetId)) {
-        activeAsset = await MediaAsset.findById(cachedVoiceAssetId).catch(() => null);
-      }
+      // Priority 1: Target User's OWN Voice Sample ALWAYS takes absolute precedence (excluding default asset)
+      if (targetUserId) {
+        activeAsset = await MediaAsset.findOne({
+          userId: targetUserId,
+          type: "VOICE_SAMPLE",
+          _id: { $ne: defaultAssetId }
+        })
+          .sort({ isSelected: -1, updatedAt: -1, createdAt: -1 })
+          .catch(() => null);
 
-      // Priority 1: User's explicitly selected active voice sample (userId AND isSelected: true)
-      if (!activeAsset && targetUserId) {
-        activeAsset = await MediaAsset.findOne({ userId: targetUserId, type: "VOICE_SAMPLE", isSelected: true }).sort({ updatedAt: -1 }).catch(() => null);
         if (!activeAsset) {
           const userDoc = await User.findById(targetUserId).catch(() => null);
-          if (userDoc?.voiceSampleId) {
+          if (userDoc?.voiceSampleId && String(userDoc.voiceSampleId) !== defaultAssetId) {
             activeAsset = await MediaAsset.findById(userDoc.voiceSampleId).catch(() => null);
           }
         }
       }
 
-      // Priority 2: Any MediaAsset marked with isSelected: true in MongoDB
-      if (!activeAsset) {
-        activeAsset = await MediaAsset.findOne({ type: "VOICE_SAMPLE", isSelected: true }).sort({ updatedAt: -1 }).catch(() => null);
-      }
-
-      // Priority 3: Any User in DB with a linked voiceSampleId
-      if (!activeAsset) {
-        const userWithVoice = await User.findOne({ voiceSampleId: { $ne: null } }).sort({ updatedAt: -1 }).catch(() => null);
-        if (userWithVoice?.voiceSampleId) {
-          activeAsset = await MediaAsset.findById(userWithVoice.voiceSampleId).catch(() => null);
+      // Priority 2: Explicit voiceSampleId passed in body or headers
+      if (!activeAsset && (req.body?.voiceSampleId || req.headers["x-voice-sample-id"])) {
+        const sampleId = req.body?.voiceSampleId || req.headers["x-voice-sample-id"];
+        if (sampleId && String(sampleId) !== defaultAssetId) {
+          activeAsset = await MediaAsset.findById(sampleId).catch(() => null);
         }
       }
 
-      // Priority 4: Explicit voiceSampleId passed in body
-      if (!activeAsset && req.body?.voiceSampleId) {
-        activeAsset = await MediaAsset.findById(req.body.voiceSampleId).catch(() => null);
-      }
-
-      // Priority 5: Bot's custom voice sample
-      if (!activeAsset && bot?.voiceSampleId) {
-        activeAsset = await MediaAsset.findById(bot.voiceSampleId).catch(() => null);
-      }
-
-      // Priority 6: Latest VOICE_SAMPLE uploaded to MongoDB
+      // Priority 3: Latest actual user recorded VOICE_SAMPLE in MongoDB (excluding default asset)
       if (!activeAsset) {
-        activeAsset = await MediaAsset.findOne({ type: "VOICE_SAMPLE" }).sort({ createdAt: -1 }).catch(() => null);
+        activeAsset = await MediaAsset.findOne({
+          type: "VOICE_SAMPLE",
+          _id: { $ne: defaultAssetId }
+        })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .catch(() => null);
+      }
+
+      // Priority 4: Fallback to default asset only if zero user voice samples exist in DB
+      if (!activeAsset) {
+        activeAsset = await MediaAsset.findById(defaultAssetId).catch(() => null);
       }
 
       if (activeAsset) {
@@ -414,6 +414,12 @@ Answer the user's prompt or question directly in 1 to 2 short, concise sentences
           usedVoiceSampleUrl = `${reqHost}/bots/media/${activeAsset._id}`;
           console.log(`🎤 [VOICE RESOLVED] Active Voice Sample ID: ${activeAsset._id} (${activeAsset.filename})`);
         }
+      }
+
+      // Priority 7: Zero-shot vocal anchor fallback to incoming audio recording buffer
+      if (!cloneVoiceBuffer && rawSpeechBuffer && rawSpeechBuffer.length > 500) {
+        cloneVoiceBuffer = rawSpeechBuffer;
+        console.log(`🎤 [VOICE RESOLVED] Using incoming audio recording buffer as zero-shot vocal anchor.`);
       }
 
       // High-Speed Redis Voice Cache Lookup (0ms overhead if pre-synthesized)

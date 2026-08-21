@@ -1,116 +1,105 @@
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
+const os = require("os");
+const axios = require("axios");
+const ffmpegPath = require("ffmpeg-static");
+const { spawn, execSync } = require("child_process");
+const wavefile = require("wavefile");
 
 /**
- * Phoneme/Viseme Mapping rules for English speech synthesis.
- * Maps character combinations and phonemes to standard mouth shape visemes ("A", "E", "O", "M", "L", "rest").
+ * Converts any input audio Buffer (WebM, M4A, AAC, MP3, OGG, WAV) into a 16kHz mono 16-bit PCM WAV Buffer.
  */
-const VISEME_MAP = {
-  a: "A", e: "E", i: "E", o: "O", u: "U",
-  m: "M", b: "M", p: "M",
-  f: "F", v: "F",
-  l: "L", r: "L",
-  s: "S", z: "S", t: "S", d: "S",
-  w: "O", y: "E"
-};
+function convertAudioTo16kPcmWav(inputBuffer) {
+  if (!inputBuffer || !Buffer.isBuffer(inputBuffer) || inputBuffer.length === 0) {
+    return Promise.resolve(inputBuffer);
+  }
+  const tmpIn = path.join(os.tmpdir(), "audio_in_" + Date.now() + "_" + Math.random().toString(36).substring(7) + ".tmp");
+  const tmpOut = path.join(os.tmpdir(), "audio_out_" + Date.now() + "_" + Math.random().toString(36).substring(7) + ".wav");
+
+  try {
+    fs.writeFileSync(tmpIn, inputBuffer);
+    execSync('"' + ffmpegPath + '" -y -i "' + tmpIn + '" -ar 16000 -ac 1 -c:a pcm_s16le -f wav "' + tmpOut + '"', { stdio: "pipe" });
+
+    if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 44) {
+      const convertedBuf = fs.readFileSync(tmpOut);
+      if (fs.existsSync(tmpIn)) try { fs.unlinkSync(tmpIn); } catch (e) {}
+      if (fs.existsSync(tmpOut)) try { fs.unlinkSync(tmpOut); } catch (e) {}
+      return Promise.resolve(convertedBuf);
+    }
+  } catch (err) {
+    console.warn("Notice: FFmpeg conversion warning:", err.message);
+  } finally {
+    if (fs.existsSync(tmpIn)) try { fs.unlinkSync(tmpIn); } catch (e) {}
+    if (fs.existsSync(tmpOut)) try { fs.unlinkSync(tmpOut); } catch (e) {}
+  }
+  return Promise.resolve(inputBuffer);
+}
 
 /**
- * Parses text into a timeline of phonemes/viseme mouth shapes with millisecond offsets.
- * @param {string} text 
- * @returns {Array<{ timeMs: number, durationMs: number, viseme: string, shape: string }>}
+ * Decodes 16kHz WAV Buffer into Float32Array PCM samples for local Whisper STT.
+ */
+async function decodeAudioToFloat32(audioBuffer) {
+  if (!audioBuffer || !Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+    return new Float32Array(0);
+  }
+  let pcmWavBuffer = audioBuffer;
+  try {
+    const converted = await convertAudioTo16kPcmWav(audioBuffer);
+    if (converted && converted.length > 44) {
+      pcmWavBuffer = converted;
+    }
+  } catch (e) {}
+
+  try {
+    const wav = new wavefile.WaveFile(pcmWavBuffer);
+    wav.toSampleRate(16000);
+    wav.toBitDepth("32f");
+    let samples = wav.getSamples();
+    if (Array.isArray(samples)) samples = samples[0];
+    return new Float32Array(samples);
+  } catch (e) {
+    const numSamples = Math.floor(pcmWavBuffer.length / 2);
+    const float32 = new Float32Array(numSamples);
+    for (let i = 0; i < numSamples; i++) {
+      const sample = pcmWavBuffer.length >= (i * 2 + 2) ? pcmWavBuffer.readInt16LE(i * 2) : 0;
+      float32[i] = sample / 32768.0;
+    }
+    return float32;
+  }
+}
+
+/**
+ * Helper to generate visemes timeline from text
  */
 function extractVisemeTimeline(text) {
   if (!text || typeof text !== "string") return [];
+  const words = text.split(/\s+/);
+  const visemeShapes = ["rest", "etc", "E", "A", "O", "U", "FF", "TH", "L"];
+  let timeMs = 0;
+  const timeline = [];
 
-  const cleanText = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ");
-  const words = cleanText.split(/\s+/).filter(Boolean);
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i];
+    const durationMs = Math.max(120, word.length * 45);
+    const shape = visemeShapes[(i % (visemeShapes.length - 1)) + 1];
 
-  const visemes = [];
-  let currentTimeMs = 0;
-
-  // Initial silence
-  visemes.push({ timeMs: 0, durationMs: 80, viseme: "silence", shape: "rest" });
-  currentTimeMs += 80;
-
-  for (const word of words) {
-    const wordDuration = Math.max(120, word.length * 65);
-    const charDuration = Math.floor(wordDuration / word.length);
-
-    for (let i = 0; i < word.length; i++) {
-      const char = word[i];
-      const shape = VISEME_MAP[char] || "rest";
-      visemes.push({
-        timeMs: currentTimeMs,
-        durationMs: charDuration,
-        viseme: char,
-        shape: shape
-      });
-      currentTimeMs += charDuration;
-    }
-
-    // Word pause
-    visemes.push({
-      timeMs: currentTimeMs,
-      durationMs: 90,
-      viseme: "pause",
-      shape: "rest"
+    timeline.push({
+      timeMs,
+      durationMs,
+      viseme: shape,
+      shape: shape
     });
-    currentTimeMs += 90;
+    timeMs += durationMs + 30;
   }
 
-  // Trailing silence
-  visemes.push({ timeMs: currentTimeMs, durationMs: 100, viseme: "silence", shape: "rest" });
-
-  return visemes;
+  timeline.unshift({ timeMs: 0, durationMs: 80, viseme: "silence", shape: "rest" });
+  return timeline;
 }
 
 /**
- * Creates a synthetic WAV/MP3 audio header buffer for local audio playback fallback.
+ * Text-to-Speech (TTS) & Viseme Timeline Synthesis
  */
-function createSyntheticAudioBuffer(durationMs) {
-  const sampleRate = 22050;
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const totalSamples = Math.floor((durationMs / 1000) * sampleRate);
-  const dataSize = totalSamples * numChannels * (bitsPerSample / 8);
-
-  const buffer = Buffer.alloc(44 + dataSize);
-
-  // WAV Header
-  buffer.write("RIFF", 0);
-  buffer.writeUInt32LE(36 + dataSize, 4);
-  buffer.write("WAVE", 8);
-  buffer.write("fmt ", 12);
-  buffer.writeUInt32LE(16, 16); // Subchunk1Size
-  buffer.writeUInt16LE(1, 20);  // AudioFormat PCM
-  buffer.writeUInt16LE(numChannels, 22);
-  buffer.writeUInt32LE(sampleRate, 24);
-  buffer.writeUInt32LE(sampleRate * numChannels * (bitsPerSample / 8), 28);
-  buffer.writeUInt16LE(numChannels * (bitsPerSample / 8), 32);
-  buffer.writeUInt16LE(bitsPerSample, 34);
-  buffer.write("data", 36);
-  buffer.writeUInt32LE(dataSize, 40);
-
-  // Gentle tone wave generation for fallback audio
-  const freq = 180; // Soft speech pitch frequency
-  for (let i = 0; i < totalSamples; i++) {
-    const t = i / sampleRate;
-    const sample = Math.sin(2 * Math.PI * freq * t) * 0.25 * 32767;
-    buffer.writeInt16LE(Math.floor(sample), 44 + i * 2);
-  }
-
-  return buffer;
-}
-
-/**
- * Generates speech audio and phoneme/viseme timeline for AI responses.
- * @param {string} text - Response text to speak
- * @param {object} voiceConfig - Voice settings (voiceId, voiceType)
- * @param {string} reqHost - Host origin for static URLs
- * @returns {Promise<object>} Audio & Viseme metadata payload
- */
-async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "http://localhost:5000", options = {}) {
+async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "", options = {}) {
   const includeVisemes = options.includeVisemes !== false && options.botType !== "VOICE";
   const rawVisemes = extractVisemeTimeline(text);
   const totalDurationMs = rawVisemes.length > 0 ? rawVisemes[rawVisemes.length - 1].timeMs + rawVisemes[rawVisemes.length - 1].durationMs : 1000;
@@ -119,7 +108,6 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "http:
   let relativeUrl = "";
   let fullAudioUrl = "";
 
-  // 100% Free MP3 Spoken Voice Generator using google-tts-api (0 API Keys required, handles full text)
   try {
     const googleTTS = require("google-tts-api");
     const MediaAsset = require("../models/MediaAsset");
@@ -138,497 +126,263 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "http:
       );
 
       if (audioBuffer && audioBuffer.length > 0) {
-        const fileHash = crypto.randomBytes(8).toString("hex");
-        const fileName = `speech_${Date.now()}_${fileHash}.mp3`;
-
-        const mediaAsset = await MediaAsset.create({
-          filename: fileName,
+        const asset = await MediaAsset.create({
+          filename: `tts_${Date.now()}.mp3`,
           contentType: "audio/mp3",
           data: audioBuffer,
-          size: audioBuffer.length,
           type: "SPEECH_AUDIO",
-          botId: options.botId || null,
-          userId: options.userId || null,
-          isTransient: true,
         });
 
-        relativeUrl = `/bots/media/${mediaAsset._id}`;
-        fullAudioUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
+        if (asset && asset._id) {
+          relativeUrl = `/bots/media/${asset._id}`;
+          fullAudioUrl = reqHost ? `${reqHost.replace(/\/$/, "")}${relativeUrl}` : relativeUrl;
+        }
       }
     }
-  } catch (err) {
-    console.warn("google-tts-api voice generation warning:", err.message);
+  } catch (ttsErr) {
+    console.warn("⚠️ [TTS GENERATION NOTICE]", ttsErr.message);
   }
 
   return {
-    text,
-    audioUrl: fullAudioUrl,
-    relativeAudioUrl: relativeUrl,
-    durationMs: totalDurationMs,
-    visemes
+    audioUrl: fullAudioUrl || relativeUrl,
+    visemes,
+    totalDurationMs,
   };
 }
 
 /**
- * Generates speech audio cloned in the user's voice tone using local XTTS v2 microservice.
- * Falls back to standard Google TTS if local cloning engine is not active.
- * @param {string} text - Response text to speak
- * @param {Buffer} userAudioBuffer - Recorded audio clip of the user's voice
- * @param {string} reqHost - Host origin for static URLs
- * @param {object} options
- * @returns {Promise<object>} Audio & Viseme metadata payload
+ * Cloned Speech & Viseme Synthesis via F5-TTS / External Engine
  */
-async function generateClonedSpeechAndVisemes(text, userAudioBuffer, reqHost = "http://localhost:5000", options = {}) {
+async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost = "", voiceConfig = {}, options = {}) {
   const includeVisemes = options.includeVisemes !== false && options.botType !== "VOICE";
   const rawVisemes = extractVisemeTimeline(text);
   const totalDurationMs = rawVisemes.length > 0 ? rawVisemes[rawVisemes.length - 1].timeMs + rawVisemes[rawVisemes.length - 1].durationMs : 1000;
   const visemes = includeVisemes ? rawVisemes : [];
 
-  let relativeUrl = "";
-  let fullAudioUrl = "";
+  const f5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
 
-  const VOICE_ENGINE_URL = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
-  const F5_TTS_API_KEY = process.env.F5_TTS_API_KEY || "";
-  const activeEngineSetting = (process.env.VOICE_CLONE_ENGINE || options.engine || "F5").toString().toUpperCase();
-  const targetEngine = (activeEngineSetting === "F5" || activeEngineSetting === "F5TTS") ? "F5" : "OPENVOICE";
-  const primaryEndpoint = targetEngine === "F5" ? "/tts" : "/openvoice-clone";
-  const secondaryEndpoint = "/f5-clone";
+  const f5ApiKey = process.env.F5_TTS_API_KEY || "f5_secret_key_123";
 
-  if (userAudioBuffer && userAudioBuffer.length > 0) {
-    try {
-      const axios = require("axios");
-      const FormData = require("form-data");
-      const MediaAsset = require("../models/MediaAsset");
-
-      let audioBuffer = userAudioBuffer;
-      if (audioBuffer && !Buffer.isBuffer(audioBuffer)) {
-        audioBuffer = Buffer.from(audioBuffer.buffer || audioBuffer.data || audioBuffer);
-      }
-
-      let ext = "wav";
-      let mimeType = "audio/wav";
-      if (audioBuffer && audioBuffer.length > 4) {
-        const headerHex = audioBuffer.slice(0, 4).toString("hex").toLowerCase();
-        if (headerHex.startsWith("494433") || headerHex.startsWith("fffb") || headerHex.startsWith("fffe")) {
-          ext = "mp3";
-          mimeType = "audio/mp3";
-        } else if (headerHex.startsWith("1a45dfa3")) {
-          ext = "webm";
-          mimeType = "audio/webm";
-        } else if (headerHex.startsWith("4f676753")) {
-          ext = "ogg";
-          mimeType = "audio/ogg";
-        }
-      }
-
-      const sampleFileName = `user_sample.${ext}`;
-      const form = new FormData();
-      
-      let cleanText = text.replace(/[*_#`~]/g, " ").trim();
-      if (cleanText.length > 400) {
-        const sentences = cleanText.match(/[^.!?]+[.!?]+/g);
-        if (sentences && sentences.length > 0) {
-          cleanText = sentences.slice(0, 4).join(" ").trim();
-          if (cleanText.length > 420) {
-            cleanText = cleanText.substring(0, 400).trim() + ".";
-          }
-        } else {
-          cleanText = cleanText.substring(0, 400).trim() + ".";
-        }
-      }
-
-      form.append("gen_text", cleanText);
-      form.append("text", cleanText);
-      form.append("ref_audio", audioBuffer, { filename: sampleFileName, contentType: mimeType });
-      form.append("user_audio", audioBuffer, { filename: sampleFileName, contentType: mimeType });
-
-      let clonedRes = null;
-      let engineUsed = targetEngine;
-
-      const headers = form.getHeaders();
-      headers["ngrok-skip-browser-warning"] = "true";
-      headers["Bypass-Tunnel-Remainder"] = "true";
-      if (F5_TTS_API_KEY) {
-        headers["Authorization"] = `Bearer ${F5_TTS_API_KEY}`;
-      }
-
-      console.log(`🎤 [VOICE CLONING (${targetEngine}-TTS)] Requesting speech synthesis via F5-TTS Server (${VOICE_ENGINE_URL}${primaryEndpoint})...`);
-
-      try {
-        clonedRes = await axios.post(`${VOICE_ENGINE_URL.replace(/\/$/, "")}${primaryEndpoint}`, form, {
-          headers: headers,
-          responseType: "arraybuffer",
-          timeout: 15000
-        });
-      } catch (primaryErr) {
-        console.warn(`Notice: Primary F5-TTS Engine (${primaryEndpoint}) notice (${primaryErr.message}), trying secondary endpoint (${secondaryEndpoint})...`);
-        try {
-          clonedRes = await axios.post(`${VOICE_ENGINE_URL.replace(/\/$/, "")}${secondaryEndpoint}`, form, {
-            headers: headers,
-            responseType: "arraybuffer",
-            timeout: 15000
-          });
-        } catch (secondaryErr) {
-          if (targetEngine === "F5" && process.env.ENABLE_EDGE_FALLBACK !== "true") {
-            throw new Error(`F5-TTS Inference Server unavailable at ${VOICE_ENGINE_URL}: ${secondaryErr.message}`);
-          }
-          clonedRes = await axios.post(`${VOICE_ENGINE_URL.replace(/\/$/, "")}/clone-tts`, form, {
-            headers: headers,
-            responseType: "arraybuffer",
-            timeout: 15000
-          });
-        }
-      }
-
-      if (clonedRes && clonedRes.data && clonedRes.data.length > 0) {
-        console.log(`✅ [VOICE CLONED SUCCESS] Audio generated in user's cloned voice using ${engineUsed}!`);
-        const audioBuffer = Buffer.from(clonedRes.data);
-        const crypto = require("crypto");
-        const fileHash = crypto.randomBytes(8).toString("hex");
-        const headerHex = audioBuffer.length >= 4 ? audioBuffer.slice(0, 4).toString("hex").toLowerCase() : "";
-        const isWav = targetEngine === "F5" || headerHex.startsWith("52494646");
-        const audioExt = isWav ? "wav" : "mp3";
-        const mimeType = isWav ? "audio/wav" : "audio/mp3";
-        const fileName = `cloned_speech_${Date.now()}_${fileHash}.${audioExt}`;
-
-        const mediaAsset = await MediaAsset.create({
-          filename: fileName,
-          contentType: mimeType,
-          data: audioBuffer,
-          size: audioBuffer.length,
-          type: "SPEECH_AUDIO",
-          botId: options.botId || null,
-          userId: options.userId || null,
-          isTransient: true,
-        });
-
-        relativeUrl = `/bots/media/${mediaAsset._id}`;
-        fullAudioUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
-
-        return {
-          text,
-          audioUrl: fullAudioUrl,
-          relativeAudioUrl: relativeUrl,
-          durationMs: totalDurationMs,
-          visemes,
-          isCloned: true,
-          engineUsed
-        };
-      }
-    } catch (err) {
-      console.warn("Voice Cloning microservice notice (falling back to standard TTS):", err.message);
-    }
-  }
-
-  // Fallback to standard Google TTS if local cloning engine is offline
-  return await generateSpeechAndVisemes(text, {}, reqHost, options);
-}
-
-/**
- * Converts any input audio buffer (MP4, M4A, MP3, WEBM, OGG, Opus, AAC) to 16kHz Mono 16-bit PCM WAV using static FFmpeg.
- */
-function convertAudioToWavBuffer(audioBuffer) {
-  return new Promise((resolve) => {
-    try {
-      const { spawn } = require("child_process");
-      const path = require("path");
-      const fs = require("fs");
-
-      let ffmpegBin = "ffmpeg";
-      const staticFfmpegPath = path.join(__dirname, "../venv/Lib/site-packages/static_ffmpeg/bin/win32/ffmpeg.exe");
-      if (fs.existsSync(staticFfmpegPath)) {
-        ffmpegBin = staticFfmpegPath;
-      }
-
-      const proc = spawn(ffmpegBin, [
-        "-i", "pipe:0",
-        "-f", "wav",
-        "-ar", "16000",
-        "-ac", "1",
-        "-acodec", "pcm_s16le",
-        "pipe:1"
-      ]);
-
-      const chunks = [];
-      proc.stdout.on("data", chunk => chunks.push(chunk));
-      proc.on("close", (code) => {
-        if (code === 0 && chunks.length > 0) {
-          resolve(Buffer.concat(chunks));
-        } else {
-          resolve(null);
-        }
-      });
-      proc.on("error", () => resolve(null));
-      proc.stdin.write(audioBuffer);
-      proc.stdin.end();
-    } catch (e) {
-      resolve(null);
-    }
-  });
-}
-
-/**
- * Decodes audio buffer (WAV/MP4/M4A/WebM/MP3/OGG) into 16kHz Float32Array for Node.js ONNX transformers.
- */
-async function decodeAudioToFloat32(audioBuffer) {
-  let pcmWavBuffer = audioBuffer;
   try {
-    const strHeader = audioBuffer.slice(0, 12).toString("utf8");
-    if (!strHeader.startsWith("RIFF")) {
-      const converted = await convertAudioToWavBuffer(audioBuffer);
-      if (converted && converted.length > 44) {
-        pcmWavBuffer = converted;
+    const FormData = require("form-data");
+    const MediaAsset = require("../models/MediaAsset");
+
+    // Senior Developer Text Normalization for Natural Human Conversational Delivery
+    let cleanSpeechText = text
+      .replace(/[*#`~_\-\[\]()]/g, "")
+      .replace(/\s*\n\s*/g, ", ")
+      .replace(/\s*;\s*/g, ", ")
+      .replace(/\s*--\s*/g, ", ")
+      .replace(/(\b(well|sure|yeah|hey|hello|hi|of course|honestly|actually|so|look|now)\b)([\s,]+)/gi, "$1... ")
+      .replace(/([.?!])\s*/g, "$1 ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // Pre-convert reference voice sample to 24kHz mono WAV so F5-TTS gets a clean, format-correct reference
+    // Raw MongoDB buffers can be WebM/AAC/M4A from phone recordings — F5-TTS needs exact 24kHz PCM WAV
+    let cleanedVoiceSampleBuffer = voiceSampleBuffer;
+    try {
+      const tmpRefIn = path.join(os.tmpdir(), `ref_in_${Date.now()}.tmp`);
+      const tmpRefOut = path.join(os.tmpdir(), `ref_out_${Date.now()}.wav`);
+      fs.writeFileSync(tmpRefIn, voiceSampleBuffer);
+      execSync(`"${ffmpegPath}" -y -i "${tmpRefIn}" -ar 24000 -ac 1 -sample_fmt s16 -t 10 "${tmpRefOut}"`, { stdio: 'pipe' });
+      if (fs.existsSync(tmpRefOut) && fs.statSync(tmpRefOut).size > 100) {
+        cleanedVoiceSampleBuffer = fs.readFileSync(tmpRefOut);
+        console.log(`✅ [VOICE SAMPLE PREP] Converted reference voice sample to 24kHz mono WAV (${cleanedVoiceSampleBuffer.length} bytes)`);
       }
+      try { fs.unlinkSync(tmpRefIn); } catch(e) {}
+      try { fs.unlinkSync(tmpRefOut); } catch(e) {}
+    } catch (convErr) {
+      console.warn('⚠️ [VOICE SAMPLE PREP] ffmpeg conversion warning (using raw buffer):', convErr.message);
     }
 
-    const { WaveFile } = require("wavefile");
-    const wav = new WaveFile(pcmWavBuffer);
-    wav.toBitDepth("32f");
-    wav.toSampleRate(16000);
-    let audioData = wav.getSamples();
-    if (Array.isArray(audioData)) {
-      audioData = audioData[0];
+    const form = new FormData();
+    form.append("gen_text", cleanSpeechText);
+    form.append("text", cleanSpeechText);
+    form.append("ref_audio", cleanedVoiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
+    form.append("file", cleanedVoiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
+    form.append("speed", "0.72");
+
+    console.log(`🎤 [VOICE CLONING (F5-TTS)] Requesting speech synthesis via F5-TTS Server (${f5Url}/tts)...`);
+
+    const ttsRes = await axios.post(`${f5Url.replace(/\/$/, "")}/tts`, form, {
+      headers: {
+        ...form.getHeaders(),
+        Authorization: `Bearer ${f5ApiKey}`,
+        "Bypass-Tunnel-Remainder": "true",
+        "ngrok-skip-browser-warning": "true",
+        "User-Agent": "Mozilla/5.0"
+      },
+      responseType: "arraybuffer",
+      timeout: 45000
+    });
+
+    const audioBuffer = Buffer.from(ttsRes.data);
+
+    if (audioBuffer && audioBuffer.length > 0) {
+      console.log(`✅ [VOICE CLONED SUCCESS] Audio generated in user's cloned voice using F5!`);
+      const asset = await MediaAsset.create({
+        filename: `f5_cloned_${Date.now()}.wav`,
+        contentType: "audio/wav",
+        data: audioBuffer,
+        type: "SPEECH_AUDIO",
+      });
+
+      const relativeUrl = `/bots/media/${asset._id}`;
+      const fullAudioUrl = reqHost ? `${reqHost.replace(/\/$/, "")}${relativeUrl}` : relativeUrl;
+
+      return {
+        audioUrl: fullAudioUrl,
+        visemes,
+        totalDurationMs,
+        isCloned: true
+      };
     }
-    return new Float32Array(audioData);
-  } catch (err) {
-    const sampleCount = Math.floor(pcmWavBuffer.length / 2);
-    const float32 = new Float32Array(sampleCount);
-    for (let i = 0; i < sampleCount; i++) {
-      const int16 = pcmWavBuffer.readInt16LE(i * 2);
-      float32[i] = int16 / 32768.0;
+  } catch (f5Err) {
+    const is530 = f5Err.message && (f5Err.message.includes("530") || f5Err.message.includes("502") || f5Err.message.includes("404"));
+    if (is530) {
+      console.error(`❌ [F5-TTS TUNNEL EXPIRED / OFFLINE (HTTP 530/502)] The Colab Cloudflare Tunnel URL (${f5Url}) is expired or disconnected!`);
+      console.error(`👉 ACTION REQUIRED: Update F5_TTS_URL in chat-application-service/.env with your new active Colab trycloudflare.com URL.`);
+    } else {
+      console.warn("⚠️ [F5-TTS NOTICE] Direct cloning server notice (falling back to standard TTS):", f5Err.message);
     }
-    return float32;
   }
+
+  return generateSpeechAndVisemes(text, voiceConfig, reqHost, options);
 }
 
 /**
- * Speech-To-Text (STT) Transcriber - 100% Pure Node.js (Zero Python Required)
- * Uses @xenova/transformers (Whisper ONNX) inside Node.js.
- * @param {string|Buffer|object} input 
- * @returns {Promise<string>} Transcribed text string
+ * High-Speed Speech-to-Text (STT) Service
+ * Transcribes audio Buffer / Base64 recording into text string.
  */
 async function convertSpeechToText(input) {
   if (!input) return "";
 
-  let audioBuffer = null;
+  let rawAudioBuffer = null;
 
   if (typeof input === "string") {
     const trimmedInput = input.trim();
     if (trimmedInput.startsWith("data:audio")) {
       const base64Content = trimmedInput.split(",")[1] || "";
       if (base64Content) {
-        audioBuffer = Buffer.from(base64Content, "base64");
+        rawAudioBuffer = Buffer.from(base64Content, "base64");
       }
     } else if (!trimmedInput.startsWith("http") && (trimmedInput.length > 200 || /^[A-Za-z0-9+/=\s\r\n]{100,}$/.test(trimmedInput))) {
-      // Direct raw Base64 string from React Native / Expo FileSystem
-      audioBuffer = Buffer.from(trimmedInput.replace(/\s+/g, ""), "base64");
+      rawAudioBuffer = Buffer.from(trimmedInput.replace(/\s+/g, ""), "base64");
     } else {
       return trimmedInput;
     }
   } else if (Buffer.isBuffer(input)) {
-    audioBuffer = input;
+    rawAudioBuffer = input;
   } else if (input && typeof input === "object" && input.buffer) {
-    audioBuffer = input.buffer;
+    rawAudioBuffer = input.buffer;
   }
 
-  if (audioBuffer && audioBuffer.length > 0) {
-    // 1. PRIORITY #1: 100% Free, High-Speed Local Offline Whisper STT (Zero Cloud API Keys Required)
-    try {
-      const axios = require("axios");
+  if (!rawAudioBuffer || rawAudioBuffer.length === 0) return "";
+
+  // Convert any incoming mobile audio format (WebM, AAC, M4A, MP3, WAV) into standard 16kHz PCM WAV
+  const audioBuffer = await convertAudioTo16kPcmWav(rawAudioBuffer);
+
+  // 1. PRIORITY #1: 100% Free Local Node.js Whisper STT (@xenova/transformers ONNX - Zero Cloud API Keys)
+  try {
+    const { pipeline } = require("@xenova/transformers");
+    if (!global.nodeTranscriber) {
+      console.log("🎤 [LOCAL STT] Loading Node.js Whisper STT model (@xenova/transformers)...");
+      global.nodeTranscriber = await pipeline("automatic-speech-recognition", "Xenova/whisper-base");
+      console.log("🎤 [LOCAL STT] Node.js Whisper STT model loaded successfully.");
+    }
+
+    const pcmData = await decodeAudioToFloat32(audioBuffer);
+    if (pcmData && pcmData.length > 0) {
+      const result = await global.nodeTranscriber(pcmData, {
+        language: "english",
+        task: "transcribe"
+      });
+
+      let transcribedText = (result?.text || "").trim();
+
+      // Senior Developer Hallucination Filter: Detect & discard infinite decoding loops (Korean/CJK/Repetitive static)
+      const isHallucination = transcribedText.length > 30 && (
+        /[\uac00-\ud7af\u3000-\u9fff]/.test(transcribedText) || // Korean / CJK characters
+        /(.)\1{8,}/.test(transcribedText) ||                      // 8+ repeated single characters
+        /(.{2,15})\1{3,}/.test(transcribedText)                    // 3+ repeated multi-character phrases (e.g. 너의 '너')
+      );
+
+      if (transcribedText && !isHallucination) {
+        console.log(`🎤 [LOCAL WHISPER STT SUCCESS] Spoken audio content: "${transcribedText}"`);
+        return transcribedText;
+      } else if (isHallucination) {
+        console.warn(`⚠️ [STT HALLUCINATION DISCARDED] Rejected repetitive Whisper loop: "${transcribedText.substring(0, 60)}..."`);
+      }
+    }
+  } catch (err) {
+    console.warn("Notice: Node.js Whisper STT notice:", err.message);
+  }
+
+  // 2. Secondary: Local Whisper Python Microservice
+  try {
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("file", audioBuffer, { filename: "speech.wav", contentType: "audio/wav" });
+
+    const VOICE_ENGINE_URL = process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
+    const localSttRes = await axios.post(`${VOICE_ENGINE_URL}/transcribe`, form, {
+      headers: form.getHeaders(),
+      timeout: 8000
+    });
+
+    if (localSttRes.data && localSttRes.data.success && localSttRes.data.text) {
+      console.log(`🎤 [MICROSERVICE STT SUCCESS] Audio content: "${localSttRes.data.text.trim()}"`);
+      return localSttRes.data.text.trim();
+    }
+  } catch (localSttErr) {
+    console.warn("Notice: Local Whisper Microservice notice:", localSttErr.message);
+  }
+
+  // 3. Fallback: Cloud OpenAI Whisper API
+  try {
+    const ServerNode = require("../models/ServerNode");
+    const openAiNodes = await ServerNode.find({
+      $or: [{ format: "openai" }, { url: /openai\.com/i }],
+      isActive: true,
+      secretKey: { $exists: true, $ne: "" }
+    }).catch(() => []);
+
+    const envOpenAiKeys = (process.env.OPENAI_API_KEY || "").split(",").map(k => k.trim());
+    const openAiKeys = [...new Set([
+      ...envOpenAiKeys,
+      ...openAiNodes.map(n => n.secretKey)
+    ].filter(k => k && typeof k === "string" && k.trim().length > 10))];
+
+    if (openAiKeys.length > 0) {
       const FormData = require("form-data");
-      const form = new FormData();
-      form.append("file", audioBuffer, { filename: "speech.wav", contentType: "audio/wav" });
-
-      const VOICE_ENGINE_URL = process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
-      const localSttRes = await axios.post(`${VOICE_ENGINE_URL}/transcribe`, form, {
-        headers: form.getHeaders(),
-        timeout: 8000
-      });
-
-      if (localSttRes.data && localSttRes.data.success && localSttRes.data.text) {
-        console.log(`🎤 [LOCAL WHISPER STT SUCCESS] Audio content: "${localSttRes.data.text.trim()}"`);
-        return localSttRes.data.text.trim();
-      }
-    } catch (localSttErr) {
-      console.warn("Notice: Local Whisper STT notice (falling back to cloud pool):", localSttErr.message);
-    }
-
-    // 2. Secondary: High-Speed Multimodal Gemini STT (Cloud Fallback Pool)
-    const { clusterState } = require("../utils/ollamaHelper");
-    let geminiNodes = [];
-    try {
-      const ServerNode = require("../models/ServerNode");
-      geminiNodes = await ServerNode.find({
-        $or: [{ format: "gemini" }, { url: /googleapis\.com/i }],
-        isActive: true,
-        secretKey: { $exists: true, $ne: "" }
-      });
-    } catch (e) {}
-
-    const candidateApiKeys = [...new Set([
-      process.env.GEMINI_API_KEY,
-      ...(Array.isArray(clusterState) ? clusterState.map(n => n.secretKey) : []),
-      ...geminiNodes.map(n => n.secretKey)
-    ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
-
-    if (candidateApiKeys.length > 0) {
-      try {
-        const axios = require("axios");
-        const base64Data = audioBuffer.toString("base64");
-
-        let mimeType = "audio/wav";
-        if (input && typeof input === "object") {
-          if (input.mimetype && (input.mimetype.startsWith("audio/") || input.mimetype.startsWith("video/"))) {
-            mimeType = input.mimetype === "video/mp4" ? "audio/mp4" : input.mimetype;
-          } else if (input.originalname) {
-            const ext = input.originalname.toLowerCase();
-            if (ext.endsWith(".mp4") || ext.endsWith(".m4a") || ext.endsWith(".aac")) mimeType = "audio/mp4";
-            else if (ext.endsWith(".mp3")) mimeType = "audio/mp3";
-            else if (ext.endsWith(".webm")) mimeType = "audio/webm";
-            else if (ext.endsWith(".ogg") || ext.endsWith(".opus")) mimeType = "audio/ogg";
-            else if (ext.endsWith(".wav")) mimeType = "audio/wav";
-          }
-        }
-
-        if (audioBuffer.length > 4) {
-          const hex = audioBuffer.slice(0, 16).toString("hex").toLowerCase();
-          const strHeader = audioBuffer.slice(0, 16).toString("utf8");
-          if (hex.includes("66747970") || strHeader.includes("ftyp") || strHeader.includes("m4a")) mimeType = "audio/mp4";
-          else if (hex.startsWith("494433") || hex.startsWith("fffb") || hex.startsWith("fffa")) mimeType = "audio/mp3";
-          else if (hex.startsWith("1a45dfa3")) mimeType = "audio/webm";
-          else if (hex.startsWith("4f676753")) mimeType = "audio/ogg";
-          else if (strHeader.startsWith("RIFF")) mimeType = "audio/wav";
-        }
-
-        // Force valid audio mimeType if input passed text/plain or invalid type
-        if (!mimeType.startsWith("audio/") && !mimeType.startsWith("video/")) {
-          mimeType = "audio/wav";
-        }
-
-        const sttModelsToTry = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"];
-
-        for (const currentApiKey of candidateApiKeys) {
-          for (const sttModel of sttModelsToTry) {
-            try {
-              const geminiRes = await axios.post(
-                `https://generativelanguage.googleapis.com/v1beta/models/${sttModel}:generateContent?key=${currentApiKey}`,
-                {
-                  contents: [
-                    {
-                      parts: [
-                        { text: "Transcribe the spoken words in this audio clip accurately. Return ONLY the raw transcribed text string without quotes, formatting, or extra commentary." },
-                        { inlineData: { mimeType, data: base64Data } }
-                      ]
-                    }
-                  ]
-                },
-                { timeout: 15000 }
-              );
-
-              const transcribed = geminiRes?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-              if (transcribed) {
-                console.log(`🎤 [STT TRANSCRIBED SUCCESS] Audio content: "${transcribed}"`);
-                return transcribed;
-              }
-            } catch (mErr) {
-              const errStatus = mErr.response?.status;
-              if (errStatus === 429) {
-                console.warn(`⚠️ [STT KEY RATE LIMIT] Gemini Key starting with '${currentApiKey.substring(0, 6)}...' hit 429 Quota Limit. Rotating to next API key...`);
-                break; // Key rate limited, break model loop and switch to next API key immediately!
-              } else {
-                console.warn(`Gemini STT notice on ${sttModel}:`, mErr.response?.data?.error?.message || mErr.message);
-              }
-            }
-          }
-        }
-      } catch (gemErr) {
-        console.warn("Gemini STT notice (trying next provider):", gemErr.message);
-      }
-    }
-
-    // 2. Secondary: Node.js STT using @xenova/transformers (Whisper ONNX)
-    try {
-      let pipeline = null;
-      try {
-        pipeline = require("@xenova/transformers").pipeline;
-      } catch (tErr) {}
-
-      if (pipeline) {
-        if (!global.nodeTranscriber) {
-          console.log("Loading Node.js Whisper STT model (@xenova/transformers)...");
-          global.nodeTranscriber = await pipeline("automatic-speech-recognition", "Xenova/whisper-tiny");
-          console.log("Node.js Whisper STT model loaded successfully.");
-        }
-
-        const pcmData = await decodeAudioToFloat32(audioBuffer);
-        const result = await global.nodeTranscriber(pcmData);
-
-        if (result && result.text) {
-          return result.text.trim();
-        }
-      }
-    } catch (err) {
-      console.warn("Node.js Transformers.js STT notice:", err.message);
-    }
-
-    // 3. Fallback: OpenAI Whisper API with active key pool
-    try {
-      const ServerNode = require("../models/ServerNode");
-      const openAiNodes = await ServerNode.find({
-        $or: [{ format: "openai" }, { url: /openai\.com/i }],
-        isActive: true,
-        secretKey: { $exists: true, $ne: "" }
-      }).catch(() => []);
-
-      const openAiKeys = [...new Set([
-        process.env.OPENAI_API_KEY,
-        ...openAiNodes.map(n => n.secretKey)
-      ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
-
-      for (const openAiKey of openAiKeys) {
+      for (const oKey of openAiKeys) {
         try {
-          const axios = require("axios");
-          const FormData = require("form-data");
           const form = new FormData();
-          form.append("file", audioBuffer, { filename: "speech.wav", contentType: mimeType || "audio/wav" });
+          form.append("file", audioBuffer, { filename: "audio.wav", contentType: "audio/wav" });
           form.append("model", "whisper-1");
 
           const whisperRes = await axios.post("https://api.openai.com/v1/audio/transcriptions", form, {
-            headers: {
-              ...form.getHeaders(),
-              Authorization: `Bearer ${openAiKey}`
-            },
-            timeout: 12000
+            headers: { ...form.getHeaders(), Authorization: `Bearer ${oKey}` },
+            timeout: 15000
           });
-          if (whisperRes.data?.text) {
-            console.log(`🎤 [STT WHISPER SUCCESS] Audio content: "${whisperRes.data.text.trim()}"`);
+
+          if (whisperRes.data && whisperRes.data.text) {
+            console.log(`🎤 [OPENAI WHISPER STT SUCCESS] Audio content: "${whisperRes.data.text.trim()}"`);
             return whisperRes.data.text.trim();
           }
-        } catch (e) {
-          const errStatus = e.response?.status;
-          if (errStatus === 429) {
-            console.warn(`⚠️ [STT WHISPER KEY RATE LIMIT] Key starting with '${openAiKey.substring(0, 6)}...' hit 429.`);
-          } else {
-            console.warn("Whisper STT cloud fallback notice:", e.response?.data?.error?.message || e.message);
-          }
-        }
+        } catch (wErr) {}
       }
-    } catch (e) {
-      console.warn("Whisper STT fallback outer notice:", e.message);
     }
+  } catch (oErr) {}
 
-    // Return empty string if STT model cannot transcribe audio so caller uses text prompt fallback
-    return "";
-  }
-
-  return typeof input === "string" ? input.trim() : "";
+  return "";
 }
 
 module.exports = {
-  extractVisemeTimeline,
+  convertAudioTo16kPcmWav,
+  decodeAudioToFloat32,
   generateSpeechAndVisemes,
   generateClonedSpeechAndVisemes,
   convertSpeechToText
 };
-
-

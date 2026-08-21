@@ -173,7 +173,7 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
     if (isGeminiKey) secretKey = trimmedUrl;
     trimmedUrl = "https://generativelanguage.googleapis.com/v1beta";
     nodeFormat = "gemini";
-    if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-1.5-flash") model = "gemini-2.5-flash";
+    if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-1.5-flash" || defaultModel === "gemini-2.0-flash") model = "gemini-2.5-flash";
   } else if (isOpenAIKey) {
     secretKey = trimmedUrl;
     trimmedUrl = "https://api.openai.com";
@@ -377,11 +377,18 @@ exports.pingNode = async (req, res) => {
     const tStart = performance.now();
     let isOk = false;
     let statusText = "HEALTHY";
+    let rawSecretKey = "";
+    let targetUrl = node.url ? node.url.trim().replace(/\/$/, "") : "";
+    let nodeFormat = (node.format || "openai").toLowerCase();
 
     try {
-      const rawSecretKey = node.secretKey ? decrypt(node.secretKey) : "";
-      let targetUrl = node.url.trim().replace(/\/$/, "");
-      let nodeFormat = (node.format || "openai").toLowerCase();
+      if (node.secretKey) {
+        try {
+          rawSecretKey = decrypt(node.secretKey);
+        } catch (e) {
+          rawSecretKey = node.secretKey;
+        }
+      }
 
       // Auto-detect Gemini
       const isGeminiNode = targetUrl.includes("googleapis.com") || nodeFormat === "gemini" || (node.defaultModel && node.defaultModel.includes("gemini")) || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
@@ -392,8 +399,8 @@ exports.pingNode = async (req, res) => {
         if (node.format !== "gemini" || node.url !== targetUrl) {
           node.format = "gemini";
           node.url = targetUrl;
-          if (!node.defaultModel || node.defaultModel === "llama3.2:3b") {
-            node.defaultModel = "gemini-1.5-flash";
+          if (!node.defaultModel || node.defaultModel === "llama3.2:3b" || node.defaultModel === "gemini-1.5-flash" || node.defaultModel === "gemini-2.0-flash") {
+            node.defaultModel = "gemini-2.5-flash";
           }
         }
       }
@@ -485,7 +492,20 @@ exports.pingNode = async (req, res) => {
     });
   } catch (error) {
     console.error("Error pinging node:", error.message);
-    return res.status(500).json({ success: false, error: "Failed to ping server node." });
+    const latencyMs = Number((performance.now() - tStart).toFixed(2));
+    node.status = "OFFLINE";
+    node.errorMessage = `OFFLINE (${error.message})`;
+    node.consecutiveFailures = (node.consecutiveFailures || 0) + 1;
+    await node.save().catch(() => {});
+    return res.json({
+      success: true,
+      id: node._id,
+      name: node.name,
+      url: node.url,
+      status: `OFFLINE (${error.message})`,
+      latencyMs,
+      isOk: false
+    });
   }
 };
 

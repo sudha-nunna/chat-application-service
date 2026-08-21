@@ -45,7 +45,7 @@ async function refreshClusterNodesFromDB() {
         if (isGeminiNode) {
           nodeFormat = "gemini";
           nodeUrl = "https://generativelanguage.googleapis.com/v1beta";
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-1.5-flash") {
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-1.5-flash" || defaultModel === "gemini-2.0-flash") {
             defaultModel = "gemini-2.5-flash";
           }
           if (n.format !== "gemini" || n.defaultModel !== defaultModel) {

@@ -93,8 +93,9 @@ function safeFetch(url, options = {}) {
         });
       });
 
-      req.setTimeout(3500, () => {
-        req.destroy(new Error("Node connection timeout (3.5s)"));
+      const timeoutMs = options.timeout || (url.includes("127.0.0.1") || url.includes("localhost") ? 2500 : 1500);
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`Node connection timeout (${timeoutMs}ms)`));
       });
 
       req.on("error", (err) => reject(err));
@@ -250,7 +251,7 @@ class AIGateway {
 
     if (providerLower === "gemini") {
       return await this._streamCloudGemini({
-        model: model === "best" ? "gemini-1.5-flash" : model,
+        model: model === "best" ? "gemini-2.5-flash" : model,
         messages,
         conversationSummary,
         res,
@@ -349,7 +350,7 @@ class AIGateway {
         const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
         if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash" || currentModel === "gemini-2.5-flash")) {
-          currentModel = "gemini-1.5-flash";
+          currentModel = "gemini-2.5-flash";
         }
         if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
           currentModel = "z-ai/glm-5.2";
@@ -401,7 +402,7 @@ class AIGateway {
 
         // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM / Local Ollama
         const modelsToTry = isCurrentGemini
-          ? ["gemini-1.5-flash", "gemini-2.0-flash"]
+          ? ["gemini-3.6-flash", "gemini-2.5-flash"]
           : isCurrentGLM
           ? [currentModel && currentModel !== "z-ai/glm-5.2" ? currentModel : "z-ai/glm-5.2", "meta/llama-3.3-70b-instruct"]
           : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
@@ -711,7 +712,7 @@ class AIGateway {
     }
 
     const streamBuffer = new ActionStreamBuffer(res, onToken);
-    const candidateModels = ["gemini-1.5-flash", "gemini-2.0-flash"];
+    const candidateModels = ["gemini-3.6-flash", "gemini-2.5-flash"];
 
     const { GoogleGenAI } = require("@google/genai");
 
