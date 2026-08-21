@@ -283,43 +283,10 @@ async function convertSpeechToText(input) {
   // Convert any incoming mobile audio format (WebM, AAC, M4A, MP3, WAV) into standard 16kHz PCM WAV
   const audioBuffer = await convertAudioTo16kPcmWav(rawAudioBuffer);
 
-  // 1. PRIORITY #1: 100% Free Local Node.js Whisper STT (@xenova/transformers ONNX - Zero Cloud API Keys)
-  try {
-    const { pipeline } = require("@xenova/transformers");
-    if (!global.nodeTranscriber) {
-      console.log("🎤 [LOCAL STT] Loading Node.js Whisper STT model (@xenova/transformers)...");
-      global.nodeTranscriber = await pipeline("automatic-speech-recognition", "Xenova/whisper-base");
-      console.log("🎤 [LOCAL STT] Node.js Whisper STT model loaded successfully.");
-    }
+  // NOTE: @xenova/transformers local Whisper ONNX removed — consumed ~570MB RAM, crashing Render Free Tier.
+  // FE sends Browser Native STT text directly. Backend STT is only a last-resort fallback for raw audio uploads.
 
-    const pcmData = await decodeAudioToFloat32(audioBuffer);
-    if (pcmData && pcmData.length > 0) {
-      const result = await global.nodeTranscriber(pcmData, {
-        language: "english",
-        task: "transcribe"
-      });
-
-      let transcribedText = (result?.text || "").trim();
-
-      // Senior Developer Hallucination Filter: Detect & discard infinite decoding loops (Korean/CJK/Repetitive static)
-      const isHallucination = transcribedText.length > 30 && (
-        /[\uac00-\ud7af\u3000-\u9fff]/.test(transcribedText) || // Korean / CJK characters
-        /(.)\1{8,}/.test(transcribedText) ||                      // 8+ repeated single characters
-        /(.{2,15})\1{3,}/.test(transcribedText)                    // 3+ repeated multi-character phrases (e.g. 너의 '너')
-      );
-
-      if (transcribedText && !isHallucination) {
-        console.log(`🎤 [LOCAL WHISPER STT SUCCESS] Spoken audio content: "${transcribedText}"`);
-        return transcribedText;
-      } else if (isHallucination) {
-        console.warn(`⚠️ [STT HALLUCINATION DISCARDED] Rejected repetitive Whisper loop: "${transcribedText.substring(0, 60)}..."`);
-      }
-    }
-  } catch (err) {
-    console.warn("Notice: Node.js Whisper STT notice:", err.message);
-  }
-
-  // 2. Secondary: Local Whisper Python Microservice
+  // 1. Fallback: Local Whisper Python Microservice (lightweight)
   try {
     const FormData = require("form-data");
     const form = new FormData();
@@ -339,7 +306,7 @@ async function convertSpeechToText(input) {
     console.warn("Notice: Local Whisper Microservice notice:", localSttErr.message);
   }
 
-  // 3. Fallback: Cloud OpenAI Whisper API
+  // 2. Cloud OpenAI Whisper API (last resort — only if OpenAI key is configured)
   try {
     const ServerNode = require("../models/ServerNode");
     const openAiNodes = await ServerNode.find({

@@ -349,7 +349,7 @@ class AIGateway {
         const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
         const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
-        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash" || currentModel === "gemini-2.5-flash")) {
+        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash" || currentModel === "gemini-2.5-flash" || currentModel === "gemini-3.6-flash")) {
           currentModel = "gemini-2.5-flash";
         }
         if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
@@ -388,9 +388,26 @@ class AIGateway {
           nodeHeaders["X-Internal-Secret"] = resolvedApiKey;
         }
 
-        const targetFetchUrl = isCurrentGemini
-          ? (nodeUrl.includes("/openai") ? `${nodeUrl}/chat/completions` : "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-          : `${nodeUrl}${currentPath}`;
+        // Build final fetch URL from admin-configured node URL
+        // Handle all possible formats admin might store: base URL, /openai suffix, or full path
+        let targetFetchUrl;
+        if (isCurrentGemini) {
+          if (nodeUrl.includes("/chat/completions")) {
+            // Already a full endpoint URL
+            targetFetchUrl = nodeUrl;
+          } else if (nodeUrl.includes("/openai")) {
+            // e.g. https://generativelanguage.googleapis.com/v1beta/openai
+            targetFetchUrl = `${nodeUrl}/chat/completions`;
+          } else if (nodeUrl.includes("googleapis.com")) {
+            // e.g. https://generativelanguage.googleapis.com/v1beta
+            targetFetchUrl = `${nodeUrl}/openai/chat/completions`;
+          } else {
+            // Custom Gemini-compatible proxy URL set by admin
+            targetFetchUrl = `${nodeUrl}/v1/chat/completions`;
+          }
+        } else {
+          targetFetchUrl = `${nodeUrl}${currentPath}`;
+        }
 
         registerActiveJob(activeJobId, {
           userId,
@@ -402,7 +419,7 @@ class AIGateway {
 
         // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM / Local Ollama
         const modelsToTry = isCurrentGemini
-          ? ["gemini-3.6-flash", "gemini-2.5-flash"]
+          ? ["gemini-2.5-flash", "gemini-1.5-flash"]
           : isCurrentGLM
           ? [currentModel && currentModel !== "z-ai/glm-5.2" ? currentModel : "z-ai/glm-5.2", "meta/llama-3.3-70b-instruct"]
           : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
@@ -712,7 +729,7 @@ class AIGateway {
     }
 
     const streamBuffer = new ActionStreamBuffer(res, onToken);
-    const candidateModels = ["gemini-3.6-flash", "gemini-2.5-flash"];
+    const candidateModels = ["gemini-2.5-flash", "gemini-1.5-flash"];
 
     const { GoogleGenAI } = require("@google/genai");
 

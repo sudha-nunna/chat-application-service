@@ -1,3 +1,4 @@
+const mongoose = require("mongoose");
 const BotChunk = require("../models/BotChunk");
 const BotEmbedding = require("../models/BotEmbeddings");
 

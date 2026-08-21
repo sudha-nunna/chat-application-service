@@ -1389,7 +1389,7 @@ exports.sendBotChatMessage = async (req, res) => {
 
     // Execute parallel fetches: Has Files count, RAG chunks (if intent !== GREETING), and cached Bot Rules
     const rulesCacheKey = `bot:${botId}:rules`;
-    const [hasFilesCount, fetchedRagResult, cachedRulesObj] = await Promise.all([
+    let [hasFilesCount, fetchedRagResult, cachedRulesObj] = await Promise.all([
       BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] }),
       intent !== "GREETING"
         ? retrieveRelevantChunks(req.user.id, botId, message, 3, sortedHistory, bot.knowledgeSummary)

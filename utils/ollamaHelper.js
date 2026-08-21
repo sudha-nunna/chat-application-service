@@ -44,8 +44,13 @@ async function refreshClusterNodesFromDB() {
 
         if (isGeminiNode) {
           nodeFormat = "gemini";
-          nodeUrl = "https://generativelanguage.googleapis.com/v1beta";
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-1.5-flash" || defaultModel === "gemini-2.0-flash") {
+          // Preserve admin-configured URL — do NOT overwrite with hardcoded URL
+          // Only ensure the URL is a valid Gemini endpoint if it isn't already
+          if (!nodeUrl || (!nodeUrl.includes("googleapis.com") && !nodeUrl.includes("openai.com"))) {
+            nodeUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+          }
+          // Normalize invalid/placeholder model names to a real working model
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-2.0-flash" || defaultModel === "gemini-3.6-flash") {
             defaultModel = "gemini-2.5-flash";
           }
           if (n.format !== "gemini" || n.defaultModel !== defaultModel) {
@@ -58,12 +63,16 @@ async function refreshClusterNodesFromDB() {
 
         if (isGlmNode) {
           nodeFormat = "glm";
-          nodeUrl = "https://integrate.api.nvidia.com/v1";
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "z-ai/glm-5.2" || defaultModel.includes("gemini")) {
+          // Preserve admin-configured URL — do NOT overwrite with hardcoded URL
+          if (!nodeUrl || !nodeUrl.includes("nvidia.com")) {
+            nodeUrl = "https://integrate.api.nvidia.com/v1";
+          }
+          // Normalize invalid/placeholder model names
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel.includes("gemini")) {
             defaultModel = "glm-4-flash";
           }
-          if (n.format !== "glm" || n.url !== nodeUrl || n.defaultModel !== defaultModel) {
-            ServerNode.findByIdAndUpdate(n._id, { format: "glm", url: nodeUrl, defaultModel }).catch(() => { });
+          if (n.format !== "glm" || n.defaultModel !== defaultModel) {
+            ServerNode.findByIdAndUpdate(n._id, { format: "glm", defaultModel }).catch(() => { });
           }
         }
 
