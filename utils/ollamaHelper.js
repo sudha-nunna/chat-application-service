@@ -67,9 +67,9 @@ async function refreshClusterNodesFromDB() {
           if (!nodeUrl || !nodeUrl.includes("nvidia.com")) {
             nodeUrl = "https://integrate.api.nvidia.com/v1";
           }
-          // Normalize invalid/placeholder model names
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel.includes("gemini")) {
-            defaultModel = "glm-4-flash";
+          // NVIDIA NIM requires provider-prefixed model names (e.g. zhipuai/glm-4-flash)
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "glm-4-flash" || defaultModel === "z-ai/glm-5.2" || defaultModel.includes("gemini")) {
+            defaultModel = "zhipuai/glm-4-flash";
           }
           if (n.format !== "glm" || n.defaultModel !== defaultModel) {
             ServerNode.findByIdAndUpdate(n._id, { format: "glm", defaultModel }).catch(() => { });
@@ -79,8 +79,17 @@ async function refreshClusterNodesFromDB() {
         const priorityScore = typeof n.priorityScore === "number" ? n.priorityScore : (n.priority || 10);
 
         let nodeStatus = n.status || "ACTIVE";
-        // Auto-recover INACTIVE or RATE_LIMITED nodes after 30 seconds
-        if ((nodeStatus === "INACTIVE" || nodeStatus === "RATE_LIMITED") && n.updatedAt && (new Date() - new Date(n.updatedAt)) > 30000) {
+        // Recovery logic:
+        // - RATE_LIMITED: only recover if retryAfter has expired (or was never set)
+        // - INACTIVE: recover after 30s (network blip) unless admin manually deactivated via isActive=false
+        if (nodeStatus === "RATE_LIMITED") {
+          if (!n.retryAfter || new Date(n.retryAfter) <= new Date()) {
+            nodeStatus = "ACTIVE";
+            ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" }).catch(() => {});
+            console.log(`  ✅ [RATE_LIMIT RECOVERED] Node ${n.name} retryAfter expired — restored to ACTIVE.`);
+          }
+          // else: keep RATE_LIMITED until retryAfter passes — do NOT override
+        } else if (nodeStatus === "INACTIVE" && n.updatedAt && (new Date() - new Date(n.updatedAt)) > 30000) {
           nodeStatus = "ACTIVE";
           ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" }).catch(() => {});
         }
@@ -144,7 +153,7 @@ async function refreshClusterNodesFromDB() {
           await ServerNode.create({
             name: "NVIDIA GLM Cloud Node",
             url: "https://integrate.api.nvidia.com/v1",
-            defaultModel: "z-ai/glm-5.2",
+            defaultModel: "zhipuai/glm-4-flash",
             format: "glm",
             secretKey: process.env.NVIDIA_API_KEY ? require("./encryption").encrypt(process.env.NVIDIA_API_KEY) : "",
             priority: 10,
@@ -221,16 +230,25 @@ async function checkClusterHealth() {
         const nodeFormat = (node.format || "openai").toLowerCase();
 
         if (nodeFormat === "gemini" || node.url.includes("googleapis.com")) {
-          const apiKey = rawSecretKey || process.env.GEMINI_API_KEY || "";
+          // DB key only — no process.env fallback
+          const apiKey = rawSecretKey;
+          if (!apiKey) {
+            console.warn(`  ⚠️ [HEALTH CHECK SKIP] Gemini node '${node.name}' has no API key in DB. Add it via Admin Dashboard.`);
+            continue;
+          }
           pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
         } else if (node.format === "glm" || node.url.includes("integrate.api.nvidia.com")) {
-          const apiKey = rawSecretKey || process.env.NVIDIA_API_KEY || "";
-          pingUrl = `https://integrate.api.nvidia.com/v1/models`;
-          if (apiKey) {
-            headers["Authorization"] = `Bearer ${apiKey}`;
+          // DB key only — no process.env fallback
+          const apiKey = rawSecretKey;
+          if (!apiKey) {
+            console.warn(`  ⚠️ [HEALTH CHECK SKIP] GLM node '${node.name}' has no API key in DB. Add it via Admin Dashboard.`);
+            continue;
           }
+          pingUrl = `https://integrate.api.nvidia.com/v1/models`;
+          headers["Authorization"] = `Bearer ${apiKey}`;
         } else if (node.format === "openai" || node.url.includes("openai.com")) {
-          const apiKey = rawSecretKey || process.env.OPENAI_API_KEY || "";
+          // DB key only — no process.env fallback
+          const apiKey = rawSecretKey;
           pingUrl = `${node.url}/v1/models`;
           if (apiKey) {
             headers["Authorization"] = `Bearer ${apiKey}`;

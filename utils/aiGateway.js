@@ -24,41 +24,58 @@ const { selectBestClusterNodeWithPreemption, registerActiveJob, unregisterActive
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
 
-// Global API Key Pool Index Trackers for Cloud Providers (Gemini, GLM/NVIDIA, OpenAI)
-const keyPoolIndexes = {
-  gemini: 0,
-  glm: 0,
-  openai: 0
-};
+/**
+ * Per-key rate limit blocklist.
+ * Maps a specific API key string → the Date until which it is blocked.
+ * This is purely in-memory and resets on server restart (acceptable — keys
+ * re-block themselves on the next 429 quickly enough).
+ */
+const keyBlocklist = new Map(); // Map<apiKeyString, Date>
 
 /**
- * Gets next active API key for a provider from environment pool or node configuration
+ * Returns true if this specific key has hit a 429 and is still in its cooldown window.
  */
-function getProviderApiKey(provider, fallbackNodeKey) {
-  let keysEnv = "";
-  if (provider === "gemini") keysEnv = process.env.GEMINI_API_KEY || "";
-  else if (provider === "glm") keysEnv = process.env.NVIDIA_API_KEY || "";
-  else if (provider === "openai") keysEnv = process.env.OPENAI_API_KEY || "";
-
-  const keys = [
-    ...(fallbackNodeKey && typeof fallbackNodeKey === "string" && !/[\u2022\*]/.test(fallbackNodeKey) ? [fallbackNodeKey] : []),
-    ...keysEnv.split(",").map(k => k.trim())
-  ].filter(k => k && k.length > 5 && !/[\u2022\*]/.test(k));
-
-  const uniqueKeys = [...new Set(keys)];
-  if (uniqueKeys.length === 0) return fallbackNodeKey || "";
-
-  const currentIdx = (keyPoolIndexes[provider] || 0) % uniqueKeys.length;
-  return uniqueKeys[currentIdx];
+function isKeyBlocked(key) {
+  if (!key) return false;
+  const blockedUntil = keyBlocklist.get(key);
+  if (!blockedUntil) return false;
+  if (blockedUntil > new Date()) return true;
+  keyBlocklist.delete(key); // Cooldown expired — unblock
+  return false;
 }
 
 /**
- * Rotates API key index for a provider upon 429 Rate Limit or 401 Auth Failure
+ * Blocks a specific API key for `durationMs` milliseconds (default 90 seconds).
+ * Called immediately when a 429 or 401 is received for that key.
  */
-function rotateProviderApiKey(provider) {
-  if (typeof keyPoolIndexes[provider] !== "number") keyPoolIndexes[provider] = 0;
-  keyPoolIndexes[provider]++;
-  console.warn(`🔄 [API KEY ROTATED] Rotated ${provider.toUpperCase()} API key pool to key index #${keyPoolIndexes[provider]}`);
+function blockKey(key, durationMs = 90000) {
+  if (!key) return;
+  keyBlocklist.set(key, new Date(Date.now() + durationMs));
+  const maskedKey = key.length > 10 ? `...${key.slice(-6)}` : key;
+  console.warn(`🚫 [KEY BLOCKED] API key ${maskedKey} is blocked for ${durationMs / 1000}s due to rate limit / auth failure.`);
+}
+
+/**
+ * Selects the best available (non-blocked) key from a list of candidate keys.
+ * All keys come from DB (decrypted SecretKey on each ServerNode).
+ * Never reads from process.env — admin manages all keys via the dashboard.
+ *
+ * @param {string[]} candidateKeys  - Decrypted key strings from DB nodes
+ * @returns {string}  First non-blocked key, or first key as last-resort fallback
+ */
+function getProviderApiKey(candidateKeys = []) {
+  const validKeys = candidateKeys.filter(k => k && typeof k === "string" && k.trim().length > 5 && !/[\u2022\*]/.test(k));
+  if (validKeys.length === 0) return "";
+  const available = validKeys.find(k => !isKeyBlocked(k));
+  if (available) return available;
+  // All keys blocked — return the one whose block expires soonest (best chance of working)
+  const sorted = validKeys.slice().sort((a, b) => {
+    const aExp = (keyBlocklist.get(a) || new Date(0)).getTime();
+    const bExp = (keyBlocklist.get(b) || new Date(0)).getTime();
+    return aExp - bExp;
+  });
+  console.warn(`⚠️ [KEY POOL EXHAUSTED] All ${validKeys.length} keys are rate-limited. Using soonest-expiring key as last resort.`);
+  return sorted[0];
 }
 
 function safeFetch(url, options = {}) {
@@ -371,15 +388,28 @@ class AIGateway {
           currentPath = "/api/chat";
         }
 
-        const providerName = isCurrentGemini ? "gemini" : isCurrentGLM ? "glm" : (currentNode.format === "openai" || currentNode.url.includes("openai.com")) ? "openai" : "";
-        let resolvedApiKey = getProviderApiKey(providerName, currentNode.secretKey);
-
         const isOfficialCloudService = currentNode.url.includes("api.openai.com") || currentNode.url.includes("googleapis.com") || currentNode.url.includes("integrate.api.nvidia.com");
 
+        // DB-only key resolution: use this node's own decrypted secretKey.
+        // No process.env fallback — all keys must be set by admin via the dashboard.
+        const resolvedApiKey = (currentNode.secretKey && !isKeyBlocked(currentNode.secretKey))
+          ? currentNode.secretKey
+          : currentNode.secretKey || ""; // Last resort: use own key even if blocked
+
         if (isOfficialCloudService && (!resolvedApiKey || !resolvedApiKey.trim())) {
-          console.warn(`⚠️ [AI GATEWAY DISPATCH SKIPPED] Official cloud node ${currentNode.name} (${currentNode.format}) has no API Key configured. Rotating to next pool...`);
+          console.warn(`⚠️ [AI GATEWAY DISPATCH SKIPPED] Official cloud node ${currentNode.name} (${currentNode.format}) has no API Key configured. Add it via Admin Dashboard.`);
           currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
           continue;
+        }
+
+        // Skip this node if its key is currently blocked AND there are other non-blocked nodes available
+        if (isOfficialCloudService && isKeyBlocked(currentNode.secretKey)) {
+          const hasOtherAvailable = poolCandidates.some(n => n.id !== currentNode.id && !isKeyBlocked(n.secretKey || ""));
+          if (hasOtherAvailable) {
+            console.warn(`⏭️ [AI GATEWAY SKIP] Node ${currentNode.name} key is rate-limited (blocked). Skipping to next node with available key.`);
+            currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
+            continue;
+          }
         }
 
         const nodeHeaders = { ...headers };
@@ -418,10 +448,16 @@ class AIGateway {
         });
 
         // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM / Local Ollama
+        // Gemini: Use gemini-3.6-flash as primary (gemini-2.5-flash deprecated for new API keys per Google's notice)
+        // GLM/NVIDIA: Use correct NVIDIA NIM model names (provider-prefixed)
         const modelsToTry = isCurrentGemini
-          ? ["gemini-2.5-flash", "gemini-1.5-flash"]
+          ? ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
           : isCurrentGLM
-          ? [currentModel && currentModel !== "z-ai/glm-5.2" ? currentModel : "z-ai/glm-5.2", "meta/llama-3.3-70b-instruct"]
+          ? [
+              currentModel && currentModel !== "z-ai/glm-5.2" && currentModel !== "glm-4-flash" ? currentModel : "zhipuai/glm-4-flash",
+              "meta/llama-3.1-8b-instruct",
+              "mistralai/mistral-7b-instruct-v0.3"
+            ]
           : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
           ? Array.from(new Set([currentModel, "models/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2", "gemma:2b"])).filter(Boolean)
           : [currentModel];
@@ -469,7 +505,10 @@ class AIGateway {
               method: "POST",
               headers: nodeHeaders,
               body: JSON.stringify(payload),
-              signal: abortController.signal
+              signal: abortController.signal,
+              // Cloud providers (NVIDIA, Gemini, OpenAI) need longer timeout for inference
+              // Local Ollama nodes keep the default 2500ms
+              timeout: isOfficialCloudService ? 30000 : undefined
             });
 
             const elapsedMs = (performance.now() - dispatchStartTime).toFixed(2);
@@ -494,13 +533,14 @@ class AIGateway {
 
               break; // Model success! Exit candidate model loop
             } else if (response.status === 429 || response.status === 401) {
-              const provType = isCurrentGemini ? "gemini" : isCurrentGLM ? "glm" : "openai";
-              rotateProviderApiKey(provType);
-              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP ${response.status}. Rotated API key pool & moving to next cluster node...`);
+              // Block the SPECIFIC key on this node — not a provider-wide counter.
+              // This allows other nodes with different keys to continue serving immediately.
+              if (resolvedApiKey) blockKey(resolvedApiKey, 90000);
+              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP ${response.status}. Key blocked 90s. Moving to next cluster node...`);
               errorMessage = `Provider API Rate Limit Exceeded (HTTP ${response.status}) on ${currentNode.name}.`;
               currentNode.status = "RATE_LIMITED";
-              currentNode.retryAfter = new Date(Date.now() + 60 * 1000);
-              break; // Key rate limited! Break model loop to rotate to NEXT cluster node immediately
+              currentNode.retryAfter = new Date(Date.now() + 90 * 1000);
+              break; // Break model loop → move to next cluster node immediately
             } else if (response.status === 404) {
               console.warn(`⚠️ [AI GATEWAY MODEL 404] Model '${candidateModel}' not found on ${currentNode.name}. Trying next model...`);
               errorMessage = `Model ${candidateModel} not found (HTTP 404).`;
@@ -662,9 +702,33 @@ class AIGateway {
    * Cloud OpenAI Stream Fallback Implementation
    */
   async _streamCloudOpenAI({ model, messages, conversationSummary = null, res, onToken }) {
-    const apiKey = process.env.OPENAI_API_KEY;
+    // DB-only key resolution: collect all active OpenAI node keys from MongoDB.
+    // No process.env.OPENAI_API_KEY fallback — admin manages all keys via dashboard.
+    const { clusterState } = require("./ollamaHelper");
+    const { decrypt } = require("./encryption");
+
+    const memKeys = clusterState
+      .filter(n => n.format === "openai" || n.url.includes("openai.com"))
+      .map(n => n.secretKey)
+      .filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+
+    let dbKeys = [];
+    try {
+      const ServerNode = require("../models/ServerNode");
+      const dbNodes = await ServerNode.find({
+        $or: [{ format: "openai" }, { url: /openai\.com/i }],
+        isActive: true,
+        secretKey: { $exists: true, $ne: "" }
+      });
+      dbKeys = dbNodes.map(n => {
+        try { return n.secretKey ? decrypt(n.secretKey) : ""; } catch (e) { return n.secretKey || ""; }
+      }).filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+    } catch (e) {}
+
+    const apiKey = [...new Set([...memKeys, ...dbKeys])].find(k => !isKeyBlocked(k)) || null;
+
     if (!apiKey) {
-      throw new Error("OPENAI_API_KEY environment variable is not configured.");
+      throw new Error("No OpenAI API key found. Please add an OpenAI Server Node with a valid sk- key in the Admin Dashboard.");
     }
 
     const providerMessages = buildProviderAwareContextPayload({
@@ -697,43 +761,56 @@ class AIGateway {
    * Cloud Google Gemini Stream Fallback Implementation
    */
   async _streamCloudGemini({ model, messages = [], conversationSummary = null, res, onToken, secretKey = null }) {
+    // DB-only key resolution: collect all active Gemini node keys from MongoDB.
+    // No process.env.GEMINI_API_KEY fallback — admin manages all keys via dashboard.
     const { clusterState } = require("./ollamaHelper");
-    const geminiNode = clusterState.find(n => n.format === "gemini" || n.url.includes("googleapis.com"));
+    const { decrypt } = require("./encryption");
 
-    let geminiNodes = [];
+    // Build candidate keys: start from in-memory clusterState (already decrypted),
+    // then fall back to a fresh DB query for any nodes not yet in memory.
+    const memKeys = clusterState
+      .filter(n => n.format === "gemini" || n.url.includes("googleapis.com"))
+      .map(n => n.secretKey)
+      .filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+
+    let dbKeys = [];
     try {
       const ServerNode = require("../models/ServerNode");
-      geminiNodes = await ServerNode.find({
+      const dbNodes = await ServerNode.find({
         $or: [{ format: "gemini" }, { url: /googleapis\.com/i }],
         isActive: true,
         secretKey: { $exists: true, $ne: "" }
       });
+      dbKeys = dbNodes.map(n => {
+        try { return n.secretKey ? decrypt(n.secretKey) : ""; } catch (e) { return n.secretKey || ""; }
+      }).filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
     } catch (e) {}
 
-    const { decrypt } = require("./encryption");
+    // Merge, deduplicate, honour optional override key passed in
     const candidateApiKeys = [...new Set([
-      secretKey,
-      process.env.GEMINI_API_KEY,
-      geminiNode?.secretKey,
-      ...geminiNodes.map(n => {
-        try {
-          return n.secretKey ? decrypt(n.secretKey) : "";
-        } catch (e) {
-          return n.secretKey;
-        }
-      })
-    ].filter(k => k && typeof k === "string" && k.trim().length > 10 && !/[\u2022\*]/.test(k)))];
+      ...(secretKey ? [secretKey] : []),
+      ...memKeys,
+      ...dbKeys
+    ])];
 
     if (candidateApiKeys.length === 0) {
-      throw new Error("Gemini API Key is missing. Please configure GEMINI_API_KEY or add a Gemini Server Node.");
+      throw new Error("No Gemini API key found. Please add a Gemini Server Node with a valid API key in the Admin Dashboard.");
     }
 
-    const streamBuffer = new ActionStreamBuffer(res, onToken);
-    const candidateModels = ["gemini-2.5-flash", "gemini-1.5-flash"];
-
+    const candidateModels = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
     const { GoogleGenAI } = require("@google/genai");
 
     for (const gKey of candidateApiKeys) {
+      // Skip keys that are currently rate-limited
+      if (isKeyBlocked(gKey)) {
+        const maskedKey = gKey.length > 10 ? `...${gKey.slice(-6)}` : gKey;
+        console.warn(`⏭️ [CLOUD GEMINI] Skipping blocked key ${maskedKey}. Trying next key...`);
+        continue;
+      }
+
+      const streamBuffer = new ActionStreamBuffer(res, onToken);
+      let keySucceeded = false;
+
       for (const gModel of candidateModels) {
         try {
           const sysMsg = messages.find(m => m.role === "system")?.content || "";
@@ -758,25 +835,32 @@ class AIGateway {
 
           for await (const chunk of responseStream) {
             const chunkText = chunk.text || "";
-            if (chunkText) {
-              streamBuffer.push(chunkText);
-            }
+            if (chunkText) streamBuffer.push(chunkText);
           }
           streamBuffer.flush();
 
           if (streamBuffer.cleanText && streamBuffer.cleanText.trim()) {
+            keySucceeded = true;
             return { success: true, text: streamBuffer.cleanText };
           }
         } catch (apiErr) {
           const errStatus = apiErr.status || apiErr.response?.status;
-          if (errStatus === 429 || apiErr.message?.includes("429")) {
-            console.warn(`⚠️ [CLOUD GEMINI KEY RATE LIMIT] Key starting with '${gKey.substring(0, 6)}...' hit 429 Quota Limit. Rotating to next API key...`);
+          if (errStatus === 429 || apiErr.message?.includes("429") || apiErr.message?.includes("quota")) {
+            // Block this specific key and break model loop to try next key
+            blockKey(gKey, 90000);
+            console.warn(`⚠️ [CLOUD GEMINI RATE LIMIT] Key ...${gKey.slice(-6)} hit quota. Blocked 90s. Trying next key...`);
+            break; // exits candidateModels loop → continues to next gKey
+          } else if (errStatus === 401 || apiErr.message?.includes("401")) {
+            blockKey(gKey, 300000); // 5 min for auth failures
+            console.warn(`⚠️ [CLOUD GEMINI AUTH FAIL] Key ...${gKey.slice(-6)} is invalid. Blocked 5min. Trying next key...`);
             break;
           } else {
-            console.warn(`Gemini cloud model ${gModel} notice:`, apiErr.message || apiErr);
+            console.warn(`Gemini cloud model ${gModel} error:`, apiErr.message || apiErr);
           }
         }
       }
+
+      if (keySucceeded) break;
     }
 
     return { success: false, text: "" };
@@ -786,11 +870,40 @@ class AIGateway {
    * Cloud NVIDIA GLM Stream Implementation
    */
   async _streamCloudGLM({ model, messages, conversationSummary = null, res, onToken, secretKey = null }) {
+    // DB-only key resolution: collect all active GLM node keys from MongoDB.
+    // No process.env.NVIDIA_API_KEY fallback — admin manages all keys via dashboard.
     const { clusterState } = require("./ollamaHelper");
-    const glmNode = clusterState.find(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"));
-    const apiKey = secretKey || (glmNode ? glmNode.secretKey : "") || process.env.NVIDIA_API_KEY;
+    const { decrypt } = require("./encryption");
+
+    const memKeys = clusterState
+      .filter(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"))
+      .map(n => n.secretKey)
+      .filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+
+    let dbKeys = [];
+    try {
+      const ServerNode = require("../models/ServerNode");
+      const dbNodes = await ServerNode.find({
+        $or: [{ format: "glm" }, { url: /nvidia\.com/i }],
+        isActive: true,
+        secretKey: { $exists: true, $ne: "" }
+      });
+      dbKeys = dbNodes.map(n => {
+        try { return n.secretKey ? decrypt(n.secretKey) : ""; } catch (e) { return n.secretKey || ""; }
+      }).filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+    } catch (e) {}
+
+    const candidateApiKeys = [...new Set([
+      ...(secretKey ? [secretKey] : []),
+      ...memKeys,
+      ...dbKeys
+    ])];
+
+    // Try each non-blocked key
+    let apiKey = candidateApiKeys.find(k => !isKeyBlocked(k)) || candidateApiKeys[0] || null;
+
     if (!apiKey) {
-      throw new Error("NVIDIA GLM API Key is missing. Please add a secret key to your GLM Server Node in Admin Dashboard.");
+      throw new Error("No NVIDIA GLM API key found. Please add a GLM Server Node with a valid nvapi- key in the Admin Dashboard.");
     }
 
     const providerMessages = buildProviderAwareContextPayload({

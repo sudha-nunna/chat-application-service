@@ -336,18 +336,24 @@ CORE BEHAVIOR RULES:
         content: accumulatedResponseText,
       });
 
-      if (userDoc) {
-        userDoc.credits -= 1;
-        await userDoc.save();
-        
-        const CreditTransaction = require("../models/CreditTransaction");
-        await CreditTransaction.create({
-          userId: userDoc._id,
-          amount: -1,
-          type: "message_sent",
-          description: "1 credit deducted for general AI chat message",
-          balanceAfter: userDoc.credits
-        });
+      // Deduct 1 credit from user after successful response
+      try {
+        const freshUserDoc = await User.findById(userId);
+        if (freshUserDoc) {
+          freshUserDoc.credits = Math.max(0, (freshUserDoc.credits || 0) - 1);
+          await freshUserDoc.save();
+
+          const CreditTransaction = require("../models/CreditTransaction");
+          await CreditTransaction.create({
+            userId: freshUserDoc._id,
+            amount: -1,
+            type: "message_sent",
+            description: "1 credit deducted for general AI chat message",
+            balanceAfter: freshUserDoc.credits
+          });
+        }
+      } catch (creditErr) {
+        console.warn("⚠️ [CREDIT] Failed to deduct credit:", creditErr.message);
       }
 
       res.write("data: [DONE]\n\n");

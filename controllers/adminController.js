@@ -424,14 +424,24 @@ exports.pingNode = async (req, res) => {
       const headers = { "Accept": "application/json" };
 
       if (nodeFormat === "gemini" || targetUrl.includes("googleapis.com")) {
-        const apiKey = rawSecretKey || process.env.GEMINI_API_KEY || "";
+        // DB key only — no env fallback
+        const apiKey = rawSecretKey;
+        if (!apiKey) {
+          isOk = false;
+          statusText = "UNHEALTHY (No API Key — add via Admin Dashboard)";
+          return res.json({ success: true, id: node._id, name: node.name, url: node.url, status: statusText, latencyMs: 0, isOk: false });
+        }
         pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
       } else if (nodeFormat === "glm" || targetUrl.includes("integrate.api.nvidia.com")) {
-        const apiKey = rawSecretKey || process.env.NVIDIA_API_KEY || "";
-        pingUrl = `https://integrate.api.nvidia.com/v1/models`;
-        if (apiKey) {
-          headers["Authorization"] = `Bearer ${apiKey}`;
+        // DB key only — no env fallback
+        const apiKey = rawSecretKey;
+        if (!apiKey) {
+          isOk = false;
+          statusText = "UNHEALTHY (No API Key — add via Admin Dashboard)";
+          return res.json({ success: true, id: node._id, name: node.name, url: node.url, status: statusText, latencyMs: 0, isOk: false });
         }
+        pingUrl = `https://integrate.api.nvidia.com/v1/models`;
+        headers["Authorization"] = `Bearer ${apiKey}`;
       } else if (nodeFormat === "ollama") {
         pingUrl = `${targetUrl}/api/tags`;
         if (rawSecretKey) {
@@ -456,7 +466,8 @@ exports.pingNode = async (req, res) => {
       statusText = isOk ? "ACTIVE" : (pingRes.status === 429 ? "RATE_LIMITED" : `UNHEALTHY (HTTP ${pingRes.status})`);
     } catch (err) {
       const isCloudNode = nodeFormat === "glm" || nodeFormat === "gemini" || nodeFormat === "openai" || targetUrl.includes("nvidia.com") || targetUrl.includes("googleapis.com") || targetUrl.includes("openai.com");
-      if (isCloudNode && (rawSecretKey || process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY)) {
+      // For cloud nodes with a DB key, treat network errors as ACTIVE (firewall/timeout, not key issue)
+      if (isCloudNode && rawSecretKey) {
         isOk = true;
         statusText = "ACTIVE";
       } else {
