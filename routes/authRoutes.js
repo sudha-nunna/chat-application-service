@@ -35,6 +35,9 @@ router.post("/google/callback", googleAuthCallback);
 router.get("/me", protect, authController.getCurrentUser);
 router.get("/profile", protect, authController.getCurrentUser);
 
+// Delete user account (permanent — wipes all data)
+router.delete("/account", protect, authController.deleteAccount);
+
 router.post("/voice-sample", protect, handleMulterFields, authController.uploadVoiceSample);
 router.post("/avatar", protect, handleMulterFields, authController.uploadVoiceSample);
 

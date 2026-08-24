@@ -327,13 +327,14 @@ exports.uploadVoiceSample = async (req, res) => {
     }
 
     if (voiceBuffer && voiceBuffer.length > 0) {
-      const fileHash = crypto.randomBytes(8).toString("hex");
-      const audioFilename = `user_voice_sample_${Date.now()}_${fileHash}.wav`;
+      // Auto-number voice sample: bot1voice.wav, bot2voice.wav, etc.
+      const existingVoiceCount = await MediaAsset.countDocuments({ userId, type: "VOICE_SAMPLE" });
+      const autoVoiceFilename = `bot${existingVoiceCount + 1}voice.wav`;
 
       await MediaAsset.updateMany({ userId, type: "VOICE_SAMPLE" }, { isSelected: false });
 
       voiceSampleAsset = await MediaAsset.create({
-        filename: audioFilename,
+        filename: autoVoiceFilename,
         contentType: voiceContentType,
         data: voiceBuffer,
         size: voiceBuffer.length,
@@ -810,6 +811,15 @@ exports.deleteUserVoiceSample = async (req, res) => {
       return res.status(401).json({ success: false, error: "Authentication token required." });
     }
 
+    // Ensure user keeps at least one voice sample
+    const voiceCount = await MediaAsset.countDocuments({ userId, type: "VOICE_SAMPLE" });
+    if (voiceCount <= 1) {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot delete the last voice sample. You must keep at least one voice sample."
+      });
+    }
+
     const asset = await MediaAsset.findOneAndDelete({ _id: sampleId, userId });
     if (!asset) {
       return res.status(404).json({ success: false, error: "Voice sample not found or unauthorized." });
@@ -817,10 +827,31 @@ exports.deleteUserVoiceSample = async (req, res) => {
 
     const user = await User.findById(userId);
     if (user?.voiceSampleId?.toString() === sampleId) {
-      await User.findByIdAndUpdate(userId, {
-        voiceSampleId: null,
-        voiceSampleUrl: ""
-      });
+      // Auto-fallback to the latest remaining voice sample
+      const remainingVoice = await MediaAsset.findOne({ userId, type: "VOICE_SAMPLE" }).sort({ createdAt: -1 });
+      if (remainingVoice) {
+        remainingVoice.isSelected = true;
+        await remainingVoice.save();
+        const reqHost = `${req.protocol}://${req.get("host")}`;
+        await User.findByIdAndUpdate(userId, {
+          voiceSampleId: remainingVoice._id,
+          voiceSampleUrl: `${reqHost.replace(/\/$/, "")}/bots/media/${remainingVoice._id}`
+        });
+      } else {
+        await User.findByIdAndUpdate(userId, {
+          voiceSampleId: null,
+          voiceSampleUrl: ""
+        });
+      }
+    }
+
+    // Purge redis cache
+    const { redis, delCache } = require("../utils/redisClient");
+    if (redis && redis.status === "ready") {
+      await delCache(`avatar:voice:${userId}`);
+      await delCache(`user:${userId}`);
+      await delCache(`user:${userId}:voice_samples`);
+      await delCache(`user:${userId}:active_voice_asset_id`);
     }
 
     return res.json({
@@ -936,6 +967,18 @@ exports.deleteUserAvatar = async (req, res) => {
       return res.status(401).json({ success: false, error: "Authentication token required." });
     }
 
+    // Ensure user keeps at least one avatar image
+    const avatarCount = await MediaAsset.countDocuments({
+      userId,
+      type: { $in: ["PROFILE_IMAGE", "AVATAR_IMAGE", "AVATAR"] }
+    });
+    if (avatarCount <= 1) {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot delete the last avatar image. You must keep at least one avatar."
+      });
+    }
+
     const asset = await MediaAsset.findOneAndDelete({ _id: avatarId, userId });
     if (!asset) {
       return res.status(404).json({ success: false, error: "Avatar image not found or unauthorized." });
@@ -943,11 +986,38 @@ exports.deleteUserAvatar = async (req, res) => {
 
     const user = await User.findById(userId);
     if (user?.avatarImageId?.toString() === avatarId || user?.profilePic?.includes(avatarId)) {
-      await User.findByIdAndUpdate(userId, {
-        avatarImageId: null,
-        avatarUrl: "",
-        profilePic: ""
-      });
+      // Auto-fallback to the latest remaining avatar image
+      const remainingAvatar = await MediaAsset.findOne({
+        userId,
+        type: { $in: ["PROFILE_IMAGE", "AVATAR_IMAGE", "AVATAR"] }
+      }).sort({ createdAt: -1 });
+
+      if (remainingAvatar) {
+        remainingAvatar.isSelected = true;
+        await remainingAvatar.save();
+        const reqHost = `${req.protocol}://${req.get("host")}`;
+        const relativeUrl = `/bots/media/${remainingAvatar._id}`;
+        const fullUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
+        await User.findByIdAndUpdate(userId, {
+          avatarImageId: remainingAvatar._id,
+          avatarUrl: fullUrl,
+          profilePic: fullUrl
+        });
+      } else {
+        await User.findByIdAndUpdate(userId, {
+          avatarImageId: null,
+          avatarUrl: "",
+          profilePic: ""
+        });
+      }
+    }
+
+    // Purge redis cache
+    const { redis, delCache } = require("../utils/redisClient");
+    if (redis && redis.status === "ready") {
+      await delCache(`avatar:voice:${userId}`);
+      await delCache(`user:${userId}`);
+      await delCache(`user:${userId}:avatars`);
     }
 
     return res.json({
@@ -957,5 +1027,81 @@ exports.deleteUserAvatar = async (req, res) => {
   } catch (err) {
     console.error("Delete Avatar Error:", err);
     return res.status(500).json({ success: false, error: "Failed to delete avatar image." });
+  }
+};
+
+/**
+ * Permanently delete the authenticated user's account and ALL associated data.
+ * Cleans up every MongoDB collection that references this userId, then removes
+ * the User document itself (which triggers the User post-hook → Redis flush).
+ * Endpoint: DELETE /auth/account
+ */
+exports.deleteAccount = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?._id;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: "Authentication required." });
+    }
+
+    // Import every model that stores user-owned data
+    const Bot                = require("../models/Bot");
+    const BotFile            = require("../models/BotFile");
+    const BotEmbeddings      = require("../models/BotEmbeddings");
+    const BotChunk           = require("../models/BotChunk");
+    const BotApi             = require("../models/BotApi");
+    const BotContact         = require("../models/BotContact");
+    const BotConversation    = require("../models/BotConversation");
+    const BotMessage         = require("../models/BotMessage");
+    const AvatarConversation = require("../models/AvatarConversation");
+    const AvatarMessage      = require("../models/AvatarMessage");
+    const Chat               = require("../models/Chat");
+    const Contact            = require("../models/Contact");
+    const Subscription       = require("../models/Subscription");
+    const CreditTransaction  = require("../models/CreditTransaction");
+    const Usage              = require("../models/Usage");
+    const Project            = require("../models/Project");
+    const PostmanApi         = require("../models/PostmanApi");
+    const MediaAsset         = require("../models/MediaAsset");
+
+    // 1. Delete all user-owned data across every collection in parallel
+    await Promise.allSettled([
+      Bot.deleteMany({ $or: [{ userId }, { ownerId: userId }] }),
+      BotFile.deleteMany({ $or: [{ userId }, { ownerId: userId }] }),
+      BotEmbeddings.deleteMany({ userId }),
+      BotChunk.deleteMany({ userId }),
+      BotApi.deleteMany({ userId }),
+      BotContact.deleteMany({ userId }),
+      BotConversation.deleteMany({ userId }),
+      BotMessage.deleteMany({ userId }),
+      AvatarConversation.deleteMany({ userId }),
+      AvatarMessage.deleteMany({ userId }),
+      Chat.deleteMany({ userId }),
+      Contact.deleteMany({ userId }),
+      Subscription.deleteMany({ userId }),
+      CreditTransaction.deleteMany({ userId }),
+      Usage.deleteMany({ userId }),
+      Project.deleteMany({ userId }),
+      PostmanApi.deleteMany({ userId }),
+      MediaAsset.deleteMany({ userId }),
+    ]);
+
+    // 2. Delete the User document itself.
+    //    The User.js post-hook on findOneAndDelete automatically fires here,
+    //    which handles any remaining MediaAsset cleanup + full Redis session/cache flush.
+    await User.findByIdAndDelete(userId);
+
+    console.log(`🗑️  [DELETE ACCOUNT] User ${userId} and all associated data permanently deleted.`);
+
+    return res.json({
+      success: true,
+      message: "Your account and all associated data have been permanently deleted.",
+    });
+  } catch (err) {
+    console.error("Delete Account Error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to delete account.",
+      details: err.message,
+    });
   }
 };
