@@ -270,6 +270,17 @@ exports.uploadVoiceSample = async (req, res) => {
       filesArray.find(f => f !== audioFile && !(f.fieldname || "").toLowerCase().includes("audio") && !(f.fieldname || "").toLowerCase().includes("voice")) ||
       (req.file !== audioFile ? req.file : null);
 
+    const currentUser = await User.findById(userId);
+    const hasExistingVoice = Boolean(currentUser?.voiceSampleId || currentUser?.voiceSampleUrl || currentUser?.audioUrl);
+    const hasExistingAvatar = Boolean(currentUser?.avatarImageId || (currentUser?.profilePic && !currentUser.profilePic.includes("googleusercontent")));
+
+    // Check if client explicitly requested selection, or if this is initial onboarding when user has no avatar/voice yet
+    const isExplicitSelectAvatar = req.body?.select === true || req.body?.select === "true" || req.body?.isSelected === true || req.body?.isSelected === "true" || req.query?.select === "true" || (req.path && req.path.includes("/select"));
+    const shouldSelectAvatar = isExplicitSelectAvatar || !hasExistingAvatar;
+
+    const isExplicitSelectVoice = req.body?.select === true || req.body?.select === "true" || req.body?.isSelected === true || req.body?.isSelected === "true" || req.query?.select === "true" || (req.path && req.path.includes("/select"));
+    const shouldSelectVoice = isExplicitSelectVoice || !hasExistingVoice;
+
     const userUpdates = {};
     let voiceSampleAsset = null;
     let avatarImageAsset = null;
@@ -292,7 +303,9 @@ exports.uploadVoiceSample = async (req, res) => {
       const imgExt = avatarContentType.includes("jpeg") || avatarContentType.includes("jpg") ? ".jpg" : ".png";
       const imgFilename = `avatar_${Date.now()}_${imgHash}${imgExt}`;
 
-      await MediaAsset.updateMany({ userId, type: { $in: ["PROFILE_IMAGE", "AVATAR_IMAGE", "AVATAR"] } }, { isSelected: false });
+      if (shouldSelectAvatar) {
+        await MediaAsset.updateMany({ userId, type: { $in: ["PROFILE_IMAGE", "AVATAR_IMAGE", "AVATAR"] } }, { isSelected: false });
+      }
 
       avatarImageAsset = await MediaAsset.create({
         filename: imgFilename,
@@ -301,16 +314,18 @@ exports.uploadVoiceSample = async (req, res) => {
         size: avatarBuffer.length,
         type: "PROFILE_IMAGE",
         userId,
-        isSelected: true,
+        isSelected: shouldSelectAvatar,
         isTransient: false
       });
 
       const relativeAvatarUrl = `/bots/media/${avatarImageAsset._id}`;
       const fullAvatarUrl = `${reqHost.replace(/\/$/, "")}${relativeAvatarUrl}`;
 
-      userUpdates.profilePic = fullAvatarUrl;
-      userUpdates.avatarUrl = fullAvatarUrl;
-      userUpdates.avatarImageId = avatarImageAsset._id;
+      if (shouldSelectAvatar) {
+        userUpdates.profilePic = fullAvatarUrl;
+        userUpdates.avatarUrl = fullAvatarUrl;
+        userUpdates.avatarImageId = avatarImageAsset._id;
+      }
     }
 
     // 2. Process Voice Sample Audio File or Base64 Audio
@@ -327,11 +342,12 @@ exports.uploadVoiceSample = async (req, res) => {
     }
 
     if (voiceBuffer && voiceBuffer.length > 0) {
-      // Auto-number voice sample: bot1voice.wav, bot2voice.wav, etc.
       const existingVoiceCount = await MediaAsset.countDocuments({ userId, type: "VOICE_SAMPLE" });
       const autoVoiceFilename = `bot${existingVoiceCount + 1}voice.wav`;
 
-      await MediaAsset.updateMany({ userId, type: "VOICE_SAMPLE" }, { isSelected: false });
+      if (shouldSelectVoice) {
+        await MediaAsset.updateMany({ userId, type: "VOICE_SAMPLE" }, { isSelected: false });
+      }
 
       voiceSampleAsset = await MediaAsset.create({
         filename: autoVoiceFilename,
@@ -340,23 +356,29 @@ exports.uploadVoiceSample = async (req, res) => {
         size: voiceBuffer.length,
         type: "VOICE_SAMPLE",
         userId,
-        isSelected: true,
+        isSelected: shouldSelectVoice,
         isTransient: false
       });
 
       const relativeVoiceUrl = `/bots/media/${voiceSampleAsset._id}`;
       const fullVoiceUrl = `${reqHost.replace(/\/$/, "")}${relativeVoiceUrl}`;
 
-      userUpdates.voiceSampleId = voiceSampleAsset._id;
-      userUpdates.voiceSampleUrl = fullVoiceUrl;
+      if (shouldSelectVoice) {
+        userUpdates.voiceSampleId = voiceSampleAsset._id;
+        userUpdates.voiceSampleUrl = fullVoiceUrl;
+      }
+    }
 
-      // Instantly invalidate Redis voice cache so 1st chat request uses this new voice sample
+    // Purge Redis cache if active assets were updated
+    if (shouldSelectAvatar || shouldSelectVoice) {
       const { redis, delCache } = require("../utils/redisClient");
       if (redis && redis.status === "ready") {
         await delCache(`avatar:voice:${userId}`);
         await delCache(`user:${userId}`);
         await delCache(`user:${userId}:voice_samples`);
+        await delCache(`user:${userId}:avatars`);
         await delCache(`user:${userId}:active_voice_asset_id`);
+        await delCache(`user:${userId}:active_avatar_asset_id`);
         const keys = await redis.keys("avatar:tts:*").catch(() => []);
         if (keys.length > 0) {
           await redis.del(keys).catch(() => {});
@@ -392,10 +414,6 @@ exports.uploadVoiceSample = async (req, res) => {
       }
     }
 
-    const currentUser = await User.findById(userId);
-    const hasExistingVoice = Boolean(currentUser?.voiceSampleId || currentUser?.voiceSampleUrl || currentUser?.audioUrl);
-    const hasExistingAvatar = Boolean(currentUser?.avatarImageId || (currentUser?.profilePic && !currentUser.profilePic.includes("googleusercontent")));
-
     const hasNewAvatar = Boolean(avatarBuffer && avatarBuffer.length > 0);
     const hasNewVoice = Boolean(voiceBuffer && voiceBuffer.length > 0);
 
@@ -419,10 +437,16 @@ exports.uploadVoiceSample = async (req, res) => {
       });
     }
 
-    const activeVoiceUrl = voiceSampleAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${voiceSampleAsset._id}` : (updatedUser?.voiceSampleUrl || "");
-    const activeVoiceId = voiceSampleAsset?._id || updatedUser?.voiceSampleId || null;
+    const activeVoiceUrl = updatedUser?.voiceSampleUrl || "";
+    const activeVoiceId = updatedUser?.voiceSampleId || null;
     const activeAvatarUrl = updatedUser?.avatarUrl || updatedUser?.profilePic || "";
-    const activeAvatarId = avatarImageAsset?._id || updatedUser?.avatarImageId || null;
+    const activeAvatarId = updatedUser?.avatarImageId || null;
+
+    const uploadedAvatarUrl = avatarImageAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${avatarImageAsset._id}` : activeAvatarUrl;
+    const uploadedAvatarId = avatarImageAsset?._id || activeAvatarId;
+
+    const uploadedVoiceUrl = voiceSampleAsset ? `${reqHost.replace(/\/$/, "")}/bots/media/${voiceSampleAsset._id}` : activeVoiceUrl;
+    const uploadedVoiceId = voiceSampleAsset?._id || activeVoiceId;
 
     if (!isBothAvailable) {
       return res.json({
@@ -430,10 +454,16 @@ exports.uploadVoiceSample = async (req, res) => {
         message: !finalAvatarAvailable
           ? "Voice sample saved successfully. An avatar photo image is still required to complete your profile setup."
           : "Avatar photo image saved successfully. A voice sample recording is still required to complete your profile setup.",
-        voiceSampleId: activeVoiceId,
-        voiceSampleUrl: activeVoiceUrl,
-        avatarId: activeAvatarId,
-        avatarUrl: activeAvatarUrl,
+        voiceSampleId: uploadedVoiceId,
+        voiceSampleUrl: uploadedVoiceUrl,
+        audioId: uploadedVoiceId,
+        audioUrl: uploadedVoiceUrl,
+        selectedVoiceSampleId: activeVoiceId,
+        activeVoiceSampleId: activeVoiceId,
+        avatarId: uploadedAvatarId,
+        avatarUrl: uploadedAvatarUrl,
+        selectedAvatarId: activeAvatarId,
+        activeAvatarId: activeAvatarId,
         relativeUrl: voiceSampleAsset ? `/bots/media/${voiceSampleAsset._id}` : (avatarImageAsset ? `/bots/media/${avatarImageAsset._id}` : ""),
         isProfileSetup: false,
         isAvatarSetup: finalAvatarAvailable,
@@ -451,8 +481,13 @@ exports.uploadVoiceSample = async (req, res) => {
           botName: updatedUser?.botName || agentCustomName || "",
           voiceSampleUrl: activeVoiceUrl,
           voiceSampleId: activeVoiceId,
+          audioUrl: activeVoiceUrl,
+          audioId: activeVoiceId,
           avatarId: activeAvatarId,
+          avatarImageId: activeAvatarId,
           avatarUrl: activeAvatarUrl,
+          profilePic: activeAvatarUrl,
+          image: activeAvatarUrl,
           isProfileSetup: false,
           isAvatarSetup: finalAvatarAvailable,
           isVoiceSetup: finalVoiceAvailable,
@@ -464,22 +499,34 @@ exports.uploadVoiceSample = async (req, res) => {
       });
     }
 
-    let statusMsg = "Initial profile setup completed successfully.";
+    let statusMsg = "Assets uploaded successfully.";
     if (avatarImageAsset && voiceSampleAsset) {
-      statusMsg = "Avatar photo image and voice profile sample updated successfully.";
+      statusMsg = shouldSelectAvatar && shouldSelectVoice
+        ? "Avatar photo image and voice profile sample updated successfully."
+        : "Avatar photo image and voice profile sample uploaded successfully.";
     } else if (avatarImageAsset) {
-      statusMsg = "Avatar photo image updated successfully.";
+      statusMsg = shouldSelectAvatar
+        ? "Avatar photo image updated successfully."
+        : "Avatar photo image uploaded successfully. Select it to set as active profile picture.";
     } else if (voiceSampleAsset) {
-      statusMsg = "Voice profile sample updated successfully.";
+      statusMsg = shouldSelectVoice
+        ? "Voice profile sample updated successfully."
+        : "Voice profile sample uploaded successfully.";
     }
 
     return res.json({
       success: true,
       message: statusMsg,
-      voiceSampleId: activeVoiceId,
-      voiceSampleUrl: activeVoiceUrl,
-      avatarId: activeAvatarId,
-      avatarUrl: activeAvatarUrl,
+      voiceSampleId: uploadedVoiceId,
+      voiceSampleUrl: uploadedVoiceUrl,
+      audioId: uploadedVoiceId,
+      audioUrl: uploadedVoiceUrl,
+      selectedVoiceSampleId: activeVoiceId,
+      activeVoiceSampleId: activeVoiceId,
+      avatarId: uploadedAvatarId,
+      avatarUrl: uploadedAvatarUrl,
+      selectedAvatarId: activeAvatarId,
+      activeAvatarId: activeAvatarId,
       botName: updatedUser?.botName || agentCustomName || "",
       isProfileSetup: true,
       isAvatarSetup: true,
@@ -493,8 +540,13 @@ exports.uploadVoiceSample = async (req, res) => {
         botName: updatedUser?.botName || agentCustomName || "",
         voiceSampleUrl: activeVoiceUrl,
         voiceSampleId: activeVoiceId,
+        audioUrl: activeVoiceUrl,
+        audioId: activeVoiceId,
         avatarId: activeAvatarId,
+        avatarImageId: activeAvatarId,
         avatarUrl: activeAvatarUrl,
+        profilePic: activeAvatarUrl,
+        image: activeAvatarUrl,
         isProfileSetup: true,
         isAvatarSetup: true,
         isVoiceSetup: true,
@@ -536,6 +588,8 @@ exports.getCurrentUser = async (req, res) => {
 
     const activeVoiceUrl = user.voiceSampleUrl || "";
     const activeVoiceId = user.voiceSampleId || null;
+    const activeAvatarUrl = user.avatarUrl || user.profilePic || "";
+    const activeAvatarId = user.avatarImageId || null;
 
     return res.json({
       success: true,
@@ -543,9 +597,11 @@ exports.getCurrentUser = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        profilePic: user.profilePic,
-        avatarUrl: user.avatarUrl || user.profilePic || "",
-        avatarImageId: user.avatarImageId || null,
+        profilePic: user.profilePic || activeAvatarUrl,
+        avatarUrl: activeAvatarUrl,
+        avatarImageId: activeAvatarId,
+        avatarId: activeAvatarId,
+        image: activeAvatarUrl,
         botName: user.botName || "",
         authType: user.authType,
         plan: user.plan,
@@ -884,26 +940,32 @@ exports.getUserAvatars = async (req, res) => {
 
     const reqHost = `${req.protocol}://${req.get("host")}`;
 
+    // Determine activeAvatarId strictly from user.avatarImageId or the asset marked isSelected: true
+    let activeAvatarId = user?.avatarImageId?.toString() || "";
+    if (!activeAvatarId && avatars.length > 0) {
+      const selectedAvatar = avatars.find(a => a.isSelected) || avatars[0];
+      activeAvatarId = selectedAvatar._id.toString();
+    }
+
     const formattedAvatars = avatars.map((asset) => {
       const relativeUrl = `/bots/media/${asset._id}`;
-      const isSelected = user?.avatarImageId?.toString() === asset._id.toString() || user?.profilePic?.includes(asset._id.toString());
+      const isSelected = activeAvatarId === asset._id.toString();
       return {
         id: asset._id,
         filename: asset.filename,
         avatarUrl: `${reqHost.replace(/\/$/, "")}${relativeUrl}`,
         relativeUrl,
-        size: asset.size,
-        isSelected,
+        size: asset.size || 0,
+        isSelected: Boolean(isSelected),
         createdAt: asset.createdAt
       };
     });
 
     return res.json({
       success: true,
-      activeAvatarId: user?.avatarImageId || null,
-      avatars: formattedAvatars,
-      // Alias key for compatibility with voice samples response structure
-      
+      activeAvatarId: activeAvatarId || null,
+      selectedAvatarId: activeAvatarId || null,
+      avatars: formattedAvatars
     });
   } catch (err) {
     console.error("Get Avatars Error:", err);
@@ -918,7 +980,7 @@ exports.getUserAvatars = async (req, res) => {
 exports.selectUserAvatar = async (req, res) => {
   try {
     const MediaAsset = require("../models/MediaAsset");
-    const avatarId = req.params.avatarId || req.params.sampleId;
+    const avatarId = req.params.avatarId || req.params.sampleId || req.params.id;
     const userId = req.user?.id || req.user?._id;
     if (!userId) {
       return res.status(401).json({ success: false, error: "Authentication token required." });
@@ -933,24 +995,50 @@ exports.selectUserAvatar = async (req, res) => {
     const relativeUrl = `/bots/media/${asset._id}`;
     const fullUrl = `${reqHost.replace(/\/$/, "")}${relativeUrl}`;
 
+    // 1. Mark all other user avatars as unselected and this one as selected
     await MediaAsset.updateMany({ userId, type: { $in: ["PROFILE_IMAGE", "AVATAR_IMAGE", "AVATAR"] } }, { isSelected: false });
     await MediaAsset.findByIdAndUpdate(avatarId, { isSelected: true });
 
-    await User.findByIdAndUpdate(userId, {
-      avatarImageId: asset._id,
-      avatarUrl: fullUrl,
-      profilePic: fullUrl
-    });
+    // 2. Update user profile
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      {
+        avatarImageId: asset._id,
+        avatarUrl: fullUrl,
+        profilePic: fullUrl,
+        isProfileSetup: true
+      },
+      { new: true }
+    ).select("-password");
+
+    // 3. Purge Redis caches so changes reflect immediately everywhere
+    const { redis, delCache } = require("../utils/redisClient");
+    if (redis && redis.status === "ready") {
+      await delCache(`avatar:voice:${userId}`);
+      await delCache(`user:${userId}`);
+      await delCache(`user:${userId}:avatars`);
+      await delCache(`user:${userId}:active_avatar_asset_id`);
+    }
 
     return res.json({
       success: true,
       message: "Active profile avatar updated successfully.",
       selectedAvatarId: asset._id,
-      avatarUrl: fullUrl
+      avatarId: asset._id,
+      avatarUrl: fullUrl,
+      profilePic: fullUrl,
+      user: {
+        ...(updatedUser ? updatedUser.toObject() : {}),
+        avatarId: asset._id,
+        avatarImageId: asset._id,
+        avatarUrl: fullUrl,
+        profilePic: fullUrl,
+        image: fullUrl
+      }
     });
   } catch (err) {
     console.error("Select Avatar Error:", err);
-    return res.status(500).json({ success: false, error: "Failed to select avatar image." });
+    return res.status(500).json({ success: false, error: "Failed to select avatar image.", details: err.message });
   }
 };
 
@@ -961,7 +1049,7 @@ exports.selectUserAvatar = async (req, res) => {
 exports.deleteUserAvatar = async (req, res) => {
   try {
     const MediaAsset = require("../models/MediaAsset");
-    const avatarId = req.params.avatarId || req.params.sampleId;
+    const avatarId = req.params.avatarId || req.params.sampleId || req.params.id;
     const userId = req.user?.id || req.user?._id;
     if (!userId) {
       return res.status(401).json({ success: false, error: "Authentication token required." });
@@ -1018,6 +1106,7 @@ exports.deleteUserAvatar = async (req, res) => {
       await delCache(`avatar:voice:${userId}`);
       await delCache(`user:${userId}`);
       await delCache(`user:${userId}:avatars`);
+      await delCache(`user:${userId}:active_avatar_asset_id`);
     }
 
     return res.json({
