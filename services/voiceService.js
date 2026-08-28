@@ -202,6 +202,9 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
     form.append("ref_audio", cleanedVoiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
     form.append("file", cleanedVoiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
     form.append("speed", "1.0");
+    if (voiceConfig?.ref_text || voiceConfig?.sampleTranscript || options?.refText) {
+      form.append("ref_text", voiceConfig.ref_text || voiceConfig.sampleTranscript || options.refText);
+    }
 
     console.log(`🎤 [VOICE CLONING (F5-TTS)] Requesting speech synthesis via F5-TTS Server (${f5Url}/tts)...`);
 
@@ -346,10 +349,50 @@ async function convertSpeechToText(input) {
   return "";
 }
 
+/**
+ * Stream Cloned Voice Synthesis directly to an Express HTTP Response stream (Sentence-by-sentence)
+ */
+async function streamClonedSpeech(text, voiceSampleBuffer, res, voiceConfig = {}, options = {}) {
+  const f5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
+  const f5ApiKey = process.env.F5_TTS_API_KEY || "f5_secret_key_123";
+
+  try {
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("gen_text", text);
+    form.append("text", text);
+    form.append("ref_audio", voiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
+    form.append("file", voiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
+    form.append("speed", "1.0");
+    if (voiceConfig?.ref_text || voiceConfig?.sampleTranscript || options?.refText) {
+      form.append("ref_text", voiceConfig.ref_text || voiceConfig.sampleTranscript || options.refText);
+    }
+
+    const response = await axios.post(`${f5Url.replace(/\/$/, "")}/tts-stream`, form, {
+      headers: {
+        ...form.getHeaders(),
+        Authorization: `Bearer ${f5ApiKey}`,
+      },
+      responseType: "stream",
+      timeout: 60000
+    });
+
+    res.setHeader("Content-Type", "audio/wav");
+    res.setHeader("Transfer-Encoding", "chunked");
+    response.data.pipe(res);
+  } catch (err) {
+    console.error("⚠️ [STREAMING CLONE ERROR]:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Streaming voice cloning failed", details: err.message });
+    }
+  }
+}
+
 module.exports = {
   convertAudioTo16kPcmWav,
   decodeAudioToFloat32,
   generateSpeechAndVisemes,
   generateClonedSpeechAndVisemes,
+  streamClonedSpeech,
   convertSpeechToText
 };
