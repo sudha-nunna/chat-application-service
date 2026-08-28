@@ -167,13 +167,13 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
     const FormData = require("form-data");
     const MediaAsset = require("../models/MediaAsset");
 
-    // Senior Developer Text Normalization for Natural Human Conversational Delivery
+    // Senior Developer Text Normalization for Fluent, Natural Human Conversational Delivery
     let cleanSpeechText = text
       .replace(/[*#`~_\-\[\]()]/g, "")
       .replace(/\s*\n\s*/g, ", ")
       .replace(/\s*;\s*/g, ", ")
       .replace(/\s*--\s*/g, ", ")
-      .replace(/(\b(well|sure|yeah|hey|hello|hi|of course|honestly|actually|so|look|now)\b)([\s,]+)/gi, "$1... ")
+      .replace(/\.{2,}/g, ".")
       .replace(/([.?!])\s*/g, "$1 ")
       .replace(/\s+/g, " ")
       .trim();
@@ -185,7 +185,7 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
       const tmpRefIn = path.join(os.tmpdir(), `ref_in_${Date.now()}.tmp`);
       const tmpRefOut = path.join(os.tmpdir(), `ref_out_${Date.now()}.wav`);
       fs.writeFileSync(tmpRefIn, voiceSampleBuffer);
-      execSync(`"${ffmpegPath}" -y -i "${tmpRefIn}" -ar 24000 -ac 1 -sample_fmt s16 -t 10 "${tmpRefOut}"`, { stdio: 'pipe' });
+      execSync(`"${ffmpegPath}" -y -i "${tmpRefIn}" -ar 24000 -ac 1 -sample_fmt s16 -t 12 "${tmpRefOut}"`, { stdio: 'pipe' });
       if (fs.existsSync(tmpRefOut) && fs.statSync(tmpRefOut).size > 100) {
         cleanedVoiceSampleBuffer = fs.readFileSync(tmpRefOut);
         console.log(`✅ [VOICE SAMPLE PREP] Converted reference voice sample to 24kHz mono WAV (${cleanedVoiceSampleBuffer.length} bytes)`);
@@ -201,7 +201,7 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
     form.append("text", cleanSpeechText);
     form.append("ref_audio", cleanedVoiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
     form.append("file", cleanedVoiceSampleBuffer, { filename: "reference.wav", contentType: "audio/wav" });
-    form.append("speed", "0.72");
+    form.append("speed", "1.0");
 
     console.log(`🎤 [VOICE CLONING (F5-TTS)] Requesting speech synthesis via F5-TTS Server (${f5Url}/tts)...`);
 
