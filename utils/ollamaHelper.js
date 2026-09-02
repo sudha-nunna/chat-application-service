@@ -14,15 +14,22 @@ const HEALTH_CHECK_INTERVAL_MS = 30 * 1000; // 30 seconds
 let clusterState = [];
 let healthCheckTimer = null;
 let isHealthCheckExecuting = false;
+let lastNodesRefreshTime = 0;
+const NODES_CACHE_TTL_MS = 15 * 1000; // 15 seconds in-memory cache
 
 /**
  * Fetches active AI server nodes strictly from MongoDB (ServerNode collection).
+ * Uses 15s in-memory caching to eliminate per-request MongoDB query latency.
  */
-async function refreshClusterNodesFromDB() {
+async function refreshClusterNodesFromDB(force = false) {
+  if (!force && clusterState.length > 0 && (Date.now() - lastNodesRefreshTime < NODES_CACHE_TTL_MS)) {
+    return clusterState;
+  }
   try {
     const ServerNode = require("../models/ServerNode");
     const { decrypt } = require("./encryption");
     const dbNodes = await ServerNode.find({ isActive: true }).sort({ priority: -1, priorityScore: -1, createdAt: 1 });
+    lastNodesRefreshTime = Date.now();
 
     if (dbNodes && dbNodes.length > 0) {
       const activeMap = new Map(clusterState.map(n => [n.id, n.activeRequests]));
@@ -39,17 +46,14 @@ async function refreshClusterNodesFromDB() {
         let nodeFormat = (n.format || "openai").toLowerCase();
         let defaultModel = n.defaultModel || "llama3.2:3b";
 
-        // Auto-fix Gemini node properties if URL or model or key indicates Google Gemini
-        const isGeminiNode = nodeUrl.includes("googleapis.com") || nodeFormat === "gemini" || defaultModel.includes("gemini") || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
+        // Auto-fix Gemini node properties ONLY if URL or key strictly indicates Google Gemini
+        const isGeminiNode = nodeUrl.includes("googleapis.com") || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
 
         if (isGeminiNode) {
           nodeFormat = "gemini";
-          // Preserve admin-configured URL — do NOT overwrite with hardcoded URL
-          // Only ensure the URL is a valid Gemini endpoint if it isn't already
           if (!nodeUrl || (!nodeUrl.includes("googleapis.com") && !nodeUrl.includes("openai.com"))) {
             nodeUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
           }
-          // Normalize invalid/placeholder model names to a real working model
           if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-2.0-flash" || defaultModel === "gemini-3.6-flash") {
             defaultModel = "gemini-2.5-flash";
           }
@@ -58,16 +62,14 @@ async function refreshClusterNodesFromDB() {
           }
         }
 
-        // Auto-fix GLM node properties if URL or model or key indicates NVIDIA / GLM
-        const isGlmNode = nodeUrl.includes("integrate.api.nvidia.com") || nodeFormat === "glm" || defaultModel.includes("glm") || rawSecretKey.startsWith("nvapi-");
+        // Auto-fix GLM node properties ONLY if URL or key strictly indicates official NVIDIA NIM
+        const isGlmNode = nodeUrl.includes("integrate.api.nvidia.com") || rawSecretKey.startsWith("nvapi-");
 
         if (isGlmNode) {
           nodeFormat = "glm";
-          // Preserve admin-configured URL — do NOT overwrite with hardcoded URL
           if (!nodeUrl || !nodeUrl.includes("nvidia.com")) {
             nodeUrl = "https://integrate.api.nvidia.com/v1";
           }
-          // NVIDIA NIM requires provider-prefixed model names (e.g. zhipuai/glm-4-flash)
           if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "glm-4-flash" || defaultModel === "z-ai/glm-5.2" || defaultModel.includes("gemini")) {
             defaultModel = "zhipuai/glm-4-flash";
           }
@@ -120,9 +122,8 @@ async function refreshClusterNodesFromDB() {
       clusterState.length = 0;
       freshNodes.forEach(fn => clusterState.push(fn));
 
-      // Append Local Ollama Fallback Candidate (http://127.0.0.1:11434) if not already in DB
-      const hasLocalNode = freshNodes.some(n => n.url.includes("127.0.0.1:11434") || n.url.includes("localhost:11434"));
-      if (!hasLocalNode) {
+      // Only append Local Ollama emergency fallback if zero active nodes are in DB
+      if (freshNodes.length === 0) {
         clusterState.push({
           id: "local_ollama_11434",
           name: "Local Ollama Engine",
@@ -146,26 +147,7 @@ async function refreshClusterNodesFromDB() {
         });
       }
 
-      // Auto-seed default GLM node in MongoDB if no GLM node exists
-      const hasGlmNode = freshNodes.some(n => n.format === "glm" || n.url.includes("integrate.api.nvidia.com"));
-      if (!hasGlmNode) {
-        try {
-          await ServerNode.create({
-            name: "NVIDIA GLM Cloud Node",
-            url: "https://integrate.api.nvidia.com/v1",
-            defaultModel: "zhipuai/glm-4-flash",
-            format: "glm",
-            secretKey: process.env.NVIDIA_API_KEY ? require("./encryption").encrypt(process.env.NVIDIA_API_KEY) : "",
-            priority: 10,
-            priorityScore: 10,
-            isActive: true,
-            status: "ACTIVE"
-          });
-          return await refreshClusterNodesFromDB();
-        } catch (e) {
-          console.warn("⚠️ [OLLAMA HELPER] Could not auto-seed GLM node:", e.message);
-        }
-      }
+      // (Auto-seeding removed: Admin has full control over all server nodes)
 
       return clusterState;
     } else {
@@ -260,6 +242,7 @@ async function checkClusterHealth() {
           }
         }
 
+        const tStart = performance.now();
         const res = await fetch(pingUrl, fetchOptions);
 
         latency = Number((performance.now() - tStart).toFixed(2));

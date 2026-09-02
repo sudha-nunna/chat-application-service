@@ -25,7 +25,27 @@ const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, keepAliveM
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 30000 });
 
 /**
+ * Accurately estimates token count for a text or message array
+ * Standard rule of thumb: ~3.8 characters per token + framing overhead
+ */
+function estimateTokens(input) {
+  if (!input) return 0;
+  if (Array.isArray(input)) {
+    let count = 0;
+    for (const msg of input) {
+      const contentStr = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
+      count += estimateTokens(contentStr) + 4; // 4 tokens per message framing overhead
+    }
+    return Math.max(1, count);
+  }
+  const str = String(input).trim();
+  if (!str) return 0;
+  return Math.max(1, Math.round(str.length / 3.8));
+}
+
+/**
  * Per-key rate limit blocklist.
+
  * Maps a specific API key string → the Date until which it is blocked.
  * This is purely in-memory and resets on server restart (acceptable — keys
  * re-block themselves on the next 429 quickly enough).
@@ -101,18 +121,32 @@ function safeFetch(url, options = {}) {
       };
 
       const req = client.request(parsedUrl, reqOptions, (res) => {
-        const webStream = Readable.toWeb(res);
+        // Return raw IncomingMessage directly — do NOT convert to Web Streams.
+        // Readable.toWeb() buffers all SSE chunks until completion (35s wait for streaming LLMs).
+        // The stream consumer reads line-by-line using Node.js events.
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
           status: res.statusCode,
           headers: res.headers,
-          body: webStream
+          rawStream: res  // raw Node.js IncomingMessage
         });
       });
 
-      const timeoutMs = options.timeout || (url.includes("127.0.0.1") || url.includes("localhost") ? 2500 : 1500);
-      req.setTimeout(timeoutMs, () => {
-        req.destroy(new Error(`Node connection timeout (${timeoutMs}ms)`));
+      // Remote LLM nodes (codegene, etc.) can take 30-60s before first token.
+      // Use a generous socket inactivity timeout (180s) to handle slow cold-start inference.
+      const isLocalhost = url.includes("127.0.0.1") || url.includes("localhost");
+      const socketTimeoutMs = options.connectTimeout || (isLocalhost ? 8000 : 180000);
+
+      req.setTimeout(socketTimeoutMs, () => {
+        req.destroy(new Error(`Node connection timeout (${socketTimeoutMs}ms)`));
+      });
+
+      // Reset the socket timeout on every data chunk so streaming LLMs don't timeout mid-stream
+      req.on("socket", (socket) => {
+        socket.on("data", () => {
+          // Refresh timeout on each received chunk to prevent mid-stream timeouts
+          socket.setTimeout(socketTimeoutMs);
+        });
       });
 
       req.on("error", (err) => reject(err));
@@ -257,51 +291,166 @@ class AIGateway {
     }
 
     if (providerLower === "openai") {
-      return await this._streamCloudOpenAI({
-        model: model === "best" ? "gpt-4o-mini" : model,
+      // Only attempt official OpenAI API if there's an actual api.openai.com node configured.
+      // Ollama-compatible nodes (codegene, etc.) that use format="openai" for the protocol
+      // should go directly to the cluster — they are NOT official api.openai.com.
+      const { clusterState } = require("./ollamaHelper");
+      const hasRealOpenAiNode = clusterState.some(n =>
+        n.isActive !== false &&
+        n.url && n.url.includes("api.openai.com") &&
+        n.secretKey && n.secretKey.length > 10 &&
+        !n.secretKey.startsWith("sk-ollam") &&
+        !/[\u2022\*]/.test(n.secretKey)
+      );
+
+      if (hasRealOpenAiNode) {
+        try {
+          return await this._streamCloudOpenAI({
+            model: model === "best" ? "gpt-4o-mini" : model,
+            messages,
+            conversationSummary,
+            res,
+            onToken
+          });
+        } catch (openAiErr) {
+          console.warn("⚠️ [GATEWAY STRICT] Cloud OpenAI direct failed:", openAiErr.message, "-> Trying cluster OpenAI nodes.");
+        }
+      }
+      // Fall through to cluster dispatch for Ollama-compatible OpenAI-format nodes
+      return await this._streamOllamaCluster({
+        model: model || "best",
+        customUrl,
         messages,
         conversationSummary,
         res,
-        onToken
+        userPriority,
+        jobId,
+        userId,
+        onToken,
+        strictProvider: "openai"
       });
     }
 
     if (providerLower === "gemini") {
-      return await this._streamCloudGemini({
-        model: model === "best" ? "gemini-2.5-flash" : model,
-        messages,
-        conversationSummary,
-        res,
-        onToken
-      });
+      try {
+        return await this._streamCloudGemini({
+          model: model === "best" ? "gemini-2.5-flash" : model,
+          messages,
+          conversationSummary,
+          res,
+          onToken
+        });
+      } catch (geminiErr) {
+        console.warn("⚠️ [GATEWAY STRICT] Cloud Gemini direct failed:", geminiErr.message, "-> Trying cluster Gemini nodes.");
+        return await this._streamOllamaCluster({
+          model: model || "gemini-2.5-flash",
+          customUrl,
+          messages,
+          conversationSummary,
+          res,
+          userPriority,
+          jobId,
+          userId,
+          onToken,
+          strictProvider: "gemini"
+        });
+      }
     }
 
     if (providerLower === "glm" || providerLower === "nvidia") {
-      return await this._streamCloudGLM({
-        model: model === "best" ? "z-ai/glm-5.2" : model,
-        messages,
-        conversationSummary,
-        res,
-        onToken
-      });
+      try {
+        return await this._streamCloudGLM({
+          model: model === "best" ? "z-ai/glm-5.2" : model,
+          messages,
+          conversationSummary,
+          res,
+          onToken
+        });
+      } catch (glmErr) {
+        console.warn("⚠️ [GATEWAY STRICT] Cloud GLM direct failed:", glmErr.message, "-> Trying cluster GLM nodes.");
+        return await this._streamOllamaCluster({
+          model: model || "z-ai/glm-5.2",
+          customUrl,
+          messages,
+          conversationSummary,
+          res,
+          userPriority,
+          jobId,
+          userId,
+          onToken,
+          strictProvider: "glm"
+        });
+      }
     }
 
-    throw new Error(`Unsupported AI Provider: ${provider}`);
+    // Default & Cluster Stream for Ollama/vLLM & Auto
+    return await this._streamOllamaCluster({
+      model: model || "best",
+      customUrl,
+      messages,
+      conversationSummary,
+      res,
+      userPriority,
+      jobId,
+      userId,
+      onToken,
+      strictProvider: providerLower !== "auto" ? providerLower : null
+    });
   }
 
   /**
    * Streams response from Cluster Server Nodes with Provider Pools, Priority Routing,
    * Least-Loaded Balancing, Intra-Pool & Cross-Pool Failover, and Observability Metrics.
    */
-  async _streamOllamaCluster({ model, customUrl, messages, conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null }) {
+  async _streamOllamaCluster({ model, customUrl, messages, conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null, strictProvider = null }) {
     const { getProviderPools, refreshClusterNodesFromDB } = require("./ollamaHelper");
     await refreshClusterNodesFromDB();
 
     const ServerNode = require("../models/ServerNode");
     const { geminiPool, glmPool, llamaPool, openAiPool, allNodes } = getProviderPools();
 
-    // Group Provider Pools in Priority Fallback Hierarchy: Gemini Pool -> GLM Pool -> LLaMA Pool -> OpenAI Pool
-    const poolsHierarchy = [geminiPool, glmPool, llamaPool, openAiPool];
+    // 1. Find nodes that explicitly support the requested model
+    const matchedNodes = (model && model !== "best" && model !== "auto")
+      ? allNodes.filter(n =>
+          (Array.isArray(n.supportedModels) && n.supportedModels.some(m => m && m.toLowerCase() === model.toLowerCase())) ||
+          (n.defaultModel && n.defaultModel.toLowerCase() === model.toLowerCase()) ||
+          (n.url && n.url.includes("ai.codegene.io") && (model.includes("deepseek") || model.includes("kimi") || model.includes("glm") || model.includes("qwen")))
+        )
+      : [];
+
+    // 2. Strict Mode Provider Isolation: Route strictly within the selected provider pool
+    const isExplicitModel = model && model !== "best" && model !== "auto";
+    const isGeminiModel = (strictProvider === "gemini") || (model && model.toLowerCase().includes("gemini"));
+    const isGLMModel = (strictProvider === "glm") || (model && (model.toLowerCase().includes("glm") || model.toLowerCase().includes("nvidia") || model.toLowerCase().includes("z-ai")));
+    const isOpenAIModel = (strictProvider === "openai") || (model && (model.toLowerCase().startsWith("gpt-") || model.toLowerCase().includes("o1") || model.toLowerCase().includes("o3")));
+    const isOllamaModel = (strictProvider === "ollama") || (model && (model.toLowerCase().includes("qwen") || model.toLowerCase().includes("deepseek") || model.toLowerCase().includes("kimi") || model.toLowerCase().includes("llama")));
+
+    // ALWAYS prioritize matchedNodes first — these are the nodes that explicitly host the requested model.
+    // If matchedNodes has results, use them as the primary pool regardless of provider classification.
+    let poolsHierarchy;
+    if (matchedNodes.length > 0) {
+      // Start with the specific matched nodes, then fall back to the broader pool
+      if (isGeminiModel) poolsHierarchy = [matchedNodes, geminiPool, allNodes];
+      else if (isGLMModel) poolsHierarchy = [matchedNodes, glmPool, allNodes];
+      else if (isOpenAIModel) poolsHierarchy = [matchedNodes, openAiPool, allNodes];
+      else poolsHierarchy = [matchedNodes, allNodes];
+    } else if (isExplicitModel || strictProvider) {
+      if (isOpenAIModel) {
+        poolsHierarchy = [openAiPool, allNodes];
+      } else if (isGeminiModel) {
+        poolsHierarchy = [geminiPool, allNodes];
+      } else if (isGLMModel) {
+        poolsHierarchy = [glmPool, allNodes];
+      } else if (isOllamaModel) {
+        // Ollama models (qwen, llama, deepseek, kimi) can run on any node with OpenAI-compat API
+        poolsHierarchy = [allNodes];
+      } else {
+        poolsHierarchy = [allNodes];
+      }
+    } else {
+      // Auto / Best Mode — try all nodes
+      poolsHierarchy = [allNodes];
+    }
 
     let selectedNode = null;
     let response = null;
@@ -324,8 +473,9 @@ class AIGateway {
     const triedNodeIds = new Set();
     const now = new Date();
 
-    // Cross-Pool Failover Loop: Gemini Pool -> LLaMA Pool -> OpenAI Pool
-    for (const currentPool of poolsHierarchy) {
+    try {
+      // Cross-Pool Failover Loop: Gemini Pool -> LLaMA Pool -> OpenAI Pool
+      for (const currentPool of poolsHierarchy) {
       if (streamedSuccessfully || (response && response.ok)) break;
 
       let poolCandidates = currentPool.filter(n =>
@@ -363,8 +513,9 @@ class AIGateway {
         currentNode.activeRequests++;
         currentNode.lastUsedAt = new Date();
 
-        const isCurrentGemini = currentNode.format === "gemini" || currentNode.url.includes("googleapis.com");
-        const isCurrentGLM = currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com");
+        const isCodegeneNode = (currentNode.url && currentNode.url.includes("ai.codegene.io")) || (currentNode.name && currentNode.name.toLowerCase().includes("codegene"));
+        const isCurrentGemini = !isCodegeneNode && (currentNode.format === "gemini" || currentNode.url.includes("googleapis.com"));
+        const isCurrentGLM = !isCodegeneNode && (currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com"));
         let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
         if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash" || currentModel === "gemini-2.5-flash" || currentModel === "gemini-3.6-flash")) {
           currentModel = "gemini-2.5-flash";
@@ -418,25 +569,33 @@ class AIGateway {
           nodeHeaders["X-Internal-Secret"] = resolvedApiKey;
         }
 
-        // Build final fetch URL from admin-configured node URL
-        // Handle all possible formats admin might store: base URL, /openai suffix, or full path
+        // Build final fetch URL from admin-configured node URL without duplicate /v1 paths
         let targetFetchUrl;
-        if (isCurrentGemini) {
-          if (nodeUrl.includes("/chat/completions")) {
-            // Already a full endpoint URL
-            targetFetchUrl = nodeUrl;
-          } else if (nodeUrl.includes("/openai")) {
-            // e.g. https://generativelanguage.googleapis.com/v1beta/openai
-            targetFetchUrl = `${nodeUrl}/chat/completions`;
-          } else if (nodeUrl.includes("googleapis.com")) {
-            // e.g. https://generativelanguage.googleapis.com/v1beta
-            targetFetchUrl = `${nodeUrl}/openai/chat/completions`;
+        const cleanNodeUrl = nodeUrl.replace(/\/+$/, "");
+        if (isCodegeneNode) {
+          targetFetchUrl = cleanNodeUrl.endsWith("/v1/chat/completions")
+            ? cleanNodeUrl
+            : cleanNodeUrl.endsWith("/v1")
+            ? `${cleanNodeUrl}/chat/completions`
+            : `${cleanNodeUrl}/v1/chat/completions`;
+        } else if (isCurrentGemini) {
+          if (cleanNodeUrl.includes("/chat/completions")) {
+            targetFetchUrl = cleanNodeUrl;
+          } else if (cleanNodeUrl.includes("/openai")) {
+            targetFetchUrl = `${cleanNodeUrl}/chat/completions`;
+          } else if (cleanNodeUrl.includes("googleapis.com")) {
+            targetFetchUrl = `${cleanNodeUrl}/openai/chat/completions`;
           } else {
-            // Custom Gemini-compatible proxy URL set by admin
-            targetFetchUrl = `${nodeUrl}/v1/chat/completions`;
+            targetFetchUrl = `${cleanNodeUrl}/v1/chat/completions`;
           }
+        } else if (cleanNodeUrl.endsWith("/chat/completions") || cleanNodeUrl.endsWith("/api/chat")) {
+          targetFetchUrl = cleanNodeUrl;
+        } else if (cleanNodeUrl.endsWith("/v1")) {
+          targetFetchUrl = `${cleanNodeUrl}/chat/completions`;
+        } else if (isCloudOrOpenAI || isCurrentGLM) {
+          targetFetchUrl = `${cleanNodeUrl}/v1/chat/completions`;
         } else {
-          targetFetchUrl = `${nodeUrl}${currentPath}`;
+          targetFetchUrl = `${cleanNodeUrl}/api/chat`;
         }
 
         registerActiveJob(activeJobId, {
@@ -447,19 +606,22 @@ class AIGateway {
           abortController
         });
 
-        // High Availability Model Fallback Tiers for Google Gemini / NVIDIA GLM / Local Ollama
-        // Gemini: Use gemini-3.6-flash as primary (gemini-2.5-flash deprecated for new API keys per Google's notice)
-        // GLM/NVIDIA: Use correct NVIDIA NIM model names (provider-prefixed)
-        const modelsToTry = isCurrentGemini
+        // High Availability Model Fallback Tiers
+        const modelsToTry = isCodegeneNode
+          ? Array.from(new Set([
+              currentModel,
+              ...(Array.isArray(currentNode.supportedModels) ? currentNode.supportedModels : []),
+              "deepseek-v4-flash:cloud",
+              "glm-5.3-flash:cloud",
+              "gemma4:cloud",
+              "kimi-k2.7-code:cloud"
+            ])).filter(Boolean)
+          : isCurrentGemini
           ? ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
           : isCurrentGLM
-          ? [
-              currentModel && currentModel !== "z-ai/glm-5.2" && currentModel !== "glm-4-flash" ? currentModel : "zhipuai/glm-4-flash",
-              "meta/llama-3.1-8b-instruct",
-              "mistralai/mistral-7b-instruct-v0.3"
-            ]
+          ? Array.from(new Set([currentModel, "zhipuai/glm-4-flash", "meta/llama-3.1-8b-instruct"])).filter(Boolean)
           : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
-          ? Array.from(new Set([currentModel, "models/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2", "gemma:2b"])).filter(Boolean)
+          ? Array.from(new Set([currentModel, process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2"])).filter(Boolean)
           : [currentModel];
 
         let modelSuccess = false;
@@ -500,6 +662,7 @@ class AIGateway {
 
           try {
             console.log(`🚀 [AI GATEWAY DISPATCH] RequestId: ${activeJobId} | Provider: ${currentNode.format || "auto"} | Node: ${currentNode.name} (${currentNode.id}) | Priority: ${currentNode.priorityScore} | Model: ${candidateModel}`);
+            console.log(`🔍 [DEBUG FETCH URL] TargetUrl: ${targetFetchUrl} | AuthHeader: ${nodeHeaders["Authorization"]}`);
 
             response = await safeFetch(targetFetchUrl, {
               method: "POST",
@@ -515,60 +678,116 @@ class AIGateway {
             console.log(`⏱️ [AI GATEWAY RESPONSE] RequestId: ${activeJobId} | Node: ${currentNode.name} | Model: ${candidateModel} | HTTP Status: ${response.status} | Latency: ${elapsedMs}ms`);
 
             if (response.ok) {
-              selectedNode = currentNode;
-              currentNode.successRequests = (currentNode.successRequests || 0) + 1;
-              currentNode.consecutiveFailures = 0;
-              currentNode.status = "ACTIVE";
-              modelSuccess = true;
+              const rawStream = response.rawStream;
+              if (rawStream) {
+                const streamBuffer = new ActionStreamBuffer(res, onToken);
+                let lineBuffer = "";
 
-              if (currentNode.id && currentNode.id.length === 24) {
-                ServerNode.findByIdAndUpdate(currentNode.id, {
-                  $inc: { successRequests: 1 },
-                  status: "ACTIVE",
-                  consecutiveFailures: 0,
-                  defaultModel: candidateModel,
-                  lastUsedAt: new Date()
-                }).catch(() => { });
+                await new Promise((resolveStream) => {
+                  const parseLine = (line) => {
+                    const trimmed = line.trim();
+                    if (!trimmed || trimmed === "event: chunk" || trimmed === "event: metadata" || trimmed.startsWith(":")) return;
+                    let jsonStr = trimmed;
+                    if (trimmed.startsWith("data:")) {
+                      jsonStr = trimmed.replace(/^data:\s*/, "").trim();
+                    }
+                    if (!jsonStr || jsonStr === "[DONE]") return;
+                    try {
+                      const parsed = JSON.parse(jsonStr);
+                      const chunkText =
+                        parsed.choices?.[0]?.delta?.content ??
+                        parsed.choices?.[0]?.message?.content ??
+                        parsed.message?.content ??
+                        parsed.response ?? "";
+                      if (chunkText) {
+                        if (!firstTokenTimestamp) {
+                          firstTokenTimestamp = performance.now();
+                          ttft = firstTokenTimestamp - llmStartTime;
+                        }
+                        streamBuffer.push(chunkText);
+                      }
+                    } catch (e) { }
+                  };
+
+                  rawStream.on("data", (chunk) => {
+                    lineBuffer += chunk.toString("utf8");
+                    let idx;
+                    while ((idx = lineBuffer.indexOf("\n")) !== -1) {
+                      const line = lineBuffer.substring(0, idx);
+                      lineBuffer = lineBuffer.substring(idx + 1);
+                      parseLine(line);
+                    }
+                  });
+
+                  rawStream.on("end", () => {
+                    if (lineBuffer.trim()) parseLine(lineBuffer);
+                    resolveStream();
+                  });
+
+                  rawStream.on("error", (err) => {
+                    console.warn(`⚠️ [AI GATEWAY STREAM ERROR] ${err.message}`);
+                    resolveStream();
+                  });
+
+                  if (abortController.signal.aborted) {
+                    rawStream.destroy();
+                    resolveStream();
+                  } else {
+                    abortController.signal.addEventListener("abort", () => rawStream.destroy(), { once: true });
+                  }
+                });
+
+                streamBuffer.flush();
+
+                if (streamBuffer.cleanText && streamBuffer.cleanText.trim().length > 0) {
+                  accumulatedResponseText = streamBuffer.cleanText;
+                  selectedNode = currentNode;
+                  currentNode.successRequests = (currentNode.successRequests || 0) + 1;
+                  currentNode.consecutiveFailures = 0;
+                  currentNode.status = "ACTIVE";
+                  modelSuccess = true;
+                  streamedSuccessfully = true;
+
+                  if (currentNode.id && currentNode.id.length === 24) {
+                    ServerNode.findByIdAndUpdate(currentNode.id, {
+                      $inc: { successRequests: 1 },
+                      status: "ACTIVE",
+                      consecutiveFailures: 0,
+                      defaultModel: candidateModel,
+                      lastUsedAt: new Date()
+                    }).catch(() => { });
+                  }
+
+                  break; // Successful token streaming! Exit candidate model loop
+                } else {
+                  console.warn(`⚠️ [AI GATEWAY EMPTY STREAM] Model '${candidateModel}' on ${currentNode.name} returned 0 tokens. Trying next candidate model...`);
+                }
               }
-
-              break; // Model success! Exit candidate model loop
-            } else if (response.status === 429 || response.status === 401) {
-              // Block the SPECIFIC key on this node — not a provider-wide counter.
-              // This allows other nodes with different keys to continue serving immediately.
+            } else if (response.status === 429) {
               if (resolvedApiKey) blockKey(resolvedApiKey, 90000);
-              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP ${response.status}. Key blocked 90s. Moving to next cluster node...`);
-              errorMessage = `Provider API Rate Limit Exceeded (HTTP ${response.status}) on ${currentNode.name}.`;
+              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP 429. Key blocked 90s. Moving to next cluster node...`);
+              errorMessage = `Provider API Rate Limit Exceeded (HTTP 429) on ${currentNode.name}.`;
               currentNode.status = "RATE_LIMITED";
               currentNode.retryAfter = new Date(Date.now() + 90 * 1000);
-              break; // Break model loop → move to next cluster node immediately
-            } else if (response.status === 404) {
-              console.warn(`⚠️ [AI GATEWAY MODEL 404] Model '${candidateModel}' not found on ${currentNode.name}. Trying next model...`);
-              errorMessage = `Model ${candidateModel} not found (HTTP 404).`;
+              break;
+            } else if (response.status === 401 || response.status === 403 || response.status === 404 || response.status === 410) {
+              console.warn(`⚠️ [AI GATEWAY MODEL NOTICE] Model '${candidateModel}' on ${currentNode.name} returned HTTP ${response.status}. Trying next candidate model...`);
+              errorMessage = `Model ${candidateModel} returned HTTP ${response.status}.`;
             } else {
               errorMessage = `Server Node ${currentNode.name} returned HTTP ${response.status}.`;
-              break; // Non-404 HTTP error, try next node
             }
           } catch (err) {
             errorMessage = `Network connection error on ${currentNode.name}: ${err.message}`;
             console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} network error: ${err.message}.`);
-            break;
           }
         }
 
-        if (modelSuccess && response && response.ok) {
+        if (modelSuccess) {
           currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
           break; // Intra-Pool Success! Exit node loop
         } else {
           currentNode.failedRequests = (currentNode.failedRequests || 0) + 1;
           currentNode.consecutiveFailures = (currentNode.consecutiveFailures || 0) + 1;
-
-          if (response && response.status === 429) {
-            currentNode.status = "RATE_LIMITED";
-            currentNode.retryAfter = new Date(Date.now() + 60 * 1000);
-          } else if (response && (response.status === 401 || response.status === 403)) {
-            console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} returned HTTP ${response.status} (Invalid or Unauthorized API Key). Rotating to next pool...`);
-            response = null; // Clear failing response to allow next pool execution
-          }
 
           if (currentNode.id && currentNode.id.length === 24) {
             ServerNode.findByIdAndUpdate(currentNode.id, {
@@ -582,68 +801,6 @@ class AIGateway {
         }
       }
     }
-
-    if (!selectedNode && allNodes.length > 0) {
-      selectedNode = allNodes[0];
-    }
-    if (!selectedNode) {
-      selectedNode = { id: "fallback", name: "Fallback Node", activeRequests: 0 };
-    }
-
-    try {
-      if (response && response.ok && response.body) {
-        selectedNode.activeRequests++;
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let rawBuffer = "";
-        const streamBuffer = new ActionStreamBuffer(res, onToken);
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (value) {
-            rawBuffer += decoder.decode(value, { stream: true });
-          }
-
-          const events = rawBuffer.split(/\n\n|\r\n\r\n/);
-          rawBuffer = events.pop() || "";
-
-          for (const event of events) {
-            const lines = event.split(/\r?\n/);
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              let jsonStr = trimmed;
-              if (trimmed.startsWith("data:")) {
-                jsonStr = trimmed.replace(/^data:\s*/, "").trim();
-              }
-              if (!jsonStr || jsonStr === "[DONE]") continue;
-
-              try {
-                const parsed = JSON.parse(jsonStr);
-                const chunkText = parsed.choices?.[0]?.delta?.content ||
-                  parsed.choices?.[0]?.message?.content ||
-                  parsed.message?.content ||
-                  parsed.response || "";
-                if (chunkText) {
-                  if (!firstTokenTimestamp) {
-                    firstTokenTimestamp = performance.now();
-                    ttft = firstTokenTimestamp - llmStartTime;
-                  }
-                  streamBuffer.push(chunkText);
-                }
-              } catch (e) { }
-            }
-          }
-
-          if (done) break;
-        }
-
-        streamBuffer.flush();
-        accumulatedResponseText = streamBuffer.cleanText;
-        streamedSuccessfully = true;
-      }
-    } catch (err) {
-      console.warn(`⚠️ [AI GATEWAY ERROR] Stream consumption error: ${err.message}`);
     } finally {
       unregisterActiveJob(activeJobId);
       if (selectedNode) {
@@ -652,17 +809,17 @@ class AIGateway {
     }
 
     if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
-      console.warn("⚠️ [AI GATEWAY FALLBACK] Cluster node streaming yielded empty text. Attempting direct Cloud AI Provider fallbacks...");
-      try {
-        const cloudRes = await this._streamCloudGemini({ model, messages, conversationSummary, res, onToken });
-        if (cloudRes && cloudRes.text) {
-          accumulatedResponseText = cloudRes.text;
-          streamedSuccessfully = true;
+      if (isGeminiModel) {
+        try {
+          const cloudRes = await this._streamCloudGemini({ model, messages, conversationSummary, res, onToken });
+          if (cloudRes && cloudRes.text) {
+            accumulatedResponseText = cloudRes.text;
+            streamedSuccessfully = true;
+          }
+        } catch (fErr) {
+          console.warn("⚠️ [GATEWAY STRICT] Direct Gemini retry notice:", fErr.message);
         }
-      } catch (fErr) {
-        console.warn("Direct Gemini fallback notice:", fErr.message);
-      }
-      if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
+      } else if (isGLMModel) {
         try {
           const cloudRes = await this._streamCloudGLM({ model, messages, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
@@ -670,10 +827,9 @@ class AIGateway {
             streamedSuccessfully = true;
           }
         } catch (fErr) {
-          console.warn("Direct GLM fallback notice:", fErr.message);
+          console.warn("⚠️ [GATEWAY STRICT] Direct GLM retry notice:", fErr.message);
         }
-      }
-      if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
+      } else if (isOpenAIModel) {
         try {
           const cloudRes = await this._streamCloudOpenAI({ model, messages, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
@@ -681,12 +837,14 @@ class AIGateway {
             streamedSuccessfully = true;
           }
         } catch (fErr) {
-          console.warn("Direct OpenAI fallback notice:", fErr.message);
+          console.warn("⚠️ [GATEWAY STRICT] Direct OpenAI retry notice:", fErr.message);
         }
       }
     }
 
     const totalDurationMs = performance.now() - llmStartTime;
+    const promptTokens = estimateTokens(messages);
+    const completionTokens = estimateTokens(accumulatedResponseText);
 
     return {
       success: streamedSuccessfully && accumulatedResponseText.trim().length > 0,
@@ -694,7 +852,10 @@ class AIGateway {
       errorMessage,
       ttft,
       totalDurationMs,
-      nodeId: selectedNode ? selectedNode.id : "unknown"
+      nodeId: selectedNode ? selectedNode.id : "unknown",
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens
     };
   }
 
@@ -708,21 +869,21 @@ class AIGateway {
     const { decrypt } = require("./encryption");
 
     const memKeys = clusterState
-      .filter(n => n.format === "openai" || n.url.includes("openai.com"))
+      .filter(n => n.url && n.url.includes("api.openai.com"))
       .map(n => n.secretKey)
-      .filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+      .filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k) && !k.startsWith("sk-ollam"));
 
     let dbKeys = [];
     try {
       const ServerNode = require("../models/ServerNode");
       const dbNodes = await ServerNode.find({
-        $or: [{ format: "openai" }, { url: /openai\.com/i }],
+        url: /api\.openai\.com/i,
         isActive: true,
         secretKey: { $exists: true, $ne: "" }
       });
       dbKeys = dbNodes.map(n => {
         try { return n.secretKey ? decrypt(n.secretKey) : ""; } catch (e) { return n.secretKey || ""; }
-      }).filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k));
+      }).filter(k => k && k.length > 10 && !/[\u2022\*]/.test(k) && !k.startsWith("sk-ollam"));
     } catch (e) {}
 
     const apiKey = [...new Set([...memKeys, ...dbKeys])].find(k => !isKeyBlocked(k)) || null;
@@ -754,7 +915,17 @@ class AIGateway {
     }
     streamBuffer.flush();
 
-    return { success: true, text: streamBuffer.cleanText };
+    const promptTokens = estimateTokens(messages);
+    const completionTokens = estimateTokens(streamBuffer.cleanText);
+
+    return {
+      success: true,
+      text: streamBuffer.cleanText,
+      nodeId: "cloud_openai",
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens
+    };
   }
 
   /**
@@ -841,7 +1012,16 @@ class AIGateway {
 
           if (streamBuffer.cleanText && streamBuffer.cleanText.trim()) {
             keySucceeded = true;
-            return { success: true, text: streamBuffer.cleanText };
+            const promptTokens = estimateTokens(messages);
+            const completionTokens = estimateTokens(streamBuffer.cleanText);
+            return {
+              success: true,
+              text: streamBuffer.cleanText,
+              nodeId: "cloud_gemini",
+              promptTokens,
+              completionTokens,
+              totalTokens: promptTokens + completionTokens
+            };
           }
         } catch (apiErr) {
           const errStatus = apiErr.status || apiErr.response?.status;
@@ -933,7 +1113,17 @@ class AIGateway {
     }
     streamBuffer.flush();
 
-    return { success: true, text: streamBuffer.cleanText };
+    const promptTokens = estimateTokens(messages);
+    const completionTokens = estimateTokens(streamBuffer.cleanText);
+
+    return {
+      success: true,
+      text: streamBuffer.cleanText,
+      nodeId: "cloud_glm",
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens
+    };
   }
 }
 
@@ -968,7 +1158,6 @@ class ActionStreamBuffer {
   constructor(res, onToken) {
     this.res = res;
     this.onToken = onToken;
-    this.buffer = "";
     this.cleanText = "";
     this.extractedMeta = [];
     this.firstTokenFired = false;
@@ -976,21 +1165,24 @@ class ActionStreamBuffer {
 
   push(chunkText) {
     if (!chunkText) return;
-    this.buffer += chunkText;
+    const sanitizedChunk = this._sanitizeVendorBranding(chunkText);
+    this.cleanText += sanitizedChunk;
 
-    let newlineIndex;
-    while ((newlineIndex = this.buffer.indexOf("\n")) !== -1) {
-      const line = this.buffer.substring(0, newlineIndex);
-      this.buffer = this.buffer.substring(newlineIndex + 1);
-      this._emitLine(line + "\n");
+    if (!this.firstTokenFired && typeof this.onToken === "function") {
+      this.firstTokenFired = true;
+      this.onToken(sanitizedChunk);
+    }
+
+    if (this.res && !this.res.writableEnded) {
+      this.res.write(`data: ${JSON.stringify({ type: "chunk", chunk: sanitizedChunk, text: sanitizedChunk })}\n\n`);
+      if (typeof this.res.flush === "function") {
+        try { this.res.flush(); } catch (e) {}
+      }
     }
   }
 
   flush() {
-    if (this.buffer.length > 0) {
-      this._emitLine(this.buffer);
-      this.buffer = "";
-    }
+    // All token chunks are already streamed immediately to client
   }
 
   _sanitizeVendorBranding(text) {
@@ -1003,30 +1195,50 @@ class ActionStreamBuffer {
       .replace(/\bClaude\b/gi, "AI Assistant")
       .replace(/\bAnthropic\b/gi, "AI Platform");
   }
+}
 
-  _emitLine(lineWithBreak) {
-    const sanitizedLine = this._sanitizeVendorBranding(lineWithBreak);
-    const trimmed = sanitizedLine.trim();
-    const actionMeta = parseActionDirective(trimmed);
+const modelPricingCache = new Map();
+const MODEL_PRICING_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
 
-    if (actionMeta) {
-      this.extractedMeta.push(actionMeta);
-      console.log(`📡 [SSE OUT Meta Action]:`, JSON.stringify(actionMeta));
-      if (this.res && !this.res.writableEnded) {
-        this.res.write(`event: metadata\ndata: ${JSON.stringify(actionMeta)}\n\n`);
-      }
-    } else {
-      this.cleanText += sanitizedLine;
-      if (!this.firstTokenFired && typeof this.onToken === "function") {
-        this.firstTokenFired = true;
-        this.onToken(sanitizedLine);
-      }
-      if (this.res && !this.res.writableEnded) {
-        console.log(`📡 [SSE OUT Chunk]:`, JSON.stringify({ text: sanitizedLine }));
-        this.res.write(`event: chunk\ndata: ${JSON.stringify({ type: "chunk", chunk: sanitizedLine, text: sanitizedLine })}\n\n`);
-      }
-    }
+async function getModelPricingCached(modelId) {
+  if (!modelId || modelId === "auto" || modelId === "best") {
+    return { promptTokenCostPer1k: 0.05, completionTokenCostPer1k: 0.1, displayName: "Auto Model", provider: "auto", modelId: "auto" };
+  }
+  const cached = modelPricingCache.get(modelId);
+  if (cached && (Date.now() - cached.cachedAt < MODEL_PRICING_TTL_MS)) {
+    return cached.data;
+  }
+  try {
+    const AIModel = require("../models/AIModel");
+    const modelDoc = await AIModel.findOne({ modelId, enabled: true });
+    const data = modelDoc ? {
+      modelId: modelDoc.modelId,
+      displayName: modelDoc.displayName || modelDoc.modelId,
+      provider: modelDoc.provider || "auto",
+      promptTokenCostPer1k: modelDoc.promptTokenCostPer1k ?? 0.05,
+      completionTokenCostPer1k: modelDoc.completionTokenCostPer1k ?? 0.1
+    } : {
+      modelId,
+      displayName: modelId,
+      provider: "auto",
+      promptTokenCostPer1k: 0.05,
+      completionTokenCostPer1k: 0.1
+    };
+    modelPricingCache.set(modelId, { data, cachedAt: Date.now() });
+    return data;
+  } catch (err) {
+    return { promptTokenCostPer1k: 0.05, completionTokenCostPer1k: 0.1, displayName: modelId, provider: "auto", modelId };
   }
 }
 
-module.exports = new AIGateway();
+function invalidateModelPricingCache(modelId = null) {
+  if (modelId) modelPricingCache.delete(modelId);
+  else modelPricingCache.clear();
+}
+
+const gatewayInstance = new AIGateway();
+gatewayInstance.getModelPricingCached = getModelPricingCached;
+gatewayInstance.invalidateModelPricingCache = invalidateModelPricingCache;
+
+module.exports = gatewayInstance;
+

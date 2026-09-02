@@ -1,4 +1,5 @@
 const ServerNode = require("../models/ServerNode");
+const AIModel = require("../models/AIModel");
 const User = require("../models/User");
 const Bot = require("../models/Bot");
 const Message = require("../models/Message");
@@ -169,19 +170,17 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
   const isOpenAIKey = /^(sk-proj-|sk-|gsk_)/i.test(trimmedUrl);
   const isNvidiaKey = /^nvapi-/i.test(trimmedUrl);
 
-  if (isGeminiKey || nodeFormat === "gemini") {
+  if (isGeminiKey) {
     if (isGeminiKey) secretKey = trimmedUrl;
-    trimmedUrl = "https://generativelanguage.googleapis.com/v1beta";
     nodeFormat = "gemini";
     if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-1.5-flash" || defaultModel === "gemini-2.0-flash") model = "gemini-2.5-flash";
-  } else if (isOpenAIKey) {
+  } else if (isOpenAIKey && !trimmedUrl.includes("://")) {
     secretKey = trimmedUrl;
     trimmedUrl = "https://api.openai.com";
     nodeFormat = "openai";
     if (!defaultModel || defaultModel === "llama3.2:3b") model = "gpt-4o-mini";
-  } else if (isNvidiaKey || nodeFormat === "glm") {
+  } else if (isNvidiaKey) {
     if (isNvidiaKey) secretKey = trimmedUrl;
-    trimmedUrl = "https://integrate.api.nvidia.com/v1";
     nodeFormat = "glm";
     if (!defaultModel || defaultModel === "llama3.2:3b") model = "z-ai/glm-5.2";
   }
@@ -215,13 +214,6 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
     return { error: `Invalid Server URL syntax "${rawUrl}". Please provide a valid HTTP or HTTPS endpoint URL.` };
   }
 
-  if (nodeFormat === "gemini") {
-    fullUrl = "https://generativelanguage.googleapis.com/v1beta";
-  }
-  if (nodeFormat === "glm") {
-    fullUrl = "https://integrate.api.nvidia.com/v1";
-  }
-
   return {
     cleanUrl: fullUrl,
     secretKey,
@@ -252,17 +244,26 @@ exports.createNode = async (req, res) => {
 
     const { cleanUrl, secretKey: finalSecret, nodeFormat, model: finalModel } = validationResult;
 
-    const finalPriority = Math.min(100, Math.max(1, Number(priority) || 10));
+    const supported = Array.isArray(req.body.supportedModels) && req.body.supportedModels.length > 0 
+      ? req.body.supportedModels 
+      : (finalModel ? [finalModel] : []);
 
     const newNode = await ServerNode.create({
       name: name.trim(),
       url: cleanUrl,
       defaultModel: finalModel,
+      supportedModels: supported,
+      modelsCount: Math.max(1, supported.length),
+      lastScannedAt: new Date(),
       format: nodeFormat,
       secretKey: finalSecret ? encrypt(finalSecret) : "",
       priority: finalPriority,
       isActive: isActive !== undefined ? isActive : true
     });
+
+    // Auto-sync supported models to user-facing AIModel catalog
+    const allModelsToSync = Array.from(new Set([finalModel, ...(newNode.supportedModels || [])])).filter(Boolean);
+    await ensureModelsInCatalog(allModelsToSync, nodeFormat);
 
     // Seed/clear memory cache in ollamaHelper
     const { refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
@@ -279,6 +280,37 @@ exports.createNode = async (req, res) => {
     return res.status(500).json({ success: false, error: "Failed to create server node." });
   }
 };
+
+/**
+ * Helper: Ensure discovered/saved models exist in AIModel catalog for user chat dropdown
+ */
+async function ensureModelsInCatalog(modelsList, provider) {
+  try {
+    if (!Array.isArray(modelsList) || modelsList.length === 0) return;
+    for (const modelId of modelsList) {
+      if (!modelId || typeof modelId !== "string") continue;
+      const cleanId = modelId.trim();
+      const exists = await AIModel.findOne({ modelId: cleanId });
+      if (!exists) {
+        const isHeavy = cleanId.includes("pro") || cleanId.includes("deepseek") || cleanId.includes("70b") || cleanId.includes("kimi");
+        const isFast = cleanId.includes("flash") || cleanId.includes("1.5b") || cleanId.includes("2.0") || cleanId.includes("mini");
+        await AIModel.create({
+          modelId: cleanId,
+          displayName: cleanId.replace(/^models\//, ""),
+          provider: provider || "openai",
+          tier: isHeavy ? "HEAVY" : (isFast ? "FAST" : "BALANCED"),
+          creditCost: isHeavy ? 3 : (isFast ? 1 : 2),
+          contextLength: "128k",
+          enabled: true,
+          recommended: false,
+          fallbackModels: []
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("⚠️ [CATALOG SYNC] Notice:", err.message);
+  }
+}
 
 /**
  * Update an existing AI Server Node with encrypted secretKey
@@ -304,8 +336,8 @@ exports.updateNode = async (req, res) => {
         return res.status(400).json({ success: false, error: validationResult.error });
       }
       node.url = validationResult.cleanUrl;
-      if (validationResult.secretKey) {
-        node.secretKey = encrypt(validationResult.secretKey);
+      if (validationResult.secretKey && !/[\u2022\*]/.test(validationResult.secretKey) && validationResult.secretKey.trim()) {
+        node.secretKey = encrypt(validationResult.secretKey.trim());
       }
       if (validationResult.nodeFormat) {
         node.format = validationResult.nodeFormat;
@@ -316,15 +348,25 @@ exports.updateNode = async (req, res) => {
     } else {
       if (defaultModel !== undefined) node.defaultModel = defaultModel.trim();
       if (format !== undefined) node.format = format.toLowerCase();
+      if (secretKey !== undefined && !/[\u2022\*]/.test(secretKey) && secretKey.trim()) {
+        node.secretKey = encrypt(secretKey.trim());
+      }
     }
-
-    if (secretKey !== undefined && !/[\u2022\*]/.test(secretKey) && secretKey.trim()) {
-      node.secretKey = encrypt(secretKey.trim());
+    if (req.body.supportedModels !== undefined && Array.isArray(req.body.supportedModels)) {
+      node.supportedModels = req.body.supportedModels;
+      node.modelsCount = Math.max(1, req.body.supportedModels.length);
+      node.lastScannedAt = new Date();
+    } else if (node.supportedModels && Array.isArray(node.supportedModels)) {
+      node.modelsCount = Math.max(1, node.supportedModels.length);
     }
     if (priority !== undefined) node.priority = Math.min(100, Math.max(1, Number(priority) || 10));
     if (isActive !== undefined) node.isActive = isActive;
 
     await node.save();
+
+    // Auto-sync updated supported models to user-facing AIModel catalog
+    const allModelsToSync = Array.from(new Set([node.defaultModel, ...(node.supportedModels || [])])).filter(Boolean);
+    await ensureModelsInCatalog(allModelsToSync, node.format);
 
     const { refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
     if (typeof refreshClusterNodesFromDB === "function") {
@@ -335,6 +377,139 @@ exports.updateNode = async (req, res) => {
   } catch (error) {
     console.error("Error updating server node:", error.message);
     return res.status(500).json({ success: false, error: "Failed to update server node." });
+  }
+};
+
+/**
+ * Auto-Discover Available Models from a Server Endpoint & API Key
+ */
+exports.discoverServerModels = async (req, res) => {
+  try {
+    let { url, format, secretKey, nodeId } = req.body;
+
+    const isMaskedOrEmpty = !secretKey || /[\u2022\*]/.test(secretKey);
+    if (nodeId && (!url || isMaskedOrEmpty)) {
+      const node = await ServerNode.findById(nodeId);
+      if (node) {
+        url = url || node.url;
+        format = format || node.format;
+        if (isMaskedOrEmpty && node.secretKey) {
+          try {
+            secretKey = decrypt(node.secretKey);
+          } catch (e) {
+            secretKey = node.secretKey;
+          }
+        }
+      }
+    }
+
+    if (!url || !url.trim()) {
+      return res.status(400).json({ success: false, error: "Server URL is required to discover models." });
+    }
+
+    let cleanUrl = url.trim().replace(/\/$/, "");
+    let resolvedFormat = (format || "openai").toLowerCase();
+    let resolvedKey = secretKey ? secretKey.trim() : "";
+    if (/[\u2022\*]/.test(resolvedKey)) {
+      resolvedKey = "";
+    } else if (resolvedKey && (resolvedKey.startsWith("U2FsdGVkX1") || resolvedKey.includes(":"))) {
+      try {
+        const decryptedKey = decrypt(resolvedKey);
+        if (decryptedKey) resolvedKey = decryptedKey;
+      } catch (e) {}
+    }
+
+    let models = [];
+    const timeoutSignal = AbortSignal.timeout(12000);
+
+    // 1. Google Gemini Provider
+    if (resolvedFormat === "gemini" || cleanUrl.includes("googleapis.com")) {
+      const pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${resolvedKey}`;
+      const resp = await fetch(pingUrl, { signal: timeoutSignal });
+      if (!resp.ok) {
+        return res.status(400).json({
+          success: false,
+          error: `Gemini API returned HTTP ${resp.status}: ${resp.statusText}. Please verify your API Key.`
+        });
+      }
+      const data = await resp.json();
+      models = (data.models || [])
+        .filter((m) => m.supportedGenerationMethods?.includes("generateContent"))
+        .map((m) => {
+          const mId = m.name.replace(/^models\//, "");
+          return {
+            modelId: mId,
+            displayName: m.displayName || mId,
+            provider: "gemini",
+            tier: mId.includes("pro") ? "HEAVY" : (mId.includes("2.0") ? "FAST" : "BALANCED"),
+            contextLength: mId.includes("2.5") ? "1M" : "128k"
+          };
+        });
+    }
+    // 2. Ollama / Self-Hosted Cluster / Private Cloud
+    else if (resolvedFormat === "ollama" || cleanUrl.includes("/ollama") || cleanUrl.includes("11434")) {
+      const headers = { "Accept": "application/json" };
+      if (resolvedKey) headers["Authorization"] = `Bearer ${resolvedKey}`;
+
+      const pingUrl = cleanUrl.endsWith("/api/tags") ? cleanUrl : `${cleanUrl}/api/tags`;
+      const resp = await fetch(pingUrl, { headers, signal: timeoutSignal });
+      if (!resp.ok) {
+        return res.status(400).json({
+          success: false,
+          error: `Ollama server returned HTTP ${resp.status}: ${resp.statusText}`
+        });
+      }
+      const data = await resp.json();
+      models = (data.models || []).map((m) => {
+        const name = m.name || m.model;
+        const isHeavy = name.includes("deepseek") || name.includes("kimi") || name.includes("70b") || (m.details?.parameter_size && m.details.parameter_size.includes("T"));
+        const isFast = name.includes("1.5b") || name.includes("2b") || name.includes("mini");
+        return {
+          modelId: name,
+          displayName: name.split(":")[0].toUpperCase() + (name.includes(":") ? ` (${name.split(":")[1]})` : ""),
+          provider: "ollama",
+          tier: isHeavy ? "HEAVY" : (isFast ? "FAST" : "BALANCED"),
+          contextLength: "128k"
+        };
+      });
+    }
+    // 3. OpenAI / NVIDIA GLM / NIM / VLLM / Open WebUI
+    else {
+      const headers = { "Accept": "application/json" };
+      if (resolvedKey) headers["Authorization"] = `Bearer ${resolvedKey}`;
+
+      let pingUrl = cleanUrl.endsWith("/models") ? cleanUrl : (cleanUrl.endsWith("/v1") ? `${cleanUrl}/models` : `${cleanUrl}/v1/models`);
+      const resp = await fetch(pingUrl, { headers, signal: timeoutSignal });
+      if (!resp.ok) {
+        return res.status(400).json({
+          success: false,
+          error: `Provider API returned HTTP ${resp.status}: ${resp.statusText}`
+        });
+      }
+      const data = await resp.json();
+      const rawList = data.data || data.models || [];
+      const isNvidia = cleanUrl.includes("nvidia.com") || resolvedFormat === "glm";
+      models = rawList.map((m) => {
+        const id = m.id || m.name;
+        return {
+          modelId: id,
+          displayName: id,
+          provider: isNvidia ? "glm" : "openai",
+          tier: id.includes("gpt-4") || id.includes("70b") || id.includes("deepseek") ? "HEAVY" : "BALANCED",
+          contextLength: "128k"
+        };
+      });
+    }
+
+    return res.json({
+      success: true,
+      provider: resolvedFormat,
+      totalDiscovered: models.length,
+      models
+    });
+  } catch (error) {
+    console.error("Error auto-discovering models:", error.message);
+    return res.status(500).json({ success: false, error: error.message || "Failed to discover models from server." });
   }
 };
 
@@ -528,8 +703,41 @@ exports.pingNode = async (req, res) => {
 
 exports.getAllUsers = async (req, res) => {
   try {
-    const users = await User.find().select("-password").sort({ createdAt: -1 });
-    return res.json({ success: true, count: users.length, users });
+    const users = await User.find().select("-password").sort({ createdAt: -1 }).lean();
+    const ModelUsage = require("../models/ModelUsage");
+    const Usage = require("../models/Usage");
+
+    // Aggregate lifetime tokens and requests per user
+    const userStats = await ModelUsage.aggregate([
+      {
+        $group: {
+          _id: "$userId",
+          totalTokens: { $sum: { $add: ["$promptTokens", "$completionTokens"] } },
+          totalCreditsUsed: { $sum: "$creditsUsed" },
+          totalRequests: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const statsMap = new Map();
+    userStats.forEach(s => {
+      statsMap.set(s._id.toString(), s);
+    });
+
+    const enrichedUsers = users.map(u => {
+      const stat = statsMap.get(u._id.toString()) || { totalTokens: 0, totalCreditsUsed: 0, totalRequests: 0 };
+      const isPaid = Boolean(u.isPaidUser || u.totalCreditsPurchased > 0);
+      return {
+        ...u,
+        isPaidUser: isPaid,
+        tier: isPaid ? "Paid (Unlimited)" : "Free (50/day)",
+        totalTokens: stat.totalTokens || 0,
+        totalCreditsUsed: parseFloat((stat.totalCreditsUsed || 0).toFixed(4)),
+        totalRequests: stat.totalRequests || 0
+      };
+    });
+
+    return res.json({ success: true, count: enrichedUsers.length, users: enrichedUsers });
   } catch (error) {
     console.error("Error fetching users:", error);
     return res.status(500).json({ success: false, error: "Failed to fetch users." });
@@ -539,7 +747,7 @@ exports.getAllUsers = async (req, res) => {
 exports.updateUserCredits = async (req, res) => {
   try {
     const { id } = req.params;
-    const { credits, plan } = req.body;
+    const { credits, plan, isPaidUser } = req.body;
     
     const user = await User.findById(id);
     if (!user) return res.status(404).json({ success: false, error: "User not found." });
@@ -561,6 +769,10 @@ exports.updateUserCredits = async (req, res) => {
     
     if (plan !== undefined) {
       user.plan = plan;
+    }
+
+    if (isPaidUser !== undefined) {
+      user.isPaidUser = Boolean(isPaidUser);
     }
 
     await user.save();
@@ -602,36 +814,38 @@ exports.createPlan = async (req, res) => {
 exports.updatePlan = async (req, res) => {
   try {
     const { id } = req.params;
+    const mongoose = require("mongoose");
     const Plan = require("../models/Plan");
-    const plan = await Plan.findByIdAndUpdate(id, req.body, { new: true });
     
-    if (!plan) return res.status(404).json({ success: false, error: "Plan not found." });
+    const isObjectId = mongoose.Types.ObjectId.isValid(id);
+    const query = isObjectId ? { _id: id } : { key: id };
+
+    const plan = await Plan.findOneAndUpdate(query, req.body, { new: true, runValidators: false });
+    
+    if (!plan) return res.status(404).json({ success: false, error: "Credit package not found." });
     return res.json({ success: true, plan });
   } catch (error) {
     console.error("Error updating plan:", error);
-    return res.status(500).json({ success: false, error: "Failed to update subscription plan." });
+    return res.status(500).json({ success: false, error: error.message || "Failed to update credit package." });
   }
 };
 
 exports.deletePlan = async (req, res) => {
   try {
     const { id } = req.params;
+    const mongoose = require("mongoose");
     const Plan = require("../models/Plan");
     
-    // Check if users are using this plan before deleting it.
-    const User = require("../models/User");
-    const plan = await Plan.findById(id);
-    if (!plan) return res.status(404).json({ success: false, error: "Plan not found." });
-    
-    const usersCount = await User.countDocuments({ plan: plan.key });
-    if (usersCount > 0) {
-      return res.status(400).json({ success: false, error: `Cannot delete plan: ${usersCount} users are currently subscribed to it.` });
-    }
+    const isObjectId = mongoose.Types.ObjectId.isValid(id);
+    const query = isObjectId ? { _id: id } : { key: id };
 
-    await Plan.findByIdAndDelete(id);
-    return res.json({ success: true, message: "Plan deleted successfully." });
+    const plan = await Plan.findOne(query);
+    if (!plan) return res.status(404).json({ success: false, error: "Credit package not found." });
+    
+    await Plan.deleteOne(query);
+    return res.json({ success: true, message: "Credit package deleted successfully." });
   } catch (error) {
     console.error("Error deleting plan:", error);
-    return res.status(500).json({ success: false, error: "Failed to delete subscription plan." });
+    return res.status(500).json({ success: false, error: error.message || "Failed to delete credit package." });
   }
 };

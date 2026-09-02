@@ -19,6 +19,7 @@ router.get("/stats", adminController.getDashboardStats);
 // Node Management
 router.get("/nodes", adminController.getAllNodes);
 router.post("/nodes", adminController.createNode);
+router.post("/nodes/discover-models", adminController.discoverServerModels);
 router.put("/nodes/:id", adminController.updateNode);
 router.delete("/nodes/:id", adminController.deleteNode);
 router.post("/nodes/:id/ping", adminController.pingNode);

@@ -14,12 +14,28 @@ const creditTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["purchase", "admin_grant", "admin_deduct", "message_sent", "subscription_grant", "other"],
+      enum: ["purchase", "admin_grant", "admin_deduct", "message_sent", "AI_MESSAGE_CONSUMPTION", "subscription_grant", "other"],
       required: true,
     },
     description: {
       type: String,
       default: "",
+    },
+    modelId: {
+      type: String,
+      default: "",
+    },
+    promptTokens: {
+      type: Number,
+      default: 0,
+    },
+    completionTokens: {
+      type: Number,
+      default: 0,
+    },
+    totalTokens: {
+      type: Number,
+      default: 0,
     },
     balanceAfter: {
       type: Number,

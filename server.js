@@ -14,13 +14,14 @@ const externalBotRoutes = require("./routes/externalBotRoutes");
 const subscriptionRoutes = require("./routes/subscriptionRoutes");
 const planRoutes = require("./routes/planRoutes");
 const adminRoutes = require("./routes/adminRoutes");
-const seedPlans = require("./utils/planSeeder");
+const seedAIModels = require("./utils/modelSeeder");
 const { warmOllamaConnection } = require("./utils/ollamaHelper");
 const { redis } = require("./utils/redisClient");
 const { knowledgeQueue } = require("./utils/bullQueue");
 
 connectDB().then(() => {
-  seedPlans();
+  seedAIModels();
+  warmOllamaConnection().catch(() => {});
 });
 
 const app = express();
@@ -107,6 +108,9 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 const projectRoutes = require("./routes/projectRoutes");
+const modelRoutes = require("./routes/modelRoutes");
+const usageRoutes = require("./routes/usageRoutes");
+const creditRoutes = require("./routes/creditRoutes");
 app.use("/chats", chatRoutes);
 app.use("/auth", authRoutes);
 app.use("/ollama", ollamaRoutes);
@@ -117,6 +121,15 @@ app.use("/api/v1/external/bots", externalBotRoutes);
 app.use("/subscription", subscriptionRoutes);
 app.use("/plans", planRoutes);
 app.use("/admin", adminRoutes);
+app.use("/models", modelRoutes);
+app.use("/api/v1/models", modelRoutes);
+app.use("/usage", usageRoutes);
+app.use("/api/usage", usageRoutes);
+app.use("/api/v1/usage", usageRoutes);
+app.use("/credits", creditRoutes);
+app.use("/api/credits", creditRoutes);
+app.use("/api/v1/credits", creditRoutes);
+
 
 app.get("/", (req, res) => {
   res.send("Server Running");

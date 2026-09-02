@@ -46,6 +46,21 @@ const userSchema = new mongoose.Schema(
       default: 100, // 100 free credits on sign up
     },
 
+    isPaidUser: {
+      type: Boolean,
+      default: false, // Becomes true upon first credit pack purchase
+    },
+
+    signupBonusGranted: {
+      type: Boolean,
+      default: true, // Flag ensuring 100 free signup credits are granted only once
+    },
+
+    totalCreditsPurchased: {
+      type: Number,
+      default: 0,
+    },
+
     activeSubscriptionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Subscription",

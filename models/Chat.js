@@ -13,16 +13,6 @@ const chatSchema = new mongoose.Schema(
       type: String,
       default: "New Chat",
     },
-
-    extractedEntities: {
-      firstName: { type: String, default: null },
-      lastName: { type: String, default: null },
-      email: { type: String, default: null },
-      phone: { type: String, default: null },
-      companyName: { type: String, default: null },
-      description: { type: String, default: null },
-      isConfirmed: { type: Boolean, default: false }
-    },
     conversationSummary: {
       type: String,
       default: ""

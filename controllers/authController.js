@@ -1,4 +1,5 @@
 const User = require("../models/User");
+const CreditTransaction = require("../models/CreditTransaction");
 const jwt = require("jsonwebtoken");
 const axios = require("axios");
 const { OAuth2Client } = require("google-auth-library");
@@ -45,7 +46,20 @@ exports.googleAuth = async (req, res) => {
         profilePic: picture || "",
         authType: "google",
         role: isSuperAdmin ? "admin" : "user",
+        credits: 100,
+        signupBonusGranted: true,
+        isPaidUser: false,
+        totalCreditsPurchased: 0,
       });
+
+      // Record signup bonus transaction
+      await CreditTransaction.create({
+        userId: user._id,
+        amount: 100,
+        type: "admin_grant",
+        description: "100 Free Welcome Credits (Signup Bonus)",
+        balanceAfter: 100,
+      }).catch((e) => console.warn("Failed to create welcome credit transaction:", e.message));
     } else {
       const updates = {};
       if (!user.name && name) updates.name = name;
@@ -163,7 +177,19 @@ exports.googleAuthCallback = async (req, res) => {
         password: undefined,
         profilePic: picture || "",
         authType: "google",
+        credits: 100,
+        signupBonusGranted: true,
+        isPaidUser: false,
+        totalCreditsPurchased: 0,
       });
+
+      await CreditTransaction.create({
+        userId: user._id,
+        amount: 100,
+        type: "admin_grant",
+        description: "100 Free Welcome Credits (Signup Bonus)",
+        balanceAfter: 100,
+      }).catch((e) => console.warn("Failed to create welcome credit transaction:", e.message));
     } else {
       const updates = {};
       if (!user.name && name) updates.name = name;

@@ -171,7 +171,6 @@ exports.deleteChat = async (req, res) => {
 exports.sendMessage = async (req, res) => {
   const reqStartTime = performance.now();
   let dbFetchTime = 0;
-  let modelResolveTime = 0;
   let ttft = null;
   let streamDuration = 0;
   let firstTokenTimestamp = null;
@@ -186,40 +185,103 @@ exports.sendMessage = async (req, res) => {
     }
 
     const tDbStart = performance.now();
-    let chat;
-    if (!chatId || chatId === "new" || chatId === "undefined" || chatId === "null") {
-      chat = await Chat.create({
-        userId: req.user.id,
-        title: message.trim().substring(0, 35) || "New Conversation",
-      });
-      chatId = chat._id;
-    } else {
-      chat = await Chat.findById(chatId);
-    }
+    const userId = req.user?.id || req.user?._id;
+    const todayStr = new Date().toISOString().split("T")[0];
+    const requestedModelId = req.body.model || req.body.modelId || "auto";
 
-    if (!chat) {
-      return res.status(404).json({ success: false, message: "Chat session not found." });
-    }
+    const aiGateway = require("../utils/aiGateway");
+    const User = require("../models/User");
+    const CreditTransaction = require("../models/CreditTransaction");
+    const ModelUsage = require("../models/ModelUsage");
+    const Usage = require("../models/Usage");
 
-    // Persist first user message as title for future sessions
-    if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
-      chat.title = message.trim().substring(0, 35) || "New Conversation";
-      await chat.save();
-    }
+    const isExistingChat = chatId && chatId !== "new" && chatId !== "undefined" && chatId !== "null";
 
-    // Save User message
-    await Message.create({ chatId, role: "user", content: message });
-
-    // Update rolling summary if total messages >= 20
-    const summaryText = await updateRollingSummaryIfNeeded(chat, chatId);
-
-    // Fetch last 16 messages (8 turns) for deep multi-turn conversation memory
-    const dbMessagesHistory = await Message.find({ chatId }).sort({ createdAt: -1 }).limit(16);
-    dbMessagesHistory.reverse();
+    // ✅ Promise.all Parallel DB & Pricing Cache Queries (Runs in 1 IO tick)
+    const [userDoc, userUsageToday, modelPricing, chatDoc, dbMessagesHistory] = await Promise.all([
+      User.findById(userId),
+      Usage.findOne({ userId, date: todayStr }),
+      aiGateway.getModelPricingCached(requestedModelId),
+      isExistingChat ? Chat.findById(chatId) : Chat.create({ userId, title: message.trim().substring(0, 35) || "New Conversation" }),
+      isExistingChat ? Message.find({ chatId }).sort({ createdAt: -1 }).limit(16) : Promise.resolve([])
+    ]);
 
     dbFetchTime = performance.now() - tDbStart;
 
-    // Unified System Instruction Block merging Core Guidelines and Conversation Summary
+    // 1. Resolve User & Plan
+    if (!userDoc) {
+      return res.status(401).json({ success: false, message: "User account not found." });
+    }
+    const isPaid = Boolean(userDoc.isPaidUser || userDoc.totalCreditsPurchased > 0);
+    const currentBalance = typeof userDoc.credits === "number" ? userDoc.credits : 0;
+
+    // 2. Daily Message Limit (Strictly for Free Tier users: 50 msgs/day)
+    const messagesSentToday = userUsageToday?.messagesUsedToday || 0;
+    if (!isPaid) {
+      const FREE_DAILY_LIMIT = 50;
+      if (messagesSentToday >= FREE_DAILY_LIMIT) {
+        return res.status(429).json({
+          success: false,
+          error: "DAILY_FREE_LIMIT_REACHED",
+          message: "You have reached your daily free tier limit of 50 messages. Purchase credits to unlock unlimited daily messages.",
+          dailyLimit: FREE_DAILY_LIMIT,
+          messagesUsedToday: messagesSentToday,
+          isPaidUser: false
+        });
+      }
+    }
+
+    // 3. Credit Reservation Pre-check (Floor: 0.05 credits)
+    const MINIMUM_CHARGE_FLOOR = 0.05;
+    if (currentBalance < MINIMUM_CHARGE_FLOOR) {
+      return res.status(402).json({
+        success: false,
+        error: "INSUFFICIENT_CREDITS",
+        message: "You have exhausted your credits. Please purchase a credit pack to continue chatting.",
+        requiredCredits: MINIMUM_CHARGE_FLOOR,
+        availableCredits: currentBalance,
+        isPaidUser: isPaid
+      });
+    }
+
+    let chat = chatDoc;
+    if (!chat) {
+      chat = await Chat.create({ userId, title: message.trim().substring(0, 35) || "New Conversation" });
+    }
+    chatId = chat._id;
+
+    // Save User message & update title
+    const saveUserMsgPromise = Message.create({ chatId, role: "user", content: message });
+    if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
+      chat.title = message.trim().substring(0, 35) || "New Conversation";
+      chat.save().catch(() => {});
+    }
+
+    const historyMsgs = (dbMessagesHistory || []).slice().reverse();
+
+    // 4. Resolve Model Pricing & Fast SSE Header Flush
+    const promptRate = modelPricing.promptTokenCostPer1k ?? 0.05;
+    const completionRate = modelPricing.completionTokenCostPer1k ?? 0.1;
+    const currentModelId = modelPricing.modelId || requestedModelId;
+
+    // Set SSE headers ONCE after pre-flight validations pass
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    res.write(`data: ${JSON.stringify({
+      type: "meta",
+      chatId,
+      title: chat.title,
+      model: currentModelId,
+      modelName: modelPricing.displayName || currentModelId,
+      minCharge: MINIMUM_CHARGE_FLOOR,
+      promptTokenCostPer1k: promptRate,
+      completionTokenCostPer1k: completionRate,
+      isPaidUser: isPaid
+    })}\n\n`);
+
+    const summaryText = chat.conversationSummary || "";
     let unifiedSystemPrompt = `You are a helpful, highly capable, articulate, and intelligent AI Assistant.
 
 STRICT IDENTITY RULES:
@@ -238,16 +300,8 @@ CORE BEHAVIOR RULES:
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
     }
 
-    // Assemble clean, single-system-prompt context window payload for Ollama
-    const historyPayload = [
-      {
-        role: "system",
-        content: unifiedSystemPrompt
-      }
-    ];
-
-    dbMessagesHistory.forEach((msg) => {
-      // Exclude legacy connection error or robotic filler fallbacks to prevent LLM context contamination
+    const historyPayload = [{ role: "system", content: unifiedSystemPrompt }];
+    historyMsgs.forEach((msg) => {
       if (
         msg.role === "assistant" &&
         typeof msg.content === "string" &&
@@ -264,38 +318,17 @@ CORE BEHAVIOR RULES:
       });
     });
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
+    historyPayload.push({ role: "user", content: message });
 
-    res.write(`data: ${JSON.stringify({ type: "meta", chatId, title: chat.title })}\n\n`);
+    await saveUserMsgPromise;
 
-    const aiGateway = require("../utils/aiGateway");
-    const { calculatePriority } = require("../utils/priorityCalculator");
-    const User = require("../models/User");
-
-    const userId = req.user?.id || req.user?._id;
-    let userPlan = req.user?.plan || req.headers["x-user-plan"];
-
-    if (!userPlan && userId) {
-      const { getCache, setCache } = require("../utils/redisClient");
-      const planCacheKey = `user:plan:${userId}`;
-      userPlan = await getCache(planCacheKey);
-      if (!userPlan) {
-        const userDoc = await User.findById(userId).select("plan").lean();
-        userPlan = userDoc?.plan || "free";
-        await setCache(planCacheKey, userPlan, 900);
-      }
-    }
-
-    const userPriority = await calculatePriority(userPlan || "free");
-
+    const userPriority = isPaid ? 100 : 50;
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();
 
     const gatewayResult = await aiGateway.generateStream({
-      provider: "auto",
-      model: "best",
+      provider: modelPricing.provider || "auto",
+      model: currentModelId,
       messages: historyPayload,
       res,
       userPriority,
@@ -317,11 +350,22 @@ CORE BEHAVIOR RULES:
       streamDuration = performance.now() - firstTokenTimestamp;
     }
 
+    const promptTokens = gatewayResult.promptTokens || 0;
+    const completionTokens = gatewayResult.completionTokens || 0;
+    const totalTokens = gatewayResult.totalTokens || (promptTokens + completionTokens);
+
+    const rawCreditsUsed = (promptTokens / 1000 * promptRate) + (completionTokens / 1000 * completionRate);
+    const calculatedCredits = Math.max(MINIMUM_CHARGE_FLOOR, parseFloat(rawCreditsUsed.toFixed(4)));
+
     console.log(`
-⏱️  =================== [GENERAL CHAT LATENCY DIAGNOSTICS] ===================
+⏱️  =================== [GENERAL CHAT LATENCY & TOKEN DIAGNOSTICS] ===================
   📌 Route: General Chat Stream (/chats/${chatId}/messages)
+  ├── 🧠 Model Selected:               ${currentModelId}
+  ├── 👤 User Tier:                    ${isPaid ? "Paid (Unlimited Daily)" : "Free (50 msgs/day)"}
+  ├── 📊 Token Usage:                  ${promptTokens} prompt + ${completionTokens} completion = ${totalTokens} total tokens
+  ├── 💰 Credits Consumed:             ${calculatedCredits} cr (Min Floor: ${MINIMUM_CHARGE_FLOOR}, In Rate: ${promptRate}/1k, Out Rate: ${completionRate}/1k)
   ├── 🌐 Dispatched Cluster Node:       ${gatewayResult.nodeId || "Auto"}
-  ├── 🗄️ Database Operations:          ${dbFetchTime.toFixed(2)} ms
+  ├── 🗄️ Parallel DB Overhead:         ${dbFetchTime.toFixed(2)} ms
   ├── 🚀 Time To First Token (TTFT):   ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'}
   ├── ⚡ Token Streaming Duration:     ${streamDuration > 0 ? streamDuration.toFixed(2) + ' ms' : 'N/A'}
   └── 🏁 TOTAL REQUEST DURATION:        ${totalDuration.toFixed(2)} ms
@@ -330,40 +374,83 @@ CORE BEHAVIOR RULES:
 
     if (accumulatedResponseText.trim()) {
       streamedSuccessfully = true;
-      await Message.create({
-        chatId,
-        role: "assistant",
-        content: accumulatedResponseText,
-      });
 
-      // Deduct 1 credit from user after successful response
+      const saveAssistantPromise = Message.create({ chatId, role: "assistant", content: accumulatedResponseText });
+      updateRollingSummaryIfNeeded(chat, chatId).catch(() => {});
+
+      // 5. Post-Stream Atomic Credit Deduction & Async Telemetry Logging
       try {
-        const freshUserDoc = await User.findById(userId);
-        if (freshUserDoc) {
-          freshUserDoc.credits = Math.max(0, (freshUserDoc.credits || 0) - 1);
-          await freshUserDoc.save();
+        const updatedUser = await User.findByIdAndUpdate(
+          userId,
+          { $inc: { credits: -calculatedCredits } },
+          { new: true }
+        );
 
-          const CreditTransaction = require("../models/CreditTransaction");
-          await CreditTransaction.create({
-            userId: freshUserDoc._id,
-            amount: -1,
-            type: "message_sent",
-            description: "1 credit deducted for general AI chat message",
-            balanceAfter: freshUserDoc.credits
-          });
+        if (updatedUser) {
+          const remainingCredits = Math.max(0, updatedUser.credits);
+
+          // Asynchronous telemetry writes
+          Promise.allSettled([
+            CreditTransaction.create({
+              userId: updatedUser._id,
+              amount: -calculatedCredits,
+              type: "AI_MESSAGE_CONSUMPTION",
+              modelId: currentModelId,
+              promptTokens,
+              completionTokens,
+              totalTokens,
+              description: `${calculatedCredits} cr (${promptTokens} in / ${completionTokens} out tokens) for ${modelPricing.displayName || currentModelId}`,
+              balanceAfter: remainingCredits,
+              chatId: chat._id
+            }),
+            ModelUsage.create({
+              userId: updatedUser._id,
+              modelId: currentModelId,
+              provider: modelPricing.provider || gatewayResult.provider || "auto",
+              nodeId: gatewayResult.nodeId || "",
+              responseTimeMs: Math.round(totalDuration),
+              ttftMs: Math.round(ttft || 0),
+              creditsUsed: calculatedCredits,
+              promptTokens,
+              completionTokens,
+              status: "SUCCESS"
+            }),
+            Usage.findOneAndUpdate(
+              { userId: updatedUser._id, date: todayStr },
+              {
+                $inc: {
+                  messagesUsedToday: 1,
+                  tokensUsedToday: totalTokens,
+                  creditsUsedToday: calculatedCredits
+                }
+              },
+              { upsert: true }
+            )
+          ]).catch(e => console.warn("⚠️ [TELEMETRY ERR]", e.message));
+
+          // Emit live credit update to frontend
+          res.write(`data: ${JSON.stringify({
+            type: "credit_update",
+            creditsRemaining: remainingCredits,
+            creditsConsumed: calculatedCredits,
+            promptTokens,
+            completionTokens,
+            totalTokens,
+            isPaidUser: isPaid,
+            modelId: currentModelId
+          })}\n\n`);
         }
       } catch (creditErr) {
-        console.warn("⚠️ [CREDIT] Failed to deduct credit:", creditErr.message);
+        console.warn("⚠️ [CREDIT CONSUMPTION ERROR]", creditErr.message);
       }
 
+      await saveAssistantPromise;
       res.write("data: [DONE]\n\n");
       return res.end();
     }
 
     if (!streamedSuccessfully) {
-      if (res.writableEnded) {
-        return;
-      }
+      if (res.writableEnded) return;
       console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content.");
       const fallbackText = gatewayResult.errorMessage || "I'm unable to connect to the active AI server node right now. Please check that your server node is running and accessible.";
       await streamTextInChunks(res, fallbackText, 15);

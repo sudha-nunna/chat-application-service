@@ -16,6 +16,14 @@ const usageSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    tokensUsedToday: {
+      type: Number,
+      default: 0,
+    },
+    creditsUsedToday: {
+      type: Number,
+      default: 0,
+    },
     agentsCreated: {
       type: Number,
       default: 0,
@@ -29,6 +37,7 @@ const usageSchema = new mongoose.Schema(
       default: 0,
     },
   },
+
   {
     timestamps: true,
   }

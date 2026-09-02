@@ -17,6 +17,18 @@ const ServerNodeSchema = new mongoose.Schema(
       default: "llama3.2:3b",
       trim: true
     },
+    supportedModels: {
+      type: [String],
+      default: []
+    },
+    modelsCount: {
+      type: Number,
+      default: 1
+    },
+    lastScannedAt: {
+      type: Date,
+      default: Date.now
+    },
     format: {
       type: String,
       enum: ["openai", "ollama", "gemini", "glm"],
