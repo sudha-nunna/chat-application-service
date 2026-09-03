@@ -28,7 +28,7 @@ async function refreshClusterNodesFromDB(force = false) {
   try {
     const ServerNode = require("../models/ServerNode");
     const { decrypt } = require("./encryption");
-    const dbNodes = await ServerNode.find({ isActive: true }).sort({ priority: -1, priorityScore: -1, createdAt: 1 });
+    const dbNodes = await ServerNode.find({ isActive: true, status: { $ne: "INACTIVE" } }).sort({ priority: -1, priorityScore: -1, createdAt: 1 });
     lastNodesRefreshTime = Date.now();
 
     if (dbNodes && dbNodes.length > 0) {
@@ -83,17 +83,12 @@ async function refreshClusterNodesFromDB(force = false) {
         let nodeStatus = n.status || "ACTIVE";
         // Recovery logic:
         // - RATE_LIMITED: only recover if retryAfter has expired (or was never set)
-        // - INACTIVE: recover after 30s (network blip) unless admin manually deactivated via isActive=false
         if (nodeStatus === "RATE_LIMITED") {
           if (!n.retryAfter || new Date(n.retryAfter) <= new Date()) {
             nodeStatus = "ACTIVE";
             ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" }).catch(() => {});
             console.log(`  ✅ [RATE_LIMIT RECOVERED] Node ${n.name} retryAfter expired — restored to ACTIVE.`);
           }
-          // else: keep RATE_LIMITED until retryAfter passes — do NOT override
-        } else if (nodeStatus === "INACTIVE" && n.updatedAt && (new Date() - new Date(n.updatedAt)) > 30000) {
-          nodeStatus = "ACTIVE";
-          ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" }).catch(() => {});
         }
 
         return {
@@ -147,8 +142,6 @@ async function refreshClusterNodesFromDB(force = false) {
         });
       }
 
-      // (Auto-seeding removed: Admin has full control over all server nodes)
-
       return clusterState;
     } else {
       clusterState.length = 0;
@@ -174,15 +167,15 @@ async function checkClusterHealth() {
     const now = new Date();
 
     for (const node of clusterState) {
+      // Skip checking & preserve status if node was marked INACTIVE by admin
+      if (node.status === "INACTIVE" || node.isActive === false) {
+        continue;
+      }
+
       // 1. Check Rate Limit Recovery: If retryAfter expired, transition RATE_LIMITED -> CHECKING
       if (node.status === "RATE_LIMITED" && node.retryAfter && new Date(node.retryAfter) <= now) {
         node.status = "CHECKING";
         console.log(`  ├── 🔄 Node ${node.name} retryAfter period expired. Testing node recovery...`);
-      }
-
-      // Skip checking if node was manually marked INACTIVE by admin unless performing health check
-      if (node.status === "INACTIVE" && node.consecutiveFailures < 5) {
-        continue;
       }
 
       // On-Demand Failover Strategy: Skip background pings for Cloud API nodes (Gemini/OpenAI/GLM)

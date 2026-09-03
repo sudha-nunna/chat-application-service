@@ -248,6 +248,38 @@ exports.createNode = async (req, res) => {
       ? req.body.supportedModels 
       : (finalModel ? [finalModel] : []);
 
+    const finalPriority = Math.min(100, Math.max(1, Number(priority) || 10));
+
+    // Prevent duplicate server node documents if URL or Name already exists
+    const existingNode = await ServerNode.findOne({
+      $or: [{ url: cleanUrl }, { name: name.trim() }]
+    });
+
+    if (existingNode) {
+      existingNode.name = name.trim();
+      existingNode.url = cleanUrl;
+      existingNode.defaultModel = finalModel;
+      existingNode.supportedModels = supported;
+      existingNode.modelsCount = Math.max(1, supported.length);
+      existingNode.format = nodeFormat;
+      if (finalSecret) existingNode.secretKey = encrypt(finalSecret);
+      existingNode.priority = finalPriority;
+      if (isActive !== undefined) {
+        existingNode.isActive = isActive;
+        existingNode.status = isActive ? "ACTIVE" : "INACTIVE";
+      }
+      await existingNode.save();
+
+      const { refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
+      if (typeof refreshClusterNodesFromDB === "function") {
+        await refreshClusterNodesFromDB(true);
+      }
+
+      const sanitized = existingNode.toObject();
+      sanitized.secretKey = sanitized.secretKey ? "••••••••" : "";
+      return res.status(200).json({ success: true, node: sanitized, message: "Existing server node updated." });
+    }
+
     const newNode = await ServerNode.create({
       name: name.trim(),
       url: cleanUrl,
@@ -258,7 +290,8 @@ exports.createNode = async (req, res) => {
       format: nodeFormat,
       secretKey: finalSecret ? encrypt(finalSecret) : "",
       priority: finalPriority,
-      isActive: isActive !== undefined ? isActive : true
+      isActive: isActive !== undefined ? isActive : true,
+      status: isActive === false ? "INACTIVE" : "ACTIVE"
     });
 
     // Auto-sync supported models to user-facing AIModel catalog
@@ -360,7 +393,18 @@ exports.updateNode = async (req, res) => {
       node.modelsCount = Math.max(1, node.supportedModels.length);
     }
     if (priority !== undefined) node.priority = Math.min(100, Math.max(1, Number(priority) || 10));
-    if (isActive !== undefined) node.isActive = isActive;
+    if (isActive !== undefined) {
+      node.isActive = isActive;
+      node.status = isActive ? "ACTIVE" : "INACTIVE";
+    }
+    if (req.body.status !== undefined) {
+      node.status = req.body.status;
+      if (req.body.status === "INACTIVE") {
+        node.isActive = false;
+      } else if (req.body.status === "ACTIVE") {
+        node.isActive = true;
+      }
+    }
 
     await node.save();
 
@@ -370,7 +414,7 @@ exports.updateNode = async (req, res) => {
 
     const { refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
     if (typeof refreshClusterNodesFromDB === "function") {
-      await refreshClusterNodesFromDB();
+      await refreshClusterNodesFromDB(true);
     }
 
     return res.json({ success: true, node });
@@ -525,12 +569,23 @@ exports.deleteNode = async (req, res) => {
       return res.status(404).json({ success: false, error: "Server node not found." });
     }
 
+    // Cascading Delete: Automatically delete all AI models supported by/hosted on this server node
+    const AIModel = require("../models/AIModel");
+    let deletedModelsCount = 0;
+    if (deleted.supportedModels && deleted.supportedModels.length > 0) {
+      const deleteResult = await AIModel.deleteMany({ modelId: { $in: deleted.supportedModels } });
+      deletedModelsCount = deleteResult.deletedCount || 0;
+    }
+
     const { refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
     if (typeof refreshClusterNodesFromDB === "function") {
       await refreshClusterNodesFromDB();
     }
 
-    return res.json({ success: true, message: "Server node deleted successfully." });
+    return res.json({
+      success: true,
+      message: `Server node deleted successfully. Automatically removed ${deletedModelsCount} associated catalog model(s).`
+    });
   } catch (error) {
     console.error("Error deleting server node:", error.message);
     return res.status(500).json({ success: false, error: "Failed to delete server node." });
@@ -652,7 +707,11 @@ exports.pingNode = async (req, res) => {
     }
 
     let enumStatus = "ACTIVE";
-    if (isOk) {
+    if (node.isActive === false || node.status === "INACTIVE") {
+      enumStatus = "INACTIVE";
+      statusText = "INACTIVE (Deactivated by Admin)";
+      isOk = false;
+    } else if (isOk) {
       enumStatus = "ACTIVE";
     } else if (statusText.includes("429")) {
       enumStatus = "RATE_LIMITED";
@@ -692,6 +751,126 @@ exports.pingNode = async (req, res) => {
       latencyMs,
       isOk: false
     });
+  }
+};
+
+/**
+ * Manual Admin Cluster Sync & Live Health Check:
+ * Pings all active nodes on demand, updates latency & status in DB,
+ * flushes in-memory clusterState, and returns sanitized nodes.
+ */
+exports.syncClusterHealth = async (req, res) => {
+  try {
+    const rawNodes = await ServerNode.find().sort({ priorityScore: -1, priority: -1, createdAt: 1 });
+
+    for (const node of rawNodes) {
+      if (node.isActive === false || node.status === "INACTIVE") {
+        node.status = "INACTIVE";
+        await node.save();
+        continue;
+      }
+
+      const tStart = performance.now();
+      let isOk = false;
+      let statusText = "ACTIVE";
+      let rawSecretKey = "";
+      let targetUrl = node.url ? node.url.trim().replace(/\/$/, "") : "";
+      let nodeFormat = (node.format || "openai").toLowerCase();
+
+      try {
+        if (node.secretKey) {
+          try {
+            rawSecretKey = decrypt(node.secretKey);
+          } catch (e) {
+            rawSecretKey = node.secretKey;
+          }
+        }
+
+        const isGeminiNode = targetUrl.includes("googleapis.com") || nodeFormat === "gemini" || (node.defaultModel && node.defaultModel.includes("gemini")) || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
+        if (isGeminiNode) {
+          nodeFormat = "gemini";
+          targetUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+        }
+
+        const isGlmNode = targetUrl.includes("integrate.api.nvidia.com") || nodeFormat === "glm" || (node.defaultModel && node.defaultModel.includes("glm")) || rawSecretKey.startsWith("nvapi-");
+        if (isGlmNode) {
+          nodeFormat = "glm";
+          targetUrl = "https://integrate.api.nvidia.com/v1";
+        }
+
+        let pingUrl;
+        const headers = { "Accept": "application/json" };
+
+        if (nodeFormat === "gemini" || targetUrl.includes("googleapis.com")) {
+          if (!rawSecretKey) {
+            isOk = false;
+            statusText = "UNHEALTHY (No API Key)";
+          } else {
+            pingUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${rawSecretKey}`;
+          }
+        } else if (nodeFormat === "glm" || targetUrl.includes("integrate.api.nvidia.com")) {
+          if (!rawSecretKey) {
+            isOk = false;
+            statusText = "UNHEALTHY (No API Key)";
+          } else {
+            pingUrl = `https://integrate.api.nvidia.com/v1/models`;
+            headers["Authorization"] = `Bearer ${rawSecretKey}`;
+          }
+        } else if (nodeFormat === "ollama") {
+          pingUrl = `${targetUrl}/api/tags`;
+          if (rawSecretKey) headers["Authorization"] = `Bearer ${rawSecretKey}`;
+        } else {
+          pingUrl = `${targetUrl}/v1/models`;
+          if (rawSecretKey) headers["Authorization"] = `Bearer ${rawSecretKey}`;
+        }
+
+        if (pingUrl) {
+          const pingRes = await fetch(pingUrl, { method: "GET", headers, signal: AbortSignal.timeout(3500) });
+          const isCloudNode = nodeFormat === "glm" || nodeFormat === "gemini" || nodeFormat === "openai" || targetUrl.includes("nvidia.com") || targetUrl.includes("googleapis.com") || targetUrl.includes("openai.com");
+          isOk = pingRes.ok || (isCloudNode && pingRes.status === 401);
+          statusText = isOk ? "ACTIVE" : (pingRes.status === 429 ? "RATE_LIMITED" : `UNHEALTHY (HTTP ${pingRes.status})`);
+        }
+      } catch (err) {
+        const isCloudNode = nodeFormat === "glm" || nodeFormat === "gemini" || nodeFormat === "openai" || targetUrl.includes("nvidia.com") || targetUrl.includes("googleapis.com") || targetUrl.includes("openai.com");
+        if (isCloudNode && rawSecretKey) {
+          isOk = true;
+          statusText = "ACTIVE";
+        } else {
+          isOk = false;
+          statusText = `OFFLINE (${err.message})`;
+        }
+      }
+
+      const latencyMs = Number((performance.now() - tStart).toFixed(2));
+      node.lastLatencyMs = latencyMs;
+      node.status = isOk ? "ACTIVE" : (statusText.includes("429") ? "RATE_LIMITED" : "OFFLINE");
+      node.consecutiveFailures = isOk ? 0 : (node.consecutiveFailures || 0) + 1;
+      node.errorMessage = isOk ? "" : statusText;
+      node.lastChecked = new Date();
+      await node.save();
+    }
+
+    const { refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
+    if (typeof refreshClusterNodesFromDB === "function") {
+      await refreshClusterNodesFromDB(true);
+    }
+
+    const updatedNodes = await ServerNode.find().sort({ priorityScore: -1, priority: -1, createdAt: 1 });
+    const sanitizedNodes = updatedNodes.map((n) => {
+      const doc = n.toObject();
+      if (doc.secretKey) {
+        const rawKey = decrypt(doc.secretKey);
+        doc.secretKey = rawKey.length > 8 ? `${rawKey.slice(0, 4)}••••${rawKey.slice(-4)}` : "••••••••";
+      } else {
+        doc.secretKey = "";
+      }
+      return doc;
+    });
+
+    return res.json({ success: true, count: sanitizedNodes.length, nodes: sanitizedNodes, message: "Cluster health and latency refreshed successfully." });
+  } catch (error) {
+    console.error("Error syncing cluster health:", error.message);
+    return res.status(500).json({ success: false, error: "Failed to sync cluster health." });
   }
 };
 
@@ -803,11 +982,45 @@ exports.getAllPlans = async (req, res) => {
 exports.createPlan = async (req, res) => {
   try {
     const Plan = require("../models/Plan");
-    const plan = await Plan.create(req.body);
+    const { key, name, monthlyPrice, creditsGranted } = req.body;
+
+    if (!key || !key.trim()) {
+      return res.status(400).json({ success: false, error: "Validation Error: Package Key (e.g. starter-500) is required." });
+    }
+    if (/\s/.test(key.trim())) {
+      return res.status(400).json({ success: false, error: "Validation Error: Package Key cannot contain spaces. Use hyphens (e.g. starter-500)." });
+    }
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: "Validation Error: Package Name is required." });
+    }
+    if (name.trim().length < 2) {
+      return res.status(400).json({ success: false, error: "Validation Error: Package Name must be at least 2 characters long." });
+    }
+    if (monthlyPrice === undefined || isNaN(monthlyPrice) || Number(monthlyPrice) < 0) {
+      return res.status(400).json({ success: false, error: "Validation Error: Price ($) must be a non-negative number." });
+    }
+    if (creditsGranted === undefined || isNaN(creditsGranted) || Number(creditsGranted) <= 0) {
+      return res.status(400).json({ success: false, error: "Validation Error: Credits Granted must be a positive integer greater than 0." });
+    }
+
+    const cleanKey = key.trim().toLowerCase();
+    const existing = await Plan.findOne({ key: cleanKey });
+    if (existing) {
+      return res.status(400).json({ success: false, error: `Validation Error: Package Key '${cleanKey}' already exists.` });
+    }
+
+    const plan = await Plan.create({
+      ...req.body,
+      key: cleanKey,
+      name: name.trim(),
+      monthlyPrice: Number(monthlyPrice),
+      creditsGranted: Number(creditsGranted)
+    });
+
     return res.status(201).json({ success: true, plan });
   } catch (error) {
     console.error("Error creating plan:", error);
-    return res.status(500).json({ success: false, error: "Failed to create subscription plan." });
+    return res.status(500).json({ success: false, error: error.message || "Failed to create subscription plan." });
   }
 };
 
@@ -816,6 +1029,17 @@ exports.updatePlan = async (req, res) => {
     const { id } = req.params;
     const mongoose = require("mongoose");
     const Plan = require("../models/Plan");
+
+    const { name, monthlyPrice, creditsGranted } = req.body;
+    if (name !== undefined && (!name || !name.trim())) {
+      return res.status(400).json({ success: false, error: "Validation Error: Package Name cannot be empty." });
+    }
+    if (monthlyPrice !== undefined && (isNaN(monthlyPrice) || Number(monthlyPrice) < 0)) {
+      return res.status(400).json({ success: false, error: "Validation Error: Price ($) must be a non-negative number." });
+    }
+    if (creditsGranted !== undefined && (isNaN(creditsGranted) || Number(creditsGranted) <= 0)) {
+      return res.status(400).json({ success: false, error: "Validation Error: Credits Granted must be greater than 0." });
+    }
     
     const isObjectId = mongoose.Types.ObjectId.isValid(id);
     const query = isObjectId ? { _id: id } : { key: id };
