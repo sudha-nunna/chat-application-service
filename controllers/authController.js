@@ -9,6 +9,59 @@ const googleClient = new OAuth2Client(
   process.env.GOOGLE_CLIENT_SECRET
 );
 
+/**
+ * Calculates dynamic initial welcome credits & active occasion promo offers
+ */
+async function calculateRegistrationCredits() {
+  try {
+    const SystemSetting = require("../models/SystemSetting");
+    const PromoOffer = require("../models/PromoOffer");
+
+    let setting = await SystemSetting.findOne({ key: "global_settings" });
+    const welcomeCredits = setting && typeof setting.welcomeCredits === "number" ? setting.welcomeCredits : 100;
+
+    const now = new Date();
+    const activeOffers = await PromoOffer.find({
+      isActive: true,
+      startDate: { $lte: now },
+      endDate: { $gte: now }
+    }).sort({ createdAt: -1 });
+
+    if (!activeOffers || activeOffers.length === 0) {
+      return {
+        totalCredits: welcomeCredits,
+        auditDescription: `Welcome Credits: ${welcomeCredits}`
+      };
+    }
+
+    const offer = activeOffers[0];
+    if (offer.offerMode === "BONUS") {
+      const bonus = offer.creditValue || 0;
+      return {
+        totalCredits: welcomeCredits + bonus,
+        auditDescription: `Welcome Credits: ${welcomeCredits} + Festival Bonus: ${bonus}`
+      };
+    } else if (offer.offerMode === "OVERRIDE") {
+      const overrideVal = offer.creditValue !== undefined ? offer.creditValue : welcomeCredits;
+      return {
+        totalCredits: overrideVal,
+        auditDescription: `Override Offer Applied: ${overrideVal} Credits`
+      };
+    }
+
+    return {
+      totalCredits: welcomeCredits,
+      auditDescription: `Welcome Credits: ${welcomeCredits}`
+    };
+  } catch (e) {
+    console.warn("⚠️ [REGISTRATION CREDITS] Error calculating dynamic signup credits:", e.message);
+    return {
+      totalCredits: 100,
+      auditDescription: "Welcome Credits: 100"
+    };
+  }
+}
+
 exports.googleAuth = async (req, res) => {
   try {
     const { token } = req.body;
@@ -39,6 +92,7 @@ exports.googleAuth = async (req, res) => {
     let user = await User.findOne({ email });
 
     if (!user) {
+      const regCredits = await calculateRegistrationCredits();
       user = await User.create({
         name: name || email.split("@")[0],
         email,
@@ -46,19 +100,19 @@ exports.googleAuth = async (req, res) => {
         profilePic: picture || "",
         authType: "google",
         role: isSuperAdmin ? "admin" : "user",
-        credits: 100,
+        credits: regCredits.totalCredits,
         signupBonusGranted: true,
         isPaidUser: false,
         totalCreditsPurchased: 0,
       });
 
-      // Record signup bonus transaction
+      // Record signup bonus transaction with full audit trace
       await CreditTransaction.create({
         userId: user._id,
-        amount: 100,
+        amount: regCredits.totalCredits,
         type: "admin_grant",
-        description: "100 Free Welcome Credits (Signup Bonus)",
-        balanceAfter: 100,
+        description: regCredits.auditDescription,
+        balanceAfter: regCredits.totalCredits
       }).catch((e) => console.warn("Failed to create welcome credit transaction:", e.message));
     } else {
       const updates = {};
@@ -171,13 +225,14 @@ exports.googleAuthCallback = async (req, res) => {
     let user = await User.findOne({ email });
 
     if (!user) {
+      const regCredits = await calculateRegistrationCredits();
       user = await User.create({
         name: name || email.split("@")[0],
         email,
         password: undefined,
         profilePic: picture || "",
         authType: "google",
-        credits: 100,
+        credits: regCredits.totalCredits,
         signupBonusGranted: true,
         isPaidUser: false,
         totalCreditsPurchased: 0,
@@ -185,10 +240,10 @@ exports.googleAuthCallback = async (req, res) => {
 
       await CreditTransaction.create({
         userId: user._id,
-        amount: 100,
+        amount: regCredits.totalCredits,
         type: "admin_grant",
-        description: "100 Free Welcome Credits (Signup Bonus)",
-        balanceAfter: 100,
+        description: regCredits.auditDescription,
+        balanceAfter: regCredits.totalCredits,
       }).catch((e) => console.warn("Failed to create welcome credit transaction:", e.message));
     } else {
       const updates = {};
@@ -639,7 +694,8 @@ exports.getCurrentUser = async (req, res) => {
         isAvatarUploaded: isAvatarSetup,
         isVoiceUploaded: isVoiceSetup,
         voiceSampleId: activeVoiceId,
-        voiceSampleUrl: activeVoiceUrl,
+        credits: typeof user.credits === "number" ? user.credits : 100,
+        isPaidUser: !!user.isPaidUser,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt
       }

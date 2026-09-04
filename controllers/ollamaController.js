@@ -10,13 +10,20 @@ exports.sendMessage = async (req, res) => {
         }
 
         const ollamaBaseUrl = getOllamaBaseUrl();
-        console.log(`Sending API Request to: ${ollamaBaseUrl}/api/generate`);
-
-        const response = await axios.post(`${ollamaBaseUrl}/api/generate`, {
+        const requestPayload = {
             model: model || process.env.OLLAMA_MODEL || 'qwen2.5:1.5b', 
             prompt: message,
             stream: false
-        }, {
+        };
+
+        console.log(`\n================================================================================`);
+        console.log(`📤 [AI REQUEST -> OLLAMA (STANDALONE CONTROLLER)]`);
+        console.log(`  • Endpoint: ${ollamaBaseUrl}/api/generate`);
+        console.log(`  • Payload:`);
+        console.log(JSON.stringify(requestPayload, null, 2));
+        console.log(`================================================================================\n`);
+
+        const response = await axios.post(`${ollamaBaseUrl}/api/generate`, requestPayload, {
             headers: {
                 'Content-Type': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -25,6 +32,13 @@ exports.sendMessage = async (req, res) => {
                 'Accept-Encoding': 'identity' 
             }
         });
+
+        console.log(`\n================================================================================`);
+        console.log(`📥 [AI RESPONSE <- OLLAMA (STANDALONE CONTROLLER)]`);
+        console.log(`  • Status:   ${response.status} OK`);
+        console.log(`  • Response:`);
+        console.log(JSON.stringify(response.data, null, 2));
+        console.log(`================================================================================\n`);
 
         return res.status(200).json({
             success: true,

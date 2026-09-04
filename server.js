@@ -128,7 +128,9 @@ app.use("/api/usage", usageRoutes);
 app.use("/api/v1/usage", usageRoutes);
 app.use("/credits", creditRoutes);
 app.use("/api/credits", creditRoutes);
-app.use("/api/v1/credits", creditRoutes);
+const promoController = require("./controllers/promoController");
+app.get("/offers/active", promoController.getActiveOffer);
+app.get("/api/v1/offers/active", promoController.getActiveOffer);
 
 
 app.get("/", (req, res) => {

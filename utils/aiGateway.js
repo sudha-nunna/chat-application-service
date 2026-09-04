@@ -170,6 +170,29 @@ function safeFetch(url, options = {}) {
 }
 
 /**
+ * Reads the entire text body from a Node.js raw IncomingMessage stream
+ * Useful for logging full error response bodies from Ollama, Gemini, etc.
+ */
+async function readStreamBody(rawStream) {
+  if (!rawStream) return "";
+  try {
+    return await new Promise((resolve) => {
+      let body = "";
+      const timeout = setTimeout(() => resolve(body), 3000);
+      rawStream.on("data", (chunk) => { body += chunk.toString("utf8"); });
+      rawStream.on("end", () => { clearTimeout(timeout); resolve(body); });
+      rawStream.on("error", () => { clearTimeout(timeout); resolve(body); });
+      if (rawStream.destroyed || rawStream.readableEnded) {
+        clearTimeout(timeout);
+        resolve(body);
+      }
+    });
+  } catch (e) {
+    return "";
+  }
+}
+
+/**
  * Helper to determine if a node or provider is a Local Model vs Cloud Model
  */
 function isLocalNodeOrProvider(nodeOrProvider) {
@@ -267,6 +290,7 @@ class AIGateway {
     model = "best",
     customUrl = null,
     messages = [],
+    attachments = [],
     conversationSummary = null,
     res = null,
     userPriority = 10,
@@ -281,6 +305,7 @@ class AIGateway {
         model,
         customUrl,
         messages,
+        attachments,
         conversationSummary,
         res,
         userPriority,
@@ -291,9 +316,6 @@ class AIGateway {
     }
 
     if (providerLower === "openai") {
-      // Only attempt official OpenAI API if there's an actual api.openai.com node configured.
-      // Ollama-compatible nodes (codegene, etc.) that use format="openai" for the protocol
-      // should go directly to the cluster — they are NOT official api.openai.com.
       const { clusterState } = require("./ollamaHelper");
       const hasRealOpenAiNode = clusterState.some(n =>
         n.isActive !== false &&
@@ -308,6 +330,7 @@ class AIGateway {
           return await this._streamCloudOpenAI({
             model: model === "best" ? "gpt-4o-mini" : model,
             messages,
+            attachments,
             conversationSummary,
             res,
             onToken
@@ -316,11 +339,11 @@ class AIGateway {
           console.warn("⚠️ [GATEWAY STRICT] Cloud OpenAI direct failed:", openAiErr.message, "-> Trying cluster OpenAI nodes.");
         }
       }
-      // Fall through to cluster dispatch for Ollama-compatible OpenAI-format nodes
       return await this._streamOllamaCluster({
         model: model || "best",
         customUrl,
         messages,
+        attachments,
         conversationSummary,
         res,
         userPriority,
@@ -336,6 +359,7 @@ class AIGateway {
         return await this._streamCloudGemini({
           model: model === "best" ? "gemini-2.5-flash" : model,
           messages,
+          attachments,
           conversationSummary,
           res,
           onToken
@@ -346,6 +370,7 @@ class AIGateway {
           model: model || "gemini-2.5-flash",
           customUrl,
           messages,
+          attachments,
           conversationSummary,
           res,
           userPriority,
@@ -402,7 +427,7 @@ class AIGateway {
    * Streams response from Cluster Server Nodes with Provider Pools, Priority Routing,
    * Least-Loaded Balancing, Intra-Pool & Cross-Pool Failover, and Observability Metrics.
    */
-  async _streamOllamaCluster({ model, customUrl, messages, conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null, strictProvider = null }) {
+  async _streamOllamaCluster({ model, customUrl, messages, attachments = [], conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null, strictProvider = null }) {
     const { getProviderPools, refreshClusterNodesFromDB } = require("./ollamaHelper");
     await refreshClusterNodesFromDB();
 
@@ -606,23 +631,42 @@ class AIGateway {
           abortController
         });
 
+        const imageAttachments = Array.isArray(attachments)
+          ? attachments.filter(a => (a.fileType === "image" || a.mimeType?.startsWith("image/")) && a.data)
+          : [];
+        const cleanBase64List = imageAttachments.map(a => a.data.replace(/^data:.*?;base64,/, ""));
+
         // High Availability Model Fallback Tiers
-        const modelsToTry = isCodegeneNode
-          ? Array.from(new Set([
+        let modelsToTry;
+        if (isCodegeneNode) {
+          const codegeneVisionModels = ["glm-5.3-flash:cloud", "gemma4:cloud", "kimi-k2.7-code:cloud", "qwen3.5:2b-q4_K_M"];
+          if (imageAttachments.length > 0) {
+            // Prioritize models that support vision; deepseek-v4-flash:cloud does not support image input
+            const chosenVisionModel = (currentModel && codegeneVisionModels.includes(currentModel)) ? currentModel : "glm-5.3-flash:cloud";
+            modelsToTry = Array.from(new Set([
+              chosenVisionModel,
+              ...codegeneVisionModels,
+              ...(Array.isArray(currentNode.supportedModels) ? currentNode.supportedModels.filter(m => m !== "deepseek-v4-flash:cloud") : [])
+            ])).filter(Boolean);
+          } else {
+            modelsToTry = Array.from(new Set([
               currentModel,
               ...(Array.isArray(currentNode.supportedModels) ? currentNode.supportedModels : []),
               "deepseek-v4-flash:cloud",
               "glm-5.3-flash:cloud",
               "gemma4:cloud",
               "kimi-k2.7-code:cloud"
-            ])).filter(Boolean)
-          : isCurrentGemini
-          ? ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
-          : isCurrentGLM
-          ? Array.from(new Set([currentModel, "zhipuai/glm-4-flash", "meta/llama-3.1-8b-instruct"])).filter(Boolean)
-          : (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService)
-          ? Array.from(new Set([currentModel, process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2"])).filter(Boolean)
-          : [currentModel];
+            ])).filter(Boolean);
+          }
+        } else if (isCurrentGemini) {
+          modelsToTry = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
+        } else if (isCurrentGLM) {
+          modelsToTry = Array.from(new Set([currentModel, "zhipuai/glm-4-flash", "meta/llama-3.1-8b-instruct"])).filter(Boolean);
+        } else if (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService) {
+          modelsToTry = Array.from(new Set([currentModel, process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2"])).filter(Boolean);
+        } else {
+          modelsToTry = [currentModel];
+        }
 
         let modelSuccess = false;
 
@@ -651,8 +695,63 @@ class AIGateway {
           }
         }
 
+        // Format multimodal messages according to endpoint specifications
+        let formattedMessages = providerMessages;
+        if (imageAttachments.length > 0) {
+          let lastUserIndex = -1;
+          for (let i = formattedMessages.length - 1; i >= 0; i--) {
+            if (formattedMessages[i].role === "user") {
+              lastUserIndex = i;
+              break;
+            }
+          }
+
+          if (lastUserIndex !== -1) {
+            formattedMessages = formattedMessages.map((m, idx) => {
+              if (idx !== lastUserIndex) return m;
+
+              const textContent = typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? (m.content.find(c => c.type === "text")?.text || "") : "");
+              const promptText = textContent && textContent.trim() ? textContent : "Please analyze this image and describe what it contains.";
+
+              // If native Ollama endpoint (/api/chat), Ollama expects message.images = [base64]
+              if (targetFetchUrl.endsWith("/api/chat")) {
+                return {
+                  ...m,
+                  content: promptText,
+                  images: cleanBase64List
+                };
+              }
+
+              // For OpenAI-compatible endpoints (including /v1/chat/completions on Ollama, Gemini OpenAI endpoint, vLLM):
+              // Standard OpenAI Vision format requires content to be an array of { type: 'text' } and { type: 'image_url' }
+              const contentParts = [
+                { type: "text", text: promptText },
+                ...imageAttachments.map(att => {
+                  const mime = att.mimeType || "image/png";
+                  const cleanB64 = att.data.replace(/^data:.*?;base64,/, "");
+                  return {
+                    type: "image_url",
+                    image_url: {
+                      url: `data:${mime};base64,${cleanB64}`
+                    }
+                  };
+                })
+              ];
+
+              return {
+                ...m,
+                content: contentParts,
+                images: cleanBase64List // Retain for hybrid servers
+              };
+            });
+          }
+        }
+
         for (const candidateModel of modelsToTry) {
-          const payload = { model: candidateModel, messages: providerMessages, stream: true };
+          const payload = { model: candidateModel, messages: formattedMessages, stream: true };
+          if (cleanBase64List.length > 0 && targetFetchUrl.endsWith("/api/chat")) {
+            payload.images = cleanBase64List;
+          }
           if (maxTokens) {
             payload.max_tokens = Number(maxTokens);
           }
@@ -661,8 +760,24 @@ class AIGateway {
           const dispatchStartTime = performance.now();
 
           try {
-            console.log(`🚀 [AI GATEWAY DISPATCH] RequestId: ${activeJobId} | Provider: ${currentNode.format || "auto"} | Node: ${currentNode.name} (${currentNode.id}) | Priority: ${currentNode.priorityScore} | Model: ${candidateModel}`);
-            console.log(`🔍 [DEBUG FETCH URL] TargetUrl: ${targetFetchUrl} | AuthHeader: ${nodeHeaders["Authorization"]}`);
+            const providerTag = isCurrentGemini ? "GEMINI" : (currentNode.format ? currentNode.format.toUpperCase() : "OLLAMA");
+
+            console.log(`\n================================================================================`);
+            console.log(`📤 [AI REQUEST -> ${providerTag}]`);
+            console.log(`  • JobId:       ${activeJobId}`);
+            console.log(`  • Provider:    ${currentNode.format || "ollama"}`);
+            console.log(`  • Node Name:   ${currentNode.name} (${currentNode.id})`);
+            console.log(`  • Target URL:  ${targetFetchUrl}`);
+            console.log(`  • Model:       ${candidateModel}`);
+            console.log(`  • Priority:    ${currentNode.priorityScore}`);
+            console.log(`  • Headers:     ${JSON.stringify({
+              "Content-Type": nodeHeaders["Content-Type"],
+              "Authorization": nodeHeaders["Authorization"] ? (nodeHeaders["Authorization"].substring(0, 15) + "...") : "None",
+              "User-Agent": nodeHeaders["User-Agent"]
+            })}`);
+            console.log(`  • Payload:`);
+            console.log(JSON.stringify(payload, null, 2));
+            console.log(`================================================================================\n`);
 
             response = await safeFetch(targetFetchUrl, {
               method: "POST",
@@ -675,7 +790,6 @@ class AIGateway {
             });
 
             const elapsedMs = (performance.now() - dispatchStartTime).toFixed(2);
-            console.log(`⏱️ [AI GATEWAY RESPONSE] RequestId: ${activeJobId} | Node: ${currentNode.name} | Model: ${candidateModel} | HTTP Status: ${response.status} | Latency: ${elapsedMs}ms`);
 
             if (response.ok) {
               const rawStream = response.rawStream;
@@ -748,6 +862,19 @@ class AIGateway {
                   modelSuccess = true;
                   streamedSuccessfully = true;
 
+                  console.log(`\n================================================================================`);
+                  console.log(`📥 [AI RESPONSE <- ${providerTag}]`);
+                  console.log(`  • JobId:         ${activeJobId}`);
+                  console.log(`  • Provider:      ${currentNode.format || "ollama"}`);
+                  console.log(`  • Node Name:     ${currentNode.name}`);
+                  console.log(`  • Model:         ${candidateModel}`);
+                  console.log(`  • HTTP Status:   ${response.status} OK`);
+                  console.log(`  • Latency:       ${elapsedMs} ms`);
+                  console.log(`  • TTFT:          ${ttft > 0 ? ttft.toFixed(2) + " ms" : "N/A"}`);
+                  console.log(`  • Response Text:`);
+                  console.log(accumulatedResponseText);
+                  console.log(`================================================================================\n`);
+
                   if (currentNode.id && currentNode.id.length === 24) {
                     ServerNode.findByIdAndUpdate(currentNode.id, {
                       $inc: { successRequests: 1 },
@@ -760,23 +887,49 @@ class AIGateway {
 
                   break; // Successful token streaming! Exit candidate model loop
                 } else {
-                  console.warn(`⚠️ [AI GATEWAY EMPTY STREAM] Model '${candidateModel}' on ${currentNode.name} returned 0 tokens. Trying next candidate model...`);
+                  console.warn(`\n⚠️ [AI EMPTY RESPONSE <- ${providerTag}] Model '${candidateModel}' on ${currentNode.name} returned 0 tokens. Trying next candidate model...\n`);
                 }
               }
-            } else if (response.status === 429) {
-              if (resolvedApiKey) blockKey(resolvedApiKey, 90000);
-              console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP 429. Key blocked 90s. Moving to next cluster node...`);
-              errorMessage = `Provider API Rate Limit Exceeded (HTTP 429) on ${currentNode.name}.`;
-              currentNode.status = "RATE_LIMITED";
-              currentNode.retryAfter = new Date(Date.now() + 90 * 1000);
-              break;
-            } else if (response.status === 401 || response.status === 403 || response.status === 404 || response.status === 410) {
-              console.warn(`⚠️ [AI GATEWAY MODEL NOTICE] Model '${candidateModel}' on ${currentNode.name} returned HTTP ${response.status}. Trying next candidate model...`);
-              errorMessage = `Model ${candidateModel} returned HTTP ${response.status}.`;
             } else {
-              errorMessage = `Server Node ${currentNode.name} returned HTTP ${response.status}.`;
+              const errorBody = await readStreamBody(response.rawStream);
+              console.error(`\n================================================================================`);
+              console.error(`❌ [AI ERROR RESPONSE <- ${providerTag}]`);
+              console.error(`  • JobId:       ${activeJobId}`);
+              console.error(`  • Provider:    ${currentNode.format || "ollama"}`);
+              console.error(`  • Node Name:   ${currentNode.name}`);
+              console.error(`  • Model:       ${candidateModel}`);
+              console.error(`  • HTTP Status: ${response.status}`);
+              console.error(`  • Latency:     ${elapsedMs} ms`);
+              console.error(`  • Error Body:`);
+              console.error(errorBody || "(empty body)");
+              console.error(`================================================================================\n`);
+
+              if (response.status === 429) {
+                if (resolvedApiKey) blockKey(resolvedApiKey, 90000);
+                console.warn(`⚠️ [AI GATEWAY NODE RATE_LIMIT] Node '${currentNode.name}' hit HTTP 429. Key blocked 90s. Moving to next cluster node...`);
+                errorMessage = `Provider API Rate Limit Exceeded (HTTP 429) on ${currentNode.name}. ${errorBody}`.trim();
+                currentNode.status = "RATE_LIMITED";
+                currentNode.retryAfter = new Date(Date.now() + 90 * 1000);
+                break;
+              } else if (response.status === 400 && errorBody.includes("does not support image input")) {
+                console.warn(`⚠️ [AI GATEWAY VISION NOTICE] Model '${candidateModel}' on node '${currentNode.name}' does not support image input. Trying next candidate model on this node...`);
+                errorMessage = `Model ${candidateModel} does not support image input.`;
+                continue;
+              } else if (response.status === 401 || response.status === 403 || response.status === 404 || response.status === 410) {
+                console.warn(`⚠️ [AI GATEWAY MODEL NOTICE] Model '${candidateModel}' on ${currentNode.name} returned HTTP ${response.status}. Trying next candidate model...`);
+                errorMessage = `Model ${candidateModel} returned HTTP ${response.status}. ${errorBody}`.trim();
+              } else {
+                errorMessage = `Server Node ${currentNode.name} returned HTTP ${response.status}. ${errorBody}`.trim();
+              }
             }
           } catch (err) {
+            console.error(`\n================================================================================`);
+            console.error(`❌ [AI NETWORK ERROR -> ${providerTag}]`);
+            console.error(`  • JobId:       ${activeJobId}`);
+            console.error(`  • Node Name:   ${currentNode.name} (${targetFetchUrl})`);
+            console.error(`  • Model:       ${candidateModel}`);
+            console.error(`  • Error:       ${err.message}`);
+            console.error(`================================================================================\n`);
             errorMessage = `Network connection error on ${currentNode.name}: ${err.message}`;
             console.warn(`⚠️ [AI GATEWAY FAILOVER] Node ${currentNode.name} network error: ${err.message}.`);
           }
@@ -809,9 +962,11 @@ class AIGateway {
     }
 
     if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
-      if (isGeminiModel) {
+      const hasImage = Array.isArray(attachments) && attachments.some(a => (a.fileType === "image" || a.mimeType?.startsWith("image/")) && a.data);
+      if (isGeminiModel || hasImage) {
         try {
-          const cloudRes = await this._streamCloudGemini({ model, messages, conversationSummary, res, onToken });
+          console.log(`🔄 [VISION / GEMINI FALLBACK] Attempting Cloud Gemini vision fallback...`);
+          const cloudRes = await this._streamCloudGemini({ model: "gemini-2.5-flash", messages, attachments, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
             accumulatedResponseText = cloudRes.text;
             streamedSuccessfully = true;
@@ -898,6 +1053,14 @@ class AIGateway {
       isLocal: false
     });
 
+    const openAiStartTime = performance.now();
+    console.log(`\n================================================================================`);
+    console.log(`📤 [AI REQUEST -> OPENAI (CLOUD SDK)]`);
+    console.log(`  • Model:    ${model || "gpt-4o-mini"}`);
+    console.log(`  • Messages:`);
+    console.log(JSON.stringify(providerMessages, null, 2));
+    console.log(`================================================================================\n`);
+
     const { OpenAI } = require("openai");
     const openai = new OpenAI({ apiKey });
     const stream = await openai.chat.completions.create({
@@ -915,6 +1078,15 @@ class AIGateway {
     }
     streamBuffer.flush();
 
+    const openAiElapsedMs = (performance.now() - openAiStartTime).toFixed(2);
+    console.log(`\n================================================================================`);
+    console.log(`📥 [AI RESPONSE <- OPENAI (CLOUD SDK)]`);
+    console.log(`  • Model:         ${model || "gpt-4o-mini"}`);
+    console.log(`  • Latency:       ${openAiElapsedMs} ms`);
+    console.log(`  • Response Text:`);
+    console.log(streamBuffer.cleanText);
+    console.log(`================================================================================\n`);
+
     const promptTokens = estimateTokens(messages);
     const completionTokens = estimateTokens(streamBuffer.cleanText);
 
@@ -931,7 +1103,7 @@ class AIGateway {
   /**
    * Cloud Google Gemini Stream Fallback Implementation
    */
-  async _streamCloudGemini({ model, messages = [], conversationSummary = null, res, onToken, secretKey = null }) {
+  async _streamCloudGemini({ model, messages = [], attachments = [], conversationSummary = null, res, onToken, secretKey = null }) {
     // DB-only key resolution: collect all active Gemini node keys from MongoDB.
     // No process.env.GEMINI_API_KEY fallback — admin manages all keys via dashboard.
     const { clusterState } = require("./ollamaHelper");
@@ -987,15 +1159,53 @@ class AIGateway {
           const sysMsg = messages.find(m => m.role === "system")?.content || "";
           const userMsgs = messages.filter(m => m.role !== "system");
 
-          const contentsPayload = userMsgs.map(m => ({
-            role: m.role === "assistant" ? "model" : "user",
-            parts: [{ text: m.content || "" }]
-          }));
+          const contentsPayload = userMsgs.map((m, idx) => {
+            const isLastUserMsg = idx === userMsgs.length - 1 && m.role === "user";
+            const parts = [{ text: m.content || "" }];
+
+            if (isLastUserMsg && Array.isArray(attachments)) {
+              attachments.forEach(att => {
+                if ((att.fileType === "image" || att.mimeType?.startsWith("image/")) && att.data) {
+                  parts.push({
+                    inlineData: {
+                      mimeType: att.mimeType || "image/png",
+                      data: att.data
+                    }
+                  });
+                } else if ((att.fileType === "pdf" || att.mimeType === "application/pdf") && att.data) {
+                  parts.push({
+                    inlineData: {
+                      mimeType: "application/pdf",
+                      data: att.data
+                    }
+                  });
+                }
+              });
+            }
+
+            return {
+              role: m.role === "assistant" ? "model" : "user",
+              parts
+            };
+          });
 
           if (contentsPayload.length === 0) {
             const userMsg = [...messages].reverse().find(m => m.role === "user")?.content || "Hello";
             contentsPayload.push({ role: "user", parts: [{ text: userMsg }] });
           }
+
+          const maskedKey = gKey.length > 10 ? `${gKey.slice(0, 6)}...${gKey.slice(-4)}` : "***";
+          const geminiStartTime = performance.now();
+
+          console.log(`\n================================================================================`);
+          console.log(`📤 [AI REQUEST -> GOOGLE GEMINI (CLOUD SDK)]`);
+          console.log(`  • Model:          ${gModel}`);
+          console.log(`  • API Key:        ${maskedKey}`);
+          console.log(`  • System Prompt:  ${sysMsg || "(none)"}`);
+          console.log(`  • Messages Count: ${contentsPayload.length}`);
+          console.log(`  • Contents Payload:`);
+          console.log(JSON.stringify(contentsPayload, null, 2));
+          console.log(`================================================================================\n`);
 
           const ai = new GoogleGenAI({ apiKey: gKey });
           const responseStream = await ai.models.generateContentStream({
@@ -1012,6 +1222,16 @@ class AIGateway {
 
           if (streamBuffer.cleanText && streamBuffer.cleanText.trim()) {
             keySucceeded = true;
+            const geminiElapsedMs = (performance.now() - geminiStartTime).toFixed(2);
+
+            console.log(`\n================================================================================`);
+            console.log(`📥 [AI RESPONSE <- GOOGLE GEMINI (CLOUD SDK)]`);
+            console.log(`  • Model:         ${gModel}`);
+            console.log(`  • Latency:       ${geminiElapsedMs} ms`);
+            console.log(`  • Response Text:`);
+            console.log(streamBuffer.cleanText);
+            console.log(`================================================================================\n`);
+
             const promptTokens = estimateTokens(messages);
             const completionTokens = estimateTokens(streamBuffer.cleanText);
             return {
@@ -1024,7 +1244,20 @@ class AIGateway {
             };
           }
         } catch (apiErr) {
+          const geminiElapsedMs = (performance.now() - geminiStartTime).toFixed(2);
           const errStatus = apiErr.status || apiErr.response?.status;
+
+          console.error(`\n================================================================================`);
+          console.error(`❌ [AI ERROR RESPONSE <- GOOGLE GEMINI (CLOUD SDK)]`);
+          console.error(`  • Model:    ${gModel}`);
+          console.error(`  • Status:   ${errStatus || "Error"}`);
+          console.error(`  • Latency:  ${geminiElapsedMs} ms`);
+          console.error(`  • Error:    ${apiErr.message || apiErr}`);
+          if (apiErr.response?.data) {
+            console.error(`  • Error Details:`, JSON.stringify(apiErr.response.data, null, 2));
+          }
+          console.error(`================================================================================\n`);
+
           if (errStatus === 429 || apiErr.message?.includes("429") || apiErr.message?.includes("quota")) {
             // Block this specific key and break model loop to try next key
             blockKey(gKey, 90000);
@@ -1092,6 +1325,14 @@ class AIGateway {
       isLocal: false
     });
 
+    const glmStartTime = performance.now();
+    console.log(`\n================================================================================`);
+    console.log(`📤 [AI REQUEST -> NVIDIA GLM (CLOUD SDK)]`);
+    console.log(`  • Model:    ${model || "z-ai/glm-5.2"}`);
+    console.log(`  • Messages:`);
+    console.log(JSON.stringify(providerMessages, null, 2));
+    console.log(`================================================================================\n`);
+
     const { OpenAI } = require("openai");
     const nvidia = new OpenAI({
       apiKey,
@@ -1112,6 +1353,15 @@ class AIGateway {
       }
     }
     streamBuffer.flush();
+
+    const glmElapsedMs = (performance.now() - glmStartTime).toFixed(2);
+    console.log(`\n================================================================================`);
+    console.log(`📥 [AI RESPONSE <- NVIDIA GLM (CLOUD SDK)]`);
+    console.log(`  • Model:         ${model || "z-ai/glm-5.2"}`);
+    console.log(`  • Latency:       ${glmElapsedMs} ms`);
+    console.log(`  • Response Text:`);
+    console.log(streamBuffer.cleanText);
+    console.log(`================================================================================\n`);
 
     const promptTokens = estimateTokens(messages);
     const completionTokens = estimateTokens(streamBuffer.cleanText);

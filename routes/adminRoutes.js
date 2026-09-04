@@ -35,4 +35,14 @@ router.post("/plans", adminController.createPlan);
 router.put("/plans/:id", adminController.updatePlan);
 router.delete("/plans/:id", adminController.deletePlan);
 
+// Global System Settings & Dynamic Welcome Credits
+router.get("/settings", adminController.getSettings);
+router.put("/settings", adminController.updateSettings);
+
+// Promotional Campaign Offers
+router.get("/promos", adminController.getPromos);
+router.post("/promos", adminController.createPromo);
+router.put("/promos/:id", adminController.updatePromo);
+router.delete("/promos/:id", adminController.deletePromo);
+
 module.exports = router;

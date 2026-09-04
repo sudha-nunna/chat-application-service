@@ -1073,3 +1073,158 @@ exports.deletePlan = async (req, res) => {
     return res.status(500).json({ success: false, error: error.message || "Failed to delete credit package." });
   }
 };
+
+/**
+ * Admin: Get Global System Settings (welcomeCredits)
+ * GET /admin/settings
+ */
+exports.getSettings = async (req, res) => {
+  try {
+    const SystemSetting = require("../models/SystemSetting");
+    let setting = await SystemSetting.findOne({ key: "global_settings" });
+    if (!setting) {
+      setting = await SystemSetting.create({ key: "global_settings", welcomeCredits: 100 });
+    }
+    return res.json({ success: true, settings: setting });
+  } catch (error) {
+    console.error("Error getting admin settings:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch platform settings." });
+  }
+};
+
+/**
+ * Admin: Update Global System Settings (welcomeCredits)
+ * PUT /admin/settings
+ */
+exports.updateSettings = async (req, res) => {
+  try {
+    const SystemSetting = require("../models/SystemSetting");
+    const { welcomeCredits } = req.body;
+
+    if (welcomeCredits === undefined || typeof welcomeCredits !== "number" || welcomeCredits < 0) {
+      return res.status(400).json({ success: false, error: "Validation Error: welcomeCredits must be a non-negative number." });
+    }
+
+    const setting = await SystemSetting.findOneAndUpdate(
+      { key: "global_settings" },
+      { welcomeCredits: Number(welcomeCredits) },
+      { new: true, upsert: true }
+    );
+
+    return res.json({ success: true, message: "Platform settings updated successfully.", settings: setting });
+  } catch (error) {
+    console.error("Error updating admin settings:", error);
+    return res.status(500).json({ success: false, error: "Failed to update platform settings." });
+  }
+};
+
+/**
+ * Admin: List All Promotional Offers
+ * GET /admin/promos
+ */
+exports.getPromos = async (req, res) => {
+  try {
+    const PromoOffer = require("../models/PromoOffer");
+    const promos = await PromoOffer.find().sort({ createdAt: -1 });
+    return res.json({ success: true, promos });
+  } catch (error) {
+    console.error("Error fetching promo offers:", error);
+    return res.status(500).json({ success: false, error: "Failed to fetch promotional offers." });
+  }
+};
+
+/**
+ * Admin: Create a Promotional Offer
+ * POST /admin/promos
+ */
+exports.createPromo = async (req, res) => {
+  try {
+    const PromoOffer = require("../models/PromoOffer");
+    const { title, offerMode, creditValue, startDate, endDate, isActive } = req.body;
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({ success: false, error: "Validation Error: Campaign Title is required." });
+    }
+    if (!offerMode || !["BONUS", "OVERRIDE"].includes(offerMode)) {
+      return res.status(400).json({ success: false, error: "Validation Error: offerMode must be either 'BONUS' or 'OVERRIDE'." });
+    }
+    if (creditValue === undefined || typeof creditValue !== "number" || creditValue < 0) {
+      return res.status(400).json({ success: false, error: "Validation Error: creditValue must be a non-negative number." });
+    }
+    if (!startDate || isNaN(new Date(startDate).getTime())) {
+      return res.status(400).json({ success: false, error: "Validation Error: A valid Start Date is required." });
+    }
+    if (!endDate || isNaN(new Date(endDate).getTime())) {
+      return res.status(400).json({ success: false, error: "Validation Error: A valid End Date is required." });
+    }
+    if (new Date(endDate) <= new Date(startDate)) {
+      return res.status(400).json({ success: false, error: "Validation Error: End Date must be after Start Date." });
+    }
+
+    const newOffer = await PromoOffer.create({
+      title: title.trim(),
+      offerMode,
+      creditValue: Number(creditValue),
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      isActive: isActive !== false
+    });
+
+    return res.status(201).json({ success: true, message: "Promotional campaign created successfully.", offer: newOffer });
+  } catch (error) {
+    console.error("Error creating promo offer:", error);
+    return res.status(500).json({ success: false, error: error.message || "Failed to create promotional campaign." });
+  }
+};
+
+/**
+ * Admin: Update a Promotional Offer
+ * PUT /admin/promos/:id
+ */
+exports.updatePromo = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const PromoOffer = require("../models/PromoOffer");
+    const { title, offerMode, creditValue, startDate, endDate, isActive } = req.body;
+
+    const offer = await PromoOffer.findById(id);
+    if (!offer) {
+      return res.status(404).json({ success: false, error: "Promotional campaign not found." });
+    }
+
+    if (title && title.trim()) offer.title = title.trim();
+    if (offerMode && ["BONUS", "OVERRIDE"].includes(offerMode)) offer.offerMode = offerMode;
+    if (creditValue !== undefined && typeof creditValue === "number" && creditValue >= 0) offer.creditValue = Number(creditValue);
+    if (startDate && !isNaN(new Date(startDate).getTime())) offer.startDate = new Date(startDate);
+    if (endDate && !isNaN(new Date(endDate).getTime())) offer.endDate = new Date(endDate);
+    if (offer.endDate <= offer.startDate) {
+      return res.status(400).json({ success: false, error: "Validation Error: End Date must be after Start Date." });
+    }
+    if (isActive !== undefined) offer.isActive = Boolean(isActive);
+
+    await offer.save();
+    return res.json({ success: true, message: "Promotional campaign updated successfully.", offer });
+  } catch (error) {
+    console.error("Error updating promo offer:", error);
+    return res.status(500).json({ success: false, error: error.message || "Failed to update promotional campaign." });
+  }
+};
+
+/**
+ * Admin: Delete a Promotional Offer
+ * DELETE /admin/promos/:id
+ */
+exports.deletePromo = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const PromoOffer = require("../models/PromoOffer");
+    const offer = await PromoOffer.findByIdAndDelete(id);
+    if (!offer) {
+      return res.status(404).json({ success: false, error: "Promotional campaign not found." });
+    }
+    return res.json({ success: true, message: "Promotional campaign deleted successfully." });
+  } catch (error) {
+    console.error("Error deleting promo offer:", error);
+    return res.status(500).json({ success: false, error: "Failed to delete promotional campaign." });
+  }
+};

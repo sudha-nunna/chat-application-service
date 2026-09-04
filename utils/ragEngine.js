@@ -132,6 +132,7 @@ async function generateEmbeddingVectorAsync(text) {
   }
 
   try {
+    console.log(`\n📤 [AI REQUEST -> OLLAMA (EMBEDDINGS)] Model: ${OLLAMA_EMBED_MODEL} | Text: "${text.slice(0, 80)}..."`);
     const response = await fetch(`${OLLAMA_BASE_URL}/api/embeddings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -143,11 +144,16 @@ async function generateEmbeddingVectorAsync(text) {
     if (response.ok) {
       const data = await response.json();
       if (data.embedding && Array.isArray(data.embedding)) {
+        console.log(`📥 [AI RESPONSE <- OLLAMA (EMBEDDINGS)] Success (${data.embedding.length} dimensions)`);
         embeddingCache.set(cacheKey, data.embedding);
         return data.embedding;
       }
+    } else {
+      console.warn(`⚠️ [AI EMBEDDINGS WARN <- OLLAMA] HTTP ${response.status}`);
     }
-  } catch (err) { }
+  } catch (err) {
+    console.warn(`⚠️ [AI EMBEDDINGS ERROR <- OLLAMA] ${err.message}`);
+  }
 
   const fallback = generateEmbeddingVector(text);
   embeddingCache.set(cacheKey, fallback);
@@ -263,6 +269,13 @@ Return ONLY the plain text summary narrative. Do NOT include introductory phrase
   const targetModel = await getAvailableOllamaModel(OLLAMA_BASE_URL, process.env.OLLAMA_MODEL);
 
   try {
+    console.log(`\n================================================================================`);
+    console.log(`📤 [AI REQUEST -> OLLAMA (RAG SUMMARY)]`);
+    console.log(`  • Endpoint: ${OLLAMA_BASE_URL}/api/generate`);
+    console.log(`  • Model:    ${targetModel}`);
+    console.log(`  • Prompt:   ${prompt.slice(0, 200)}...`);
+    console.log(`================================================================================\n`);
+
     const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -276,9 +289,16 @@ Return ONLY the plain text summary narrative. Do NOT include introductory phrase
     if (response.ok) {
       const data = await response.json();
       const summaryText = data.response ? data.response.trim() : "";
+      console.log(`\n================================================================================`);
+      console.log(`📥 [AI RESPONSE <- OLLAMA (RAG SUMMARY)]`);
+      console.log(`  • Status:       ${response.status} OK`);
+      console.log(`  • Summary Text: ${summaryText}`);
+      console.log(`================================================================================\n`);
       if (summaryText) {
         return summaryText;
       }
+    } else {
+      console.error(`\n❌ [AI ERROR RESPONSE <- OLLAMA (RAG SUMMARY)] Status: ${response.status} ${response.statusText}\n`);
     }
   } catch (err) {
     console.warn("⚠️ [LLM SUMMARY NOTICE] Ollama summarization offline, using narrative summary fallback:", err.message);

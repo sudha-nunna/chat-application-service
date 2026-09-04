@@ -169,7 +169,16 @@ exports.getAllModelsAdmin = async (req, res) => {
     const enrichedModels = models.map((m) => {
       const providerLower = (m.provider || "openai").toLowerCase();
       const modelIdLower = (m.modelId || "").toLowerCase();
-      const isNodeActive = activeFormats.has(providerLower) || activeModelIds.has(modelIdLower);
+
+      // Senior Developer Logic:
+      // For Ollama/local nodes: must be explicitly in activeModelIds list of active Ollama nodes
+      // For Cloud nodes (Gemini, OpenAI, GLM): node format must be active OR modelId explicitly supported
+      let isNodeActive = false;
+      if (providerLower === "ollama") {
+        isNodeActive = activeModelIds.has(modelIdLower);
+      } else {
+        isNodeActive = activeFormats.has(providerLower) || activeModelIds.has(modelIdLower);
+      }
 
       return {
         ...m,

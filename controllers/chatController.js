@@ -177,12 +177,19 @@ exports.sendMessage = async (req, res) => {
   let llmRequestStartTime = null;
 
   try {
-    const { message } = req.body;
+    let { message } = req.body;
     let chatId = req.params.chatId;
+    const rawAttachments = req.body.attachments || [];
 
-    if (!message) {
-      return res.status(400).json({ success: false, message: "Message text is required." });
+    const hasAttachments = Array.isArray(rawAttachments) && rawAttachments.length > 0;
+    const hasMessage = typeof message === "string" && message.trim().length > 0;
+
+    if (!hasMessage) {
+      return res.status(400).json({ success: false, message: "A text prompt is required with your submission." });
     }
+
+    const rawUserMessage = hasMessage ? message.trim() : "";
+    const hasImage = hasAttachments && rawAttachments.some(a => a.fileType === "image" || a.mimeType?.startsWith("image/"));
 
     const tDbStart = performance.now();
     const userId = req.user?.id || req.user?._id;
@@ -250,10 +257,60 @@ exports.sendMessage = async (req, res) => {
     }
     chatId = chat._id;
 
-    // Save User message & update title
-    const saveUserMsgPromise = Message.create({ chatId, role: "user", content: message });
+    // Process file attachments (Images, PDF, TXT)
+    const pdfParse = require("pdf-parse");
+    const processedAttachments = [];
+    let extractedTextContext = "";
+
+    if (Array.isArray(rawAttachments) && rawAttachments.length > 0) {
+      for (const att of rawAttachments) {
+        const cleanData = (att.data || "").replace(/^data:.*?;base64,/, "");
+        const fileBuffer = Buffer.from(cleanData, "base64");
+        let fileText = "";
+
+        const isPdf = att.fileType === "pdf" || att.mimeType === "application/pdf" || att.name?.endsWith(".pdf");
+        const isTxt = att.fileType === "txt" || att.mimeType?.startsWith("text/") || att.name?.endsWith(".txt") || att.name?.endsWith(".md") || att.name?.endsWith(".json") || att.name?.endsWith(".csv");
+        const isImg = att.fileType === "image" || att.mimeType?.startsWith("image/");
+
+        const fileType = isImg ? "image" : isPdf ? "pdf" : "txt";
+
+        if (isPdf && fileBuffer.length > 0) {
+          try {
+            const pdfData = await pdfParse(fileBuffer);
+            fileText = pdfData.text || "";
+          } catch (pdfErr) {
+            console.warn("⚠️ PDF text extraction warning:", pdfErr.message);
+          }
+        } else if (isTxt && fileBuffer.length > 0) {
+          fileText = fileBuffer.toString("utf-8");
+        }
+
+        processedAttachments.push({
+          name: att.name || "attachment",
+          fileType,
+          mimeType: att.mimeType || (isImg ? "image/png" : isPdf ? "application/pdf" : "text/plain"),
+          data: cleanData,
+          size: att.size || fileBuffer.length,
+          extractedText: fileText
+        });
+
+        if (fileText.trim()) {
+          extractedTextContext += `\n\n[ATTACHED DOCUMENT: ${att.name}]\n${fileText.slice(0, 12000)}\n[END OF DOCUMENT: ${att.name}]`;
+        }
+      }
+    }
+
+    // Save User message with attachments & update title (only store text user actually typed!)
+    const saveUserMsgPromise = Message.create({
+      chatId,
+      role: "user",
+      content: rawUserMessage,
+      attachments: processedAttachments.map(({ extractedText, ...rest }) => rest)
+    });
+
     if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
-      chat.title = message.trim().substring(0, 35) || "New Conversation";
+      const defaultTitle = hasImage ? "Image Analysis" : "Document Analysis";
+      chat.title = rawUserMessage.substring(0, 35) || defaultTitle;
       chat.save().catch(() => {});
     }
 
@@ -265,9 +322,16 @@ exports.sendMessage = async (req, res) => {
     const currentModelId = modelPricing.modelId || requestedModelId;
 
     // Set SSE headers ONCE after pre-flight validations pass
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
+    if (res.socket && typeof res.socket.setNoDelay === "function") {
+      res.socket.setNoDelay(true);
+    }
 
     res.write(`data: ${JSON.stringify({
       type: "meta",
@@ -318,7 +382,9 @@ CORE BEHAVIOR RULES:
       });
     });
 
-    historyPayload.push({ role: "user", content: message });
+    const promptForAI = rawUserMessage || (hasImage ? "Please analyze this image and describe what it contains." : "Please analyze the attached document.");
+    const finalUserPrompt = extractedTextContext ? `${promptForAI}\n${extractedTextContext}` : promptForAI;
+    historyPayload.push({ role: "user", content: finalUserPrompt });
 
     await saveUserMsgPromise;
 
@@ -326,10 +392,27 @@ CORE BEHAVIOR RULES:
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();
 
+    console.log(`\n================================================================================`);
+    console.log(`📥 [USER REQUEST RECEIVED IN BACKEND]`);
+    console.log(`  • ChatId:       ${chatId}`);
+    console.log(`  • User:         ${userId} (${isPaid ? "Paid Tier" : "Free Tier"})`);
+    console.log(`  • Model:        ${currentModelId} (Provider: ${modelPricing.provider || "auto"})`);
+    console.log(`  • Prompt Message: "${rawUserMessage || (hasImage ? "[Attachment Only - Image Analysis]" : "[Attachment Only]")}"`);
+    if (processedAttachments.length > 0) {
+      console.log(`  • Attachments (${processedAttachments.length}):`);
+      processedAttachments.forEach((att, i) => {
+        console.log(`    [${i + 1}] ${att.name} (Type: ${att.fileType}, MIME: ${att.mimeType}, Size: ${att.size} bytes)`);
+      });
+    } else {
+      console.log(`  • Attachments:  None`);
+    }
+    console.log(`================================================================================\n`);
+
     const gatewayResult = await aiGateway.generateStream({
       provider: modelPricing.provider || "auto",
       model: currentModelId,
       messages: historyPayload,
+      attachments: processedAttachments,
       res,
       userPriority,
       jobId,
@@ -445,6 +528,18 @@ CORE BEHAVIOR RULES:
       }
 
       await saveAssistantPromise;
+
+      console.log(`\n================================================================================`);
+      console.log(`📤 [AI RESPONSE SENT TO USER]`);
+      console.log(`  • ChatId:         ${chatId}`);
+      console.log(`  • Model:          ${currentModelId}`);
+      console.log(`  • Total Tokens:   ${totalTokens} (${promptTokens} prompt + ${completionTokens} completion)`);
+      console.log(`  • Latency:        ${totalDuration.toFixed(2)} ms (TTFT: ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'})`);
+      console.log(`  • Response Length: ${accumulatedResponseText.length} characters`);
+      console.log(`  • Response Text:`);
+      console.log(accumulatedResponseText);
+      console.log(`================================================================================\n`);
+
       res.write("data: [DONE]\n\n");
       return res.end();
     }
@@ -453,6 +548,14 @@ CORE BEHAVIOR RULES:
       if (res.writableEnded) return;
       console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content.");
       const fallbackText = gatewayResult.errorMessage || "I'm unable to connect to the active AI server node right now. Please check that your server node is running and accessible.";
+
+      console.log(`\n================================================================================`);
+      console.log(`📤 [FALLBACK RESPONSE SENT TO USER]`);
+      console.log(`  • ChatId:         ${chatId}`);
+      console.log(`  • Fallback Text:`);
+      console.log(fallbackText);
+      console.log(`================================================================================\n`);
+
       await streamTextInChunks(res, fallbackText, 15);
       res.write("data: [DONE]\n\n");
       return res.end();
