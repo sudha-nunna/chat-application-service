@@ -982,7 +982,7 @@ exports.getAllPlans = async (req, res) => {
 exports.createPlan = async (req, res) => {
   try {
     const Plan = require("../models/Plan");
-    const { key, name, monthlyPrice, creditsGranted } = req.body;
+    const { key, name, monthlyPrice, creditsGranted, description } = req.body;
 
     if (!key || !key.trim()) {
       return res.status(400).json({ success: false, error: "Validation Error: Package Key (e.g. starter-500) is required." });
@@ -1009,10 +1009,15 @@ exports.createPlan = async (req, res) => {
       return res.status(400).json({ success: false, error: `Validation Error: Package Key '${cleanKey}' already exists.` });
     }
 
+    const cleanDescription = (description && typeof description === "string" && description.trim().length > 0)
+      ? description.trim()
+      : `${name.trim()} - ${(Number(creditsGranted) || 500).toLocaleString()} AI Credits package for high-volume usage.`;
+
     const plan = await Plan.create({
       ...req.body,
       key: cleanKey,
       name: name.trim(),
+      description: cleanDescription,
       monthlyPrice: Number(monthlyPrice),
       creditsGranted: Number(creditsGranted)
     });
@@ -1059,15 +1064,25 @@ exports.deletePlan = async (req, res) => {
     const { id } = req.params;
     const mongoose = require("mongoose");
     const Plan = require("../models/Plan");
-    
-    const isObjectId = mongoose.Types.ObjectId.isValid(id);
-    const query = isObjectId ? { _id: id } : { key: id };
 
-    const plan = await Plan.findOne(query);
-    if (!plan) return res.status(404).json({ success: false, error: "Credit package not found." });
+    if (!id || !id.trim()) {
+      return res.status(400).json({ success: false, error: "Package Key or ID is required." });
+    }
+
+    const cleanId = id.trim();
+    const isObjectId = mongoose.Types.ObjectId.isValid(cleanId);
     
-    await Plan.deleteOne(query);
-    return res.json({ success: true, message: "Credit package deleted successfully." });
+    let plan = isObjectId ? await Plan.findById(cleanId) : null;
+    if (!plan) {
+      plan = await Plan.findOne({ key: cleanId.toLowerCase() });
+    }
+
+    if (!plan) {
+      return res.status(404).json({ success: false, error: `Credit package '${cleanId}' not found.` });
+    }
+    
+    await Plan.deleteOne({ _id: plan._id });
+    return res.json({ success: true, message: `Credit package '${plan.name}' deleted successfully.` });
   } catch (error) {
     console.error("Error deleting plan:", error);
     return res.status(500).json({ success: false, error: error.message || "Failed to delete credit package." });

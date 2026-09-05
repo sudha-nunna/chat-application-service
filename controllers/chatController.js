@@ -151,6 +151,37 @@ exports.getMessages = async (req, res) => {
   }
 };
 
+exports.updateChat = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { title } = req.body;
+
+    if (!title || typeof title !== "string" || !title.trim()) {
+      return res.status(400).json({ success: false, message: "Chat title cannot be empty." });
+    }
+
+    const userId = req.user?.id || req.user?._id;
+    const query = { _id: chatId };
+    if (userId) {
+      query.userId = userId;
+    }
+
+    const updatedChat = await Chat.findOneAndUpdate(
+      query,
+      { title: title.trim() },
+      { new: true }
+    );
+
+    if (!updatedChat) {
+      return res.status(404).json({ success: false, message: "Chat not found or unauthorized." });
+    }
+
+    res.json(updatedChat);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 exports.deleteChat = async (req, res) => {
   try {
     const { chatId } = req.params;
@@ -163,6 +194,7 @@ exports.deleteChat = async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
 
 // -----------------------------------------------------------------------------
 // 2. UNRESTRICTED GENERAL CHAT ENGINE WITH FULL CONVERSATION MEMORY (OLLAMA-NATIVE)

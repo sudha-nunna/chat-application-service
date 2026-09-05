@@ -1,6 +1,8 @@
 const User = require("../models/User");
 const Subscription = require("../models/Subscription");
 const Usage = require("../models/Usage");
+const Plan = require("../models/Plan");
+const CreditTransaction = require("../models/CreditTransaction");
 const { calculatePriority } = require("../utils/priorityCalculator");
 
 /**
@@ -21,8 +23,8 @@ exports.getSubscription = async (req, res) => {
       subscription = await Subscription.findById(user.activeSubscriptionId);
     }
 
-    // Lazy evaluation of subscription expiration
-    if (subscription && subscription.endDate && new Date() > new Date(subscription.endDate)) {
+    // Lazy evaluation of subscription expiration (only for recurring cycles with endDate)
+    if (subscription && subscription.billingCycle !== "one-time" && subscription.endDate && new Date() > new Date(subscription.endDate)) {
       if (subscription.status === "active" || subscription.cancelAtPeriodEnd) {
         subscription.status = "expired";
         await subscription.save();
@@ -54,13 +56,13 @@ exports.getSubscription = async (req, res) => {
 };
 
 /**
- * 2. Upgrade Plan
+ * 2. Upgrade / Purchase Credit Package
  * POST /subscription/upgrade
- * Body: { plan: string, billingCycle: "monthly" | "annual", paymentProvider?: string, paymentReference?: string }
+ * Body: { plan: string, billingCycle: "one-time" | "monthly" | "annual", paymentProvider?: string, paymentReference?: string }
  */
 exports.upgradePlan = async (req, res) => {
   try {
-    const { plan, billingCycle = "monthly", paymentProvider = "manual", paymentReference = null } = req.body;
+    const { plan, billingCycle = "one-time", paymentProvider = "manual", paymentReference = null } = req.body;
     const userId = req.user.id;
 
     const user = await User.findById(userId);
@@ -68,11 +70,15 @@ exports.upgradePlan = async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
+    const dbPlan = await Plan.findOne({ key: (plan || "").toLowerCase() });
+
     const now = new Date();
-    const endDate = new Date();
+    let endDate = null;
     if (billingCycle === "annual") {
+      endDate = new Date();
       endDate.setFullYear(endDate.getFullYear() + 1);
-    } else {
+    } else if (billingCycle === "monthly") {
+      endDate = new Date();
       endDate.setMonth(endDate.getMonth() + 1);
     }
 
@@ -93,12 +99,32 @@ exports.upgradePlan = async (req, res) => {
 
     user.plan = plan;
     user.activeSubscriptionId = subscription._id;
+
+    // Grant credits configured on this package
+    const creditsToAdd = dbPlan?.creditsGranted || (plan.toLowerCase() === "starter" ? 500 : plan.toLowerCase() === "pro" ? 2500 : plan.toLowerCase() === "power" ? 10000 : 0);
+    if (creditsToAdd > 0) {
+      const newBalance = parseFloat(((user.credits || 0) + creditsToAdd).toFixed(4));
+      user.credits = newBalance;
+      user.isPaidUser = true;
+      user.totalCreditsPurchased = (user.totalCreditsPurchased || 0) + creditsToAdd;
+
+      await CreditTransaction.create({
+        userId: user._id,
+        amount: creditsToAdd,
+        type: "purchase",
+        description: `Purchased ${dbPlan ? dbPlan.name : plan} (+${creditsToAdd.toLocaleString()} credits)`,
+        balanceAfter: newBalance,
+      }).catch(() => {});
+    }
+
     await user.save();
 
     res.status(200).json({
       success: true,
-      message: `Successfully upgraded to ${plan} plan`,
+      message: `Successfully purchased ${dbPlan ? dbPlan.name : plan} (+${creditsToAdd.toLocaleString()} credits added to your wallet)!`,
       subscription,
+      creditsAdded: creditsToAdd,
+      newBalance: user.credits,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
