@@ -10,7 +10,6 @@ const subscriptionSchema = new mongoose.Schema(
     },
     plan: {
       type: String,
-      enum: ["free", "pro", "enterprise"],
       default: "free",
       required: true,
     },
@@ -22,7 +21,7 @@ const subscriptionSchema = new mongoose.Schema(
     },
     billingCycle: {
       type: String,
-      enum: ["none", "monthly", "annual"],
+      enum: ["none", "one-time", "monthly", "annual"],
       default: "none",
     },
     startDate: {
