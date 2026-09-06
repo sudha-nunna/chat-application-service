@@ -142,6 +142,41 @@ exports.getChats = async (req, res) => {
   }
 };
 
+exports.stopMessage = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { content } = req.body;
+
+    if (!chatId) {
+      return res.status(400).json({ success: false, message: "chatId is required." });
+    }
+
+    const lastMsg = await Message.findOne({ chatId }).sort({ createdAt: -1 });
+
+    if (lastMsg && lastMsg.role === "assistant") {
+      if (content && typeof content === "string") {
+        lastMsg.content = content;
+      }
+      lastMsg.isStoppedMidway = true;
+      await lastMsg.save();
+      return res.json({ success: true, message: lastMsg });
+    } else if (content && typeof content === "string" && content.trim()) {
+      const newMsg = await Message.create({
+        chatId,
+        role: "assistant",
+        content: content.trim(),
+        isStoppedMidway: true
+      });
+      return res.json({ success: true, message: newMsg });
+    }
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Failed to mark message stopped:", error.message);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
 exports.getMessages = async (req, res) => {
   try {
     const messages = await Message.find({ chatId: req.params.chatId }).sort({ createdAt: 1 });
@@ -207,6 +242,10 @@ exports.sendMessage = async (req, res) => {
   let streamDuration = 0;
   let firstTokenTimestamp = null;
   let llmRequestStartTime = null;
+  let clientDisconnected = false;
+  req.on("close", () => {
+    clientDisconnected = true;
+  });
 
   try {
     let { message } = req.body;
@@ -461,6 +500,18 @@ CORE BEHAVIOR RULES:
       }
     }
 
+    // Continuation intent detector: when user says "continue", "not done fully", "keep going", etc.
+    const lastAssistantMsg = historyMsgs.filter((m) => m.role === "assistant").pop();
+    const isContinuationIntent = /^(continue|carry on|go on|keep going|proceed|finish|finish it|finish the code|not done|it not done|see it not done|it is not done|not fully done|see it not done fully|complete it|complete the rest|build the rest)\b/i.test((rawUserMessage || "").trim());
+
+    if (isContinuationIntent && lastAssistantMsg) {
+      finalUserPrompt = `${finalUserPrompt}\n\n[CRITICAL CONTINUATION DIRECTIVE: The user is explicitly requesting to continue and fully finish their project or code ("${rawUserMessage.trim()}").
+1. Do NOT state that you already finished or that the files are complete.
+2. Do NOT say "It looks like you might be typing continue".
+3. Do NOT ask clarifying questions like "Which section should I build first?" or "What would you like me to add next?".
+4. Immediately proceed to write the next remaining sections and components (such as FeaturesSection.jsx, PricingSection.jsx, TestimonialsSection.jsx, Footer.jsx, etc.) and provide the updated App.jsx that integrates all components into a complete, working application. Output the full code blocks directly.]`;
+    }
+
     historyPayload.push({ role: "user", content: finalUserPrompt });
 
     await saveUserMsgPromise;
@@ -566,11 +617,13 @@ CORE BEHAVIOR RULES:
         console.warn("⚠️ [FOLLOW-UPS NOTICE] Generation skipped on error:", fErr.message);
       }
 
+      const isStopped = clientDisconnected || Boolean(req.destroyed);
       const saveAssistantPromise = Message.create({
         chatId,
         role: "assistant",
         content: accumulatedResponseText,
-        followUps,
+        isStoppedMidway: isStopped,
+        followUps: isStopped ? [] : followUps,
         sources: searchSources,
         requiresWebSearch: isGuidanceActive
       });

@@ -10,6 +10,7 @@ router.use(protect);
 router.post("/", chatController.createChat);
 router.get("/", chatController.getChats);
 router.get("/:chatId/messages", chatController.getMessages);
+router.post("/:chatId/messages/stop", chatController.stopMessage);
 router.post("/:chatId/share", chatController.shareChat);
 router.get("/share/:chatId", chatController.getSharedChat);
 router.post("/share/:chatId/fork", chatController.forkSharedChat);

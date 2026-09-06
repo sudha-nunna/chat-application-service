@@ -20,6 +20,11 @@ const messageSchema = new mongoose.Schema(
       required: true,
     },
 
+    isStoppedMidway: {
+      type: Boolean,
+      default: false,
+    },
+
     attachments: [
       {
         name: { type: String, required: true },
