@@ -296,7 +296,8 @@ class AIGateway {
     userPriority = 10,
     jobId = null,
     userId = "system",
-    onToken = null
+    onToken = null,
+    preResolvedNodeHint = null
   }) {
     const providerLower = (provider || "auto").toLowerCase();
 
@@ -311,7 +312,8 @@ class AIGateway {
         userPriority,
         jobId,
         userId,
-        onToken
+        onToken,
+        preResolvedNodeHint
       });
     }
 
@@ -350,7 +352,8 @@ class AIGateway {
         jobId,
         userId,
         onToken,
-        strictProvider: "openai"
+        strictProvider: "openai",
+        preResolvedNodeHint
       });
     }
 
@@ -377,7 +380,8 @@ class AIGateway {
           jobId,
           userId,
           onToken,
-          strictProvider: "gemini"
+          strictProvider: "gemini",
+          preResolvedNodeHint
         });
       }
     }
@@ -403,7 +407,8 @@ class AIGateway {
           jobId,
           userId,
           onToken,
-          strictProvider: "glm"
+          strictProvider: "glm",
+          preResolvedNodeHint
         });
       }
     }
@@ -419,7 +424,8 @@ class AIGateway {
       jobId,
       userId,
       onToken,
-      strictProvider: providerLower !== "auto" ? providerLower : null
+      strictProvider: providerLower !== "auto" ? providerLower : null,
+      preResolvedNodeHint
     });
   }
 
@@ -427,7 +433,7 @@ class AIGateway {
    * Streams response from Cluster Server Nodes with Provider Pools, Priority Routing,
    * Least-Loaded Balancing, Intra-Pool & Cross-Pool Failover, and Observability Metrics.
    */
-  async _streamOllamaCluster({ model, customUrl, messages, attachments = [], conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null, strictProvider = null }) {
+  async _streamOllamaCluster({ model, customUrl, messages, attachments = [], conversationSummary = null, res, userPriority, jobId, userId, onToken, maxTokens = null, strictProvider = null, preResolvedNodeHint = null }) {
     const { getProviderPools, refreshClusterNodesFromDB } = require("./ollamaHelper");
     await refreshClusterNodesFromDB();
 
@@ -531,6 +537,16 @@ class AIGateway {
         }
         return a.activeRequests - b.activeRequests;
       });
+
+      // Promote pre-resolved node hint to index 0 if present in candidates (ensures search & generation node consistency)
+      if (preResolvedNodeHint) {
+        const hintId = preResolvedNodeHint.id || preResolvedNodeHint._id?.toString();
+        const hintIndex = poolCandidates.findIndex(n => (hintId && n.id === hintId) || (preResolvedNodeHint.url && n.url === preResolvedNodeHint.url));
+        if (hintIndex > 0) {
+          const [hintedNode] = poolCandidates.splice(hintIndex, 1);
+          poolCandidates.unshift(hintedNode);
+        }
+      }
 
       // Intra-Pool Failover Loop: Iterate through sorted candidates in this pool
       for (const currentNode of poolCandidates) {

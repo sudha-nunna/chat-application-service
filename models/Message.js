@@ -29,6 +29,11 @@ const messageSchema = new mongoose.Schema(
         size: { type: Number },
       },
     ],
+
+    followUps: {
+      type: [String],
+      default: [],
+    },
   },
   {
     timestamps: true,

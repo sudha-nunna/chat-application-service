@@ -12,6 +12,10 @@ const systemSettingSchema = new mongoose.Schema(
       type: Number,
       default: 100,
       min: 0
+    },
+    enableFollowUpSuggestions: {
+      type: Boolean,
+      default: true
     }
   },
   {

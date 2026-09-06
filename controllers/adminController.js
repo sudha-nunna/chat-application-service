@@ -1098,7 +1098,7 @@ exports.getSettings = async (req, res) => {
     const SystemSetting = require("../models/SystemSetting");
     let setting = await SystemSetting.findOne({ key: "global_settings" });
     if (!setting) {
-      setting = await SystemSetting.create({ key: "global_settings", welcomeCredits: 100 });
+      setting = await SystemSetting.create({ key: "global_settings", welcomeCredits: 100, enableFollowUpSuggestions: true });
     }
     return res.json({ success: true, settings: setting });
   } catch (error) {
@@ -1108,21 +1108,34 @@ exports.getSettings = async (req, res) => {
 };
 
 /**
- * Admin: Update Global System Settings (welcomeCredits)
+ * Admin: Update Global System Settings (welcomeCredits, enableFollowUpSuggestions)
  * PUT /admin/settings
  */
 exports.updateSettings = async (req, res) => {
   try {
     const SystemSetting = require("../models/SystemSetting");
-    const { welcomeCredits } = req.body;
+    const { welcomeCredits, enableFollowUpSuggestions } = req.body;
 
-    if (welcomeCredits === undefined || typeof welcomeCredits !== "number" || welcomeCredits < 0) {
-      return res.status(400).json({ success: false, error: "Validation Error: welcomeCredits must be a non-negative number." });
+    const updateFields = {};
+
+    if (welcomeCredits !== undefined) {
+      if (typeof welcomeCredits !== "number" || welcomeCredits < 0) {
+        return res.status(400).json({ success: false, error: "Validation Error: welcomeCredits must be a non-negative number." });
+      }
+      updateFields.welcomeCredits = Number(welcomeCredits);
+    }
+
+    if (enableFollowUpSuggestions !== undefined) {
+      updateFields.enableFollowUpSuggestions = Boolean(enableFollowUpSuggestions);
+    }
+
+    if (Object.keys(updateFields).length === 0) {
+      return res.status(400).json({ success: false, error: "Validation Error: No valid settings fields provided." });
     }
 
     const setting = await SystemSetting.findOneAndUpdate(
       { key: "global_settings" },
-      { welcomeCredits: Number(welcomeCredits) },
+      { $set: updateFields },
       { new: true, upsert: true }
     );
 

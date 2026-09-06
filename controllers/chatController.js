@@ -415,12 +415,42 @@ CORE BEHAVIOR RULES:
     });
 
     const promptForAI = rawUserMessage || (hasImage ? "Please analyze this image and describe what it contains." : "Please analyze the attached document.");
-    const finalUserPrompt = extractedTextContext ? `${promptForAI}\n${extractedTextContext}` : promptForAI;
+    let finalUserPrompt = extractedTextContext ? `${promptForAI}\n${extractedTextContext}` : promptForAI;
+
+    // Web Search Flag: Only execute web search when explicitly requested by user
+    const enableSearch = Boolean(
+      req.body.enableSearch || req.body.webSearch || req.body.internetSearch
+    );
+
+    // Pre-resolve best cluster node for node consistency between search & generation
+    const { selectBestClusterNode } = require("../utils/ollamaHelper");
+    const userPriority = isPaid ? 100 : 50;
+    const preResolvedNodeHint = selectBestClusterNode(userPriority);
+
+    // Evaluate smart search intent (< 0.1ms synchronous rule-based guardrail)
+    const { evaluateSearchIntent } = require("../services/searchIntentService");
+    const searchIntent = evaluateSearchIntent(rawUserMessage, enableSearch, {
+      hasHistory: Array.isArray(dbMessagesHistory) && dbMessagesHistory.length > 0
+    });
+
+    let searchExecuted = false;
+    if (searchIntent.shouldSearch && rawUserMessage) {
+      try {
+        const webSearchService = require("../services/webSearchService");
+        const searchContext = await webSearchService.searchOrFetch(rawUserMessage);
+        if (searchContext) {
+          finalUserPrompt = `${finalUserPrompt}\n\n${searchContext}`;
+          searchExecuted = true;
+        }
+      } catch (searchErr) {
+        console.warn("⚠️ [SEARCH] Graceful skip on error:", searchErr.message);
+      }
+    }
+
     historyPayload.push({ role: "user", content: finalUserPrompt });
 
     await saveUserMsgPromise;
 
-    const userPriority = isPaid ? 100 : 50;
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();
 
@@ -429,6 +459,7 @@ CORE BEHAVIOR RULES:
     console.log(`  • ChatId:       ${chatId}`);
     console.log(`  • User:         ${userId} (${isPaid ? "Paid Tier" : "Free Tier"})`);
     console.log(`  • Model:        ${currentModelId} (Provider: ${modelPricing.provider || "auto"})`);
+    console.log(`  • Web Search:   ${!enableSearch ? "Disabled (Normal Flow)" : searchExecuted ? `Active (Injected: ${searchIntent.reason})` : `Bypassed by Guardrail (${searchIntent.reason})`}`);
     console.log(`  • Prompt Message: "${rawUserMessage || (hasImage ? "[Attachment Only - Image Analysis]" : "[Attachment Only]")}"`);
     if (processedAttachments.length > 0) {
       console.log(`  • Attachments (${processedAttachments.length}):`);
@@ -449,6 +480,7 @@ CORE BEHAVIOR RULES:
       userPriority,
       jobId,
       userId: req.user.id,
+      preResolvedNodeHint,
       onToken: () => {
         if (!firstTokenTimestamp) {
           firstTokenTimestamp = performance.now();
@@ -488,12 +520,38 @@ CORE BEHAVIOR RULES:
 `);
 
     if (accumulatedResponseText.trim()) {
-      streamedSuccessfully = true;
+      // 5. Generate AI Follow-up Suggestions (if enabled in Admin System Settings)
+      let followUps = [];
+      try {
+        const SystemSetting = require("../models/SystemSetting");
+        const setting = await SystemSetting.findOne({ key: "global_settings" }).lean();
+        const isFollowUpEnabled = setting ? setting.enableFollowUpSuggestions !== false : true;
 
-      const saveAssistantPromise = Message.create({ chatId, role: "assistant", content: accumulatedResponseText });
+        if (isFollowUpEnabled) {
+          const followUpService = require("../services/followUpService");
+          followUps = await followUpService.generateFollowUps(
+            rawUserMessage,
+            accumulatedResponseText,
+            {
+              model: currentModelId,
+              nodeId: gatewayResult?.nodeId,
+              preResolvedNodeHint
+            }
+          );
+        }
+      } catch (fErr) {
+        console.warn("⚠️ [FOLLOW-UPS NOTICE] Generation skipped on error:", fErr.message);
+      }
+
+      const saveAssistantPromise = Message.create({
+        chatId,
+        role: "assistant",
+        content: accumulatedResponseText,
+        followUps
+      });
       updateRollingSummaryIfNeeded(chat, chatId).catch(() => {});
 
-      // 5. Post-Stream Atomic Credit Deduction & Async Telemetry Logging
+      // 6. Post-Stream Atomic Credit Deduction & Async Telemetry Logging
       try {
         const updatedUser = await User.findByIdAndUpdate(
           userId,
@@ -559,6 +617,14 @@ CORE BEHAVIOR RULES:
         console.warn("⚠️ [CREDIT CONSUMPTION ERROR]", creditErr.message);
       }
 
+      // Emit follow-up suggestions event to frontend if generated
+      if (Array.isArray(followUps) && followUps.length > 0) {
+        res.write(`data: ${JSON.stringify({
+          type: "follow_ups",
+          followUps
+        })}\n\n`);
+      }
+
       await saveAssistantPromise;
 
       console.log(`\n================================================================================`);
@@ -566,6 +632,7 @@ CORE BEHAVIOR RULES:
       console.log(`  • ChatId:         ${chatId}`);
       console.log(`  • Model:          ${currentModelId}`);
       console.log(`  • Total Tokens:   ${totalTokens} (${promptTokens} prompt + ${completionTokens} completion)`);
+      console.log(`  • Follow-ups:     ${followUps.length > 0 ? followUps.join(" | ") : "None"}`);
       console.log(`  • Latency:        ${totalDuration.toFixed(2)} ms (TTFT: ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'})`);
       console.log(`  • Response Length: ${accumulatedResponseText.length} characters`);
       console.log(`  • Response Text:`);
