@@ -8,6 +8,13 @@
  * or non-trivial informational requests.
  */
 
+
+// Patterns indicating the user is referring to an attached document or image
+const DOCUMENT_INQUIRY_PATTERNS = [
+  /\b(what\s*(is|in|does)|summarize|summary|explain|describe|analyze|extract|read|overview|breakdown|review|details?)\b/i,
+  /\b(this|the|attached|document|pdf|file|image|photo|chart|table|page|resume|invoice|paper)\b/i
+];
+
 // 1. Definite trivial greetings, acknowledgements, and system pings
 const TRIVIAL_PATTERNS = [
   /^(hi|hello|hey|heya|hiya|howdy|sup|yo|good\s*(morning|afternoon|evening|night|day))\b/i,
@@ -53,7 +60,16 @@ function evaluateSearchIntent(prompt, enableSearch, context = {}) {
     return { shouldSearch: false, reason: "toggle_disabled" };
   }
 
-  // 2. Empty prompt -> Skip
+  // 2. If user attached a document/image and prompt asks about it -> Prioritize attachment, bypass web search
+  if (context.hasAttachments) {
+    const cleanLower = (prompt || "").toLowerCase();
+    const explicitWebSearch = /\b(search\s*(the\s*)?web|search\s*online|look\s*up\s*online|google\s*this|latest\s*news)\b/i.test(cleanLower);
+    if (!explicitWebSearch) {
+      return { shouldSearch: false, reason: "attachment_document_focus" };
+    }
+  }
+
+  // 3. Empty prompt -> Skip
   if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
     return { shouldSearch: false, reason: "empty_prompt" };
   }
@@ -113,7 +129,21 @@ function shouldSearch(prompt, enableSearch, context = {}) {
   return evaluateSearchIntent(prompt, enableSearch, context).shouldSearch;
 }
 
+
+/**
+ * Checks if a user's prompt is asking for live, current, or time-sensitive data.
+ * @param {string} prompt - Raw user prompt
+ * @returns {boolean}
+ */
+function isTimeSensitiveQuery(prompt) {
+  if (!prompt || typeof prompt !== 'string' || !prompt.trim()) return false;
+  const clean = prompt.trim();
+  return FRESHNESS_KEYWORDS.some((regex) => regex.test(clean)) ||
+    /\b(nifty|sensex|bitcoin|crypto|gold|silver|price|quote|today|yesterday|tomorrow|weather|news|score)\b/i.test(clean);
+}
+
 module.exports = {
+  isTimeSensitiveQuery,
   evaluateSearchIntent,
   shouldSearch
 };

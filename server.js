@@ -112,6 +112,7 @@ const modelRoutes = require("./routes/modelRoutes");
 const usageRoutes = require("./routes/usageRoutes");
 const creditRoutes = require("./routes/creditRoutes");
 app.use("/chats", chatRoutes);
+app.use("/chat", chatRoutes);
 app.use("/auth", authRoutes);
 app.use("/ollama", ollamaRoutes);
 app.use("/bots", botRoutes);

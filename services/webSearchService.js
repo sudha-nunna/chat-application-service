@@ -131,13 +131,24 @@ async function searchDuckDuckGo(query) {
   }
 
   let formattedContext = "[WEB SEARCH RESULTS]\n";
-  results.forEach((item, index) => {
-    formattedContext += `\n[Source ${index + 1}]\nTitle: ${item.title}\nURL: ${item.url}\nSnippet: ${item.snippet}\n`;
+  const mappedSources = results.map((item, idx) => ({
+    id: idx + 1,
+    title: item.title,
+    url: item.url,
+    domain: (() => { try { return new URL(item.url).hostname.replace(/^www\./, ''); } catch { return 'web'; } })(),
+    snippet: item.snippet
+  }));
+
+  mappedSources.forEach((item) => {
+    formattedContext += `\n[Source ${item.id}]\nTitle: ${item.title}\nURL: ${item.url}\nSnippet: ${item.snippet}\n`;
   });
   formattedContext += "\n[INSTRUCTIONS FOR AI ASSISTANT]\n";
-  formattedContext += "Use the above search results to provide a factual, accurate, and up-to-date answer. Cite URLs where appropriate.";
+  formattedContext += "Use the above search results to provide a factual, accurate, and up-to-date answer. Cite sources using [1], [2], or inline links.";
 
-  return formattedContext;
+  return {
+    formattedContext,
+    sources: mappedSources
+  };
 }
 
 /**
@@ -174,7 +185,11 @@ async function fetchUrlContent(targetUrl) {
 
     if (!cleanText) return "";
 
-    return `[WEB PAGE CONTENT: ${targetUrl}]\n${cleanText}\n[END OF WEB PAGE CONTENT]\n\nUse the webpage content above to answer the user's question accurately.`;
+    const domain = parsed.hostname.replace(/^www\./, '');
+    return {
+      formattedContext: `[WEB PAGE CONTENT: ${targetUrl}]\n${cleanText}\n[END OF WEB PAGE CONTENT]\n\nUse the webpage content above to answer the user's question accurately.`,
+      sources: [{ id: 1, title: domain, url: targetUrl, domain, snippet: cleanText.slice(0, 200) }]
+    };
   } catch (err) {
     console.warn(`⚠️ [WEB FETCH] Failed to fetch URL (${targetUrl}):`, err.message);
     return "";
@@ -192,6 +207,10 @@ async function searchOrFetch(userPrompt) {
   const urlMatch = trimmed.match(/(https?:\/\/[^\s]+)/);
 
   try {
+    const { fetchLiveFinanceQuote } = require("./financeSearchService");
+    const liveFinance = await fetchLiveFinanceQuote(trimmed);
+    if (liveFinance) return liveFinance;
+
     if (urlMatch) {
       const url = urlMatch[0];
       const pageContent = await fetchUrlContent(url);

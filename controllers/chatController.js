@@ -290,7 +290,7 @@ exports.sendMessage = async (req, res) => {
     chatId = chat._id;
 
     // Process file attachments (Images, PDF, TXT)
-    const pdfParse = require("pdf-parse");
+    const { extractPdfText } = require("../services/pdfExtractionService");
     const processedAttachments = [];
     let extractedTextContext = "";
 
@@ -300,16 +300,16 @@ exports.sendMessage = async (req, res) => {
         const fileBuffer = Buffer.from(cleanData, "base64");
         let fileText = "";
 
-        const isPdf = att.fileType === "pdf" || att.mimeType === "application/pdf" || att.name?.endsWith(".pdf");
-        const isTxt = att.fileType === "txt" || att.mimeType?.startsWith("text/") || att.name?.endsWith(".txt") || att.name?.endsWith(".md") || att.name?.endsWith(".json") || att.name?.endsWith(".csv");
+        const isPdf = att.fileType === "pdf" || att.mimeType === "application/pdf" || att.name?.toLowerCase().endsWith(".pdf");
+        const isTxt = att.fileType === "txt" || att.mimeType?.startsWith("text/") || att.name?.toLowerCase().endsWith(".txt") || att.name?.toLowerCase().endsWith(".md") || att.name?.toLowerCase().endsWith(".json") || att.name?.toLowerCase().endsWith(".csv");
         const isImg = att.fileType === "image" || att.mimeType?.startsWith("image/");
 
         const fileType = isImg ? "image" : isPdf ? "pdf" : "txt";
 
         if (isPdf && fileBuffer.length > 0) {
           try {
-            const pdfData = await pdfParse(fileBuffer);
-            fileText = pdfData.text || "";
+            fileText = await extractPdfText(fileBuffer);
+            console.log(`📄 [PDF EXTRACTED] File: ${att.name}, Length: ${fileText.length} chars`);
           } catch (pdfErr) {
             console.warn("⚠️ PDF text extraction warning:", pdfErr.message);
           }
@@ -327,7 +327,9 @@ exports.sendMessage = async (req, res) => {
         });
 
         if (fileText.trim()) {
-          extractedTextContext += `\n\n[ATTACHED DOCUMENT: ${att.name}]\n${fileText.slice(0, 12000)}\n[END OF DOCUMENT: ${att.name}]`;
+          extractedTextContext += `\n\n[ATTACHED DOCUMENT: ${att.name}]\n${fileText.slice(0, 32000)}\n[END OF DOCUMENT: ${att.name}]`;
+        } else if (isPdf) {
+          extractedTextContext += `\n\n[ATTACHED DOCUMENT: ${att.name}]\n(Document attached: ${att.name}, size: ${Math.round(fileBuffer.length / 1024)}KB. If text is unreadable, it may be a scanned image or protected PDF.)\n[END OF DOCUMENT: ${att.name}]`;
         }
       }
     }
@@ -430,20 +432,32 @@ CORE BEHAVIOR RULES:
     // Evaluate smart search intent (< 0.1ms synchronous rule-based guardrail)
     const { evaluateSearchIntent } = require("../services/searchIntentService");
     const searchIntent = evaluateSearchIntent(rawUserMessage, enableSearch, {
-      hasHistory: Array.isArray(dbMessagesHistory) && dbMessagesHistory.length > 0
+      hasHistory: Array.isArray(dbMessagesHistory) && dbMessagesHistory.length > 0,
+      hasAttachments: Array.isArray(processedAttachments) && processedAttachments.length > 0
     });
 
     let searchExecuted = false;
+    let searchSources = [];
+    let isGuidanceActive = false;
+
     if (searchIntent.shouldSearch && rawUserMessage) {
       try {
         const webSearchService = require("../services/webSearchService");
-        const searchContext = await webSearchService.searchOrFetch(rawUserMessage);
-        if (searchContext) {
-          finalUserPrompt = `${finalUserPrompt}\n\n${searchContext}`;
+        const searchResult = await webSearchService.searchOrFetch(rawUserMessage);
+        if (searchResult && searchResult.formattedContext) {
+          finalUserPrompt = `${finalUserPrompt}\n\n${searchResult.formattedContext}`;
           searchExecuted = true;
+          searchSources = searchResult.sources || [];
         }
       } catch (searchErr) {
         console.warn("⚠️ [SEARCH] Graceful skip on error:", searchErr.message);
+      }
+    } else if (!enableSearch && rawUserMessage) {
+      const { isTimeSensitiveQuery } = require("../services/searchIntentService");
+      if (isTimeSensitiveQuery(rawUserMessage)) {
+        isGuidanceActive = true;
+        const guidanceInstruction = "\n\n[SYSTEM GUIDANCE: The user is asking for real-time live data, market prices, or current news, but Web Search is currently turned OFF in their chat settings. Explain politely that you do not have access to live real-time information in offline mode, and instruct them: \'Please switch on the 🌐 Web Search icon at the bottom of the chat to enable real-time internet search for this request.\']";
+        finalUserPrompt = `${finalUserPrompt}${guidanceInstruction}`;
       }
     }
 
@@ -470,6 +484,15 @@ CORE BEHAVIOR RULES:
       console.log(`  • Attachments:  None`);
     }
     console.log(`================================================================================\n`);
+
+    // Emit web search status or guidance event to frontend via SSE
+    if (searchExecuted && searchSources.length > 0) {
+      res.write(`data: ${JSON.stringify({ type: "search_status", sources: searchSources, query: rawUserMessage })}\n\n`);
+      if (typeof res.flush === "function") { try { res.flush(); } catch (e) {} }
+    } else if (isGuidanceActive) {
+      res.write(`data: ${JSON.stringify({ type: "search_guidance", requiresWebSearch: true, query: rawUserMessage })}\n\n`);
+      if (typeof res.flush === "function") { try { res.flush(); } catch (e) {} }
+    }
 
     const gatewayResult = await aiGateway.generateStream({
       provider: modelPricing.provider || "auto",
@@ -547,7 +570,9 @@ CORE BEHAVIOR RULES:
         chatId,
         role: "assistant",
         content: accumulatedResponseText,
-        followUps
+        followUps,
+        sources: searchSources,
+        requiresWebSearch: isGuidanceActive
       });
       updateRollingSummaryIfNeeded(chat, chatId).catch(() => {});
 
@@ -667,5 +692,130 @@ CORE BEHAVIOR RULES:
       res.write(`data: ${JSON.stringify({ type: "error", message: "Stream connection error." })}\n\n`);
       res.end();
     }
+  }
+};
+// -----------------------------------------------------------------------------
+// Public / Authenticated Shared Chat Endpoints
+// -----------------------------------------------------------------------------
+
+/**
+ * Marks a conversation as shared and returns the share timestamp.
+ */
+exports.shareChat = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const chat = await Chat.findOne({ _id: chatId, userId: req.user.id });
+    if (!chat) {
+      return res.status(404).json({ success: false, message: "Chat not found or unauthorized." });
+    }
+
+    chat.isShared = true;
+    chat.sharedAt = new Date();
+    await chat.save();
+
+    res.json({
+      success: true,
+      chatId: chat._id,
+      isShared: true,
+      sharedAt: chat.sharedAt
+    });
+  } catch (err) {
+    console.error("Error sharing chat:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/**
+ * Retrieves a shared conversation for viewing by authenticated users.
+ */
+exports.getSharedChat = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const chat = await Chat.findById(chatId).populate("userId", "name email");
+    if (!chat) {
+      return res.status(404).json({ success: false, message: "Shared conversation not found." });
+    }
+
+    const currentUserId = (req.user?.id || req.user?._id || "").toString();
+    const isOwner = chat.userId && chat.userId._id.toString() === currentUserId;
+
+    if (!chat.isShared && !isOwner) {
+      return res.status(403).json({ success: false, message: "This chat has not been shared by its author." });
+    }
+
+    const messages = await Message.find({ chatId }).sort({ createdAt: 1 });
+
+    res.json({
+      success: true,
+      chat: {
+        _id: chat._id,
+        title: chat.title,
+        createdAt: chat.createdAt,
+        sharedAt: chat.sharedAt,
+        author: {
+          name: chat.userId?.name || "Codegene User",
+          email: chat.userId?.email || ""
+        },
+        isOwner
+      },
+      messages
+    });
+  } catch (err) {
+    console.error("Error getting shared chat:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/**
+ * Clones / Forks a shared chat into the viewing user's private chat list.
+ */
+exports.forkSharedChat = async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const currentUserId = req.user?.id || req.user?._id;
+    if (!currentUserId) {
+      return res.status(401).json({ success: false, message: "Authentication required to fork chat." });
+    }
+
+    const originalChat = await Chat.findById(chatId);
+    if (!originalChat) {
+      return res.status(404).json({ success: false, message: "Chat not found." });
+    }
+
+    const isOwner = originalChat.userId.toString() === currentUserId.toString();
+    if (!originalChat.isShared && !isOwner) {
+      return res.status(403).json({ success: false, message: "This conversation has not been shared." });
+    }
+
+    // 1. Create duplicate chat for viewing user
+    const newChat = await Chat.create({
+      userId: currentUserId,
+      title: `${originalChat.title || "Conversation"} (Copy)`,
+      conversationSummary: originalChat.conversationSummary || ""
+    });
+
+    // 2. Clone all messages into the new chat
+    const originalMessages = await Message.find({ chatId }).sort({ createdAt: 1 });
+    if (originalMessages.length > 0) {
+      const clonedDocs = originalMessages.map((msg) => ({
+        chatId: newChat._id,
+        role: msg.role,
+        content: msg.content,
+        attachments: msg.attachments || [],
+        followUps: msg.followUps || [],
+        sources: msg.sources || [],
+        requiresWebSearch: msg.requiresWebSearch || false
+      }));
+      await Message.insertMany(clonedDocs);
+    }
+
+    res.json({
+      success: true,
+      newChatId: newChat._id,
+      message: "Chat cloned successfully."
+    });
+  } catch (err) {
+    console.error("Error forking chat:", err);
+    res.status(500).json({ success: false, message: err.message });
   }
 };

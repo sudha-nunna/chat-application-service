@@ -9,6 +9,14 @@ const chatSchema = new mongoose.Schema(
       index: true
     },
 
+    isShared: {
+      type: Boolean,
+      default: false,
+      index: true
+    },
+    sharedAt: {
+      type: Date
+    },
     title: {
       type: String,
       default: "New Chat",

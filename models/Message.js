@@ -30,6 +30,19 @@ const messageSchema = new mongoose.Schema(
       },
     ],
 
+    sources: [
+      {
+        id: { type: Number },
+        title: { type: String },
+        url: { type: String },
+        domain: { type: String },
+        snippet: { type: String }
+      }
+    ],
+    requiresWebSearch: {
+      type: Boolean,
+      default: false
+    },
     followUps: {
       type: [String],
       default: [],
