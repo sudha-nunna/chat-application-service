@@ -36,6 +36,20 @@ function convertAudioTo16kPcmWav(inputBuffer) {
 }
 
 /**
+ * Formats a host string and relative audio path into a complete valid URL.
+ */
+function formatHostUrl(reqHost, relativeUrl) {
+  if (!relativeUrl) return "";
+  if (relativeUrl.startsWith("http://") || relativeUrl.startsWith("https://")) return relativeUrl;
+  if (!reqHost) return relativeUrl;
+  let base = reqHost.trim();
+  if (!base.startsWith("http://") && !base.startsWith("https://")) {
+    base = (base.includes("localhost") || base.includes("127.0.0.1") ? "http://" : "https://") + base;
+  }
+  return `${base.replace(/\/$/, "")}${relativeUrl.startsWith("/") ? "" : "/"}${relativeUrl}`;
+}
+
+/**
  * Decodes 16kHz WAV Buffer into Float32Array PCM samples for local Whisper STT.
  */
 async function decodeAudioToFloat32(audioBuffer) {
@@ -108,6 +122,64 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "", op
   let relativeUrl = "";
   let fullAudioUrl = "";
 
+  // 1. High-Fidelity Voice Synthesis via F5-TTS (Zero-shot Cloning)
+  const f5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL;
+  if (f5Url && !options.skipCloning) {
+    try {
+      const MediaAsset = require("../models/MediaAsset");
+      let refBuffer = options.voiceSampleBuffer || voiceConfig.voiceSampleBuffer || null;
+      let refText = options.refText || voiceConfig.ref_text || voiceConfig.sampleTranscript || "";
+
+      // 1a. Check if voiceConfig has a custom voiceSampleId (e.g. from user recorded/uploaded custom voice)
+      if (!refBuffer && voiceConfig.voiceSampleId) {
+        const sampleAsset = await MediaAsset.findById(voiceConfig.voiceSampleId).catch(() => null);
+        if (sampleAsset && sampleAsset.data) {
+          refBuffer = Buffer.isBuffer(sampleAsset.data) ? sampleAsset.data : Buffer.from(sampleAsset.data);
+        }
+      }
+
+      // 1b. Check matching preset voice sample in uploads/audio/presets/<voiceIdKey>.wav
+      const voiceIdKey = (voiceConfig.id || voiceConfig.voiceId || voiceConfig.name || "").toLowerCase().trim();
+      if (!refBuffer && voiceIdKey) {
+        const presetWavPath = path.join(__dirname, `../uploads/audio/presets/${voiceIdKey}.wav`);
+        const presetTxtPath = path.join(__dirname, `../uploads/audio/presets/${voiceIdKey}.txt`);
+        if (fs.existsSync(presetWavPath) && fs.statSync(presetWavPath).size > 1000) {
+          refBuffer = fs.readFileSync(presetWavPath);
+          if (fs.existsSync(presetTxtPath)) {
+            refText = fs.readFileSync(presetTxtPath, "utf8").trim();
+          }
+        }
+      }
+
+      // 1c. Default fallback reference.wav in uploads/audio
+      if (!refBuffer) {
+        const localWavPath = path.join(__dirname, "../uploads/audio/reference.wav");
+        if (fs.existsSync(localWavPath) && fs.statSync(localWavPath).size > 1000) {
+          refBuffer = fs.readFileSync(localWavPath);
+          const localTxtPath = path.join(__dirname, "../uploads/audio/reference.txt");
+          if (fs.existsSync(localTxtPath)) {
+            refText = fs.readFileSync(localTxtPath, "utf8").trim();
+          }
+        }
+      }
+
+      if (refBuffer && refBuffer.length > 500) {
+        const clonedResult = await generateClonedSpeechAndVisemes(
+          text,
+          refBuffer,
+          reqHost,
+          { ...voiceConfig, ref_text: refText },
+          { ...options, skipCloning: true }
+        );
+        if (clonedResult && clonedResult.audioUrl) {
+          return clonedResult;
+        }
+      }
+    } catch (f5AttemptErr) {
+      console.warn("⚠️ [F5-TTS ATTEMPT NOTICE - FALLING BACK TO STANDARD TTS]:", f5AttemptErr.message);
+    }
+  }
+
   try {
     const googleTTS = require("google-tts-api");
     const MediaAsset = require("../models/MediaAsset");
@@ -135,7 +207,7 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "", op
 
         if (asset && asset._id) {
           relativeUrl = `/bots/media/${asset._id}`;
-          fullAudioUrl = reqHost ? `${reqHost.replace(/\/$/, "")}${relativeUrl}` : relativeUrl;
+          fullAudioUrl = formatHostUrl(reqHost, relativeUrl);
         }
       }
     }
@@ -232,7 +304,7 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
       });
 
       const relativeUrl = `/bots/media/${asset._id}`;
-      const fullAudioUrl = reqHost ? `${reqHost.replace(/\/$/, "")}${relativeUrl}` : relativeUrl;
+      const fullAudioUrl = formatHostUrl(reqHost, relativeUrl);
 
       return {
         audioUrl: fullAudioUrl,
@@ -251,7 +323,7 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
     }
   }
 
-  return generateSpeechAndVisemes(text, voiceConfig, reqHost, options);
+  return generateSpeechAndVisemes(text, voiceConfig, reqHost, { ...options, skipCloning: true });
 }
 
 /**

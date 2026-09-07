@@ -1434,10 +1434,10 @@ class ActionStreamBuffer {
     const sanitizedChunk = this._sanitizeVendorBranding(chunkText);
     this.cleanText += sanitizedChunk;
 
-    if (!this.firstTokenFired && typeof this.onToken === "function") {
-      this.firstTokenFired = true;
+    if (typeof this.onToken === "function") {
       this.onToken(sanitizedChunk);
     }
+    this.firstTokenFired = true;
 
     if (this.res && !this.res.writableEnded) {
       this.res.write(`data: ${JSON.stringify({ type: "chunk", chunk: sanitizedChunk, text: sanitizedChunk })}\n\n`);

@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const BotChunk = require("../models/BotChunk");
 const BotEmbedding = require("../models/BotEmbeddings");
+const BotFile = require("../models/BotFile");
+const Bot = require("../models/Bot");
 
 const { getOllamaBaseUrl, getAvailableOllamaModel } = require("./ollamaHelper");
 
@@ -564,20 +566,24 @@ function matchQueryToMetadata(queryText, metadata) {
 async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, historyMessages = [], botMetadata = null) {
   let targetUserId = userId;
   let targetBotId = botId;
-  let queryText = userQuestion;
+  let queryText = typeof userQuestion === "string" ? userQuestion : "";
 
-  if (typeof userId === "string" && !userQuestion) {
+  // Signature overload fallback: if called as (botId, question, topK)
+  if (typeof userId === "string" && typeof botId === "string" && (!userQuestion || typeof userQuestion !== "string")) {
     targetBotId = userId;
     queryText = botId;
     targetUserId = null;
+  } else if (!queryText && typeof userQuestion === "string") {
+    queryText = userQuestion;
   }
+  queryText = String(queryText || "").trim();
 
   // Augment query text with previous user prompt if query is a short formatting or follow-up request
   if (Array.isArray(historyMessages) && historyMessages.length > 0 && queryText) {
-    const lastUserMsg = [...historyMessages].reverse().find(m => m.role === "user" && m.content && m.content.trim() !== queryText.trim());
+    const lastUserMsg = [...historyMessages].reverse().find(m => m.role === "user" && m.content && String(m.content).trim() !== queryText);
     const isShortOrFollowup = queryText.split(/\s+/).length <= 6 || /\b(table|list|bullet|bullets|format|form|summarize|detail|explain\s+more|row|rows|column|columns|chart|grid)\b/i.test(queryText);
     if (isShortOrFollowup && lastUserMsg?.content) {
-      queryText = `${lastUserMsg.content} ${userQuestion}`;
+      queryText = `${lastUserMsg.content} ${queryText}`;
     }
   }
 
