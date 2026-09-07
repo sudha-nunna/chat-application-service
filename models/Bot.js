@@ -117,12 +117,30 @@ const botSchema = new mongoose.Schema(
     },
     voiceProfile: {
       voiceId: { type: String, default: "default-en" },
+      voiceName: { type: String, default: "Sarah" },
+      persona: { type: String, default: "Warm Female" },
+      gender: { type: String, default: "female" },
+      lang: { type: String, default: "en-US" },
+      speed: { type: Number, default: 1.0 },
+      pitch: { type: Number, default: 1.0 },
       sampleAudioUrl: { type: String, default: "" },
       voiceType: { type: String, default: "PRESET" }
     },
     avatarConfig: {
       type: Object,
       default: {}
+    },
+    avatarEmoji: {
+      type: String,
+      default: "🤖"
+    },
+    avatarColor: {
+      type: String,
+      default: "from-blue-500 to-indigo-600"
+    },
+    maxChunksPerQuery: {
+      type: Number,
+      default: 3
     },
     responseMode: {
       type: String,
@@ -135,6 +153,8 @@ const botSchema = new mongoose.Schema(
     },
     voiceConfig: {
       voiceId: { type: String, default: "default-en" },
+      rate: { type: Number, default: 1.0 },
+      pitch: { type: Number, default: 1.0 },
       sampleAudioUrl: { type: String, default: "" },
       voiceType: { type: String, default: "PRESET" }
     },
@@ -150,7 +170,8 @@ const botSchema = new mongoose.Schema(
     }
   },
   {
-    timestamps: true
+    timestamps: true,
+    strict: false
   }
 );
 

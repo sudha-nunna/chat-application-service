@@ -220,9 +220,11 @@ exports.updateChat = async (req, res) => {
 exports.deleteChat = async (req, res) => {
   try {
     const { chatId } = req.params;
-    await Chat.findByIdAndDelete(chatId);
-    await Message.deleteMany({ chatId });
-    await Summary.deleteOne({ chatId });
+    await Promise.all([
+      Chat.findByIdAndDelete(chatId),
+      Message.deleteMany({ chatId }),
+      Summary.deleteOne({ chatId })
+    ]);
 
     res.json({ success: true, message: "Chat cleared successfully." });
   } catch (error) {

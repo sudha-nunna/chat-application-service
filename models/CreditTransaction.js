@@ -14,7 +14,7 @@ const creditTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["purchase", "admin_grant", "admin_deduct", "message_sent", "AI_MESSAGE_CONSUMPTION", "subscription_grant", "other"],
+      enum: ["purchase", "admin_grant", "admin_deduct", "message_sent", "AI_MESSAGE_CONSUMPTION", "subscription_grant", "bot_chat", "other"],
       required: true,
     },
     description: {

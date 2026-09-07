@@ -39,13 +39,13 @@ exports.googleAdminLogin = async (req, res) => {
     }
     
     const userEmail = payload.email.toLowerCase().trim();
-    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com", "nunnasudha03@gmail.com"];
+    const { BOOTSTRAP_ADMIN_EMAILS, isUserAdmin } = require("../utils/adminConfig");
     
     // Check if the user exists
     let user = await User.findOne({ email: userEmail });
     
-    // Auto-create the super admin if they don't exist yet
-    if (!user && SUPER_ADMIN_EMAILS.includes(userEmail)) {
+    // Auto-create bootstrap admin if they don't exist yet
+    if (!user && BOOTSTRAP_ADMIN_EMAILS.includes(userEmail)) {
       user = await User.create({
         name: payload.name || "Super Admin",
         email: userEmail,
@@ -59,8 +59,14 @@ exports.googleAdminLogin = async (req, res) => {
       return res.status(403).json({ success: false, error: `Access denied. No account found for ${userEmail}.` });
     }
     
-    if (user.role !== "admin" && !SUPER_ADMIN_EMAILS.includes(userEmail)) {
+    if (!isUserAdmin(user)) {
       return res.status(403).json({ success: false, error: "Access denied. You do not have admin privileges." });
+    }
+
+    // Ensure role is persisted as admin
+    if (user.role !== "admin") {
+      user.role = "admin";
+      await user.save();
     }
     
     const jwtToken = jwt.sign(
@@ -954,11 +960,104 @@ exports.updateUserCredits = async (req, res) => {
       user.isPaidUser = Boolean(isPaidUser);
     }
 
+    if (req.body.role !== undefined) {
+      const targetRole = String(req.body.role).toLowerCase();
+      if (["admin", "user"].includes(targetRole)) {
+        const currentUserId = req.user?.id || req.user?._id;
+        if (targetRole === "user" && currentUserId && String(currentUserId) === String(user._id)) {
+          return res.status(400).json({ success: false, error: "You cannot revoke your own admin access." });
+        }
+        user.role = targetRole;
+      }
+    }
+
     await user.save();
     return res.json({ success: true, user });
   } catch (error) {
     console.error("Error updating user credits:", error);
     return res.status(500).json({ success: false, error: "Failed to update user." });
+  }
+};
+
+/**
+ * Update user role (Promote to Admin or Demote to User)
+ */
+exports.updateUserRole = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    if (!role || !["admin", "user"].includes(role.toLowerCase())) {
+      return res.status(400).json({ success: false, error: "Role must be 'admin' or 'user'." });
+    }
+
+    const user = await User.findById(id);
+    if (!user) return res.status(404).json({ success: false, error: "User not found." });
+
+    const currentUserId = req.user?.id || req.user?._id;
+    if (role.toLowerCase() === "user" && currentUserId && String(currentUserId) === String(user._id)) {
+      return res.status(400).json({ success: false, error: "You cannot revoke your own admin access." });
+    }
+
+    user.role = role.toLowerCase();
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: `User "${user.name || user.email}" role updated to ${user.role}.`,
+      user
+    });
+  } catch (error) {
+    console.error("Error updating user role:", error);
+    return res.status(500).json({ success: false, error: "Failed to update user role." });
+  }
+};
+
+/**
+ * Grant Admin Access by Email (Promote existing user or pre-authorize new admin)
+ */
+exports.grantAdminAccess = async (req, res) => {
+  try {
+    const { email, name } = req.body;
+    if (!email || !email.trim() || !/^\S+@\S+\.\S+$/.test(email.trim())) {
+      return res.status(400).json({ success: false, error: "A valid email address is required." });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    let user = await User.findOne({ email: cleanEmail });
+
+    if (user) {
+      if (user.role === "admin") {
+        return res.status(400).json({ success: false, error: `User "${cleanEmail}" is already an Administrator.` });
+      }
+      user.role = "admin";
+      if (name && !user.name) user.name = name.trim();
+      await user.save();
+      return res.json({
+        success: true,
+        message: `User "${cleanEmail}" has been promoted to Admin.`,
+        user
+      });
+    }
+
+    // Pre-authorize new admin account
+    const newUser = await User.create({
+      email: cleanEmail,
+      name: (name && name.trim()) || cleanEmail.split("@")[0],
+      role: "admin",
+      authType: "google",
+      credits: 100,
+      signupBonusGranted: true
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: `Admin access granted. An admin account has been created for "${cleanEmail}". They can now sign in with Google.`,
+      user: newUser
+    });
+  } catch (error) {
+    console.error("Error granting admin access:", error);
+    return res.status(500).json({ success: false, error: "Failed to grant admin access." });
   }
 };
 

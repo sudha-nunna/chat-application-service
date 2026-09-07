@@ -42,6 +42,8 @@ const auth = async (req, res, next) => {
 
 auth.protect = auth;
 
+const { isUserAdmin } = require("../utils/adminConfig");
+
 auth.requireAdmin = async (req, res, next) => {
   try {
     const userId = req.user?.id || req.user?._id;
@@ -49,19 +51,14 @@ auth.requireAdmin = async (req, res, next) => {
       return res.status(401).json({ success: false, error: "Not authorized" });
     }
 
-    const SUPER_ADMIN_EMAILS = ["sairamakrishna2@gmail.com", "saiphanindra8520@gmail.com", "nunnasudha03@gmail.com"];
-
     let userDoc = null;
     try {
-      userDoc = await User.findById(userId);
+      userDoc = await User.findById(userId).lean();
     } catch (e) {
       console.warn("Could not find user in requireAdmin:", e.message);
     }
 
-    const isAdmin =
-      (userDoc && (userDoc.role === "admin" || userDoc.isAdmin || (userDoc.email && SUPER_ADMIN_EMAILS.includes(userDoc.email.toLowerCase())))) ||
-      (req.user.role === "admin") ||
-      (req.user.email && SUPER_ADMIN_EMAILS.includes(req.user.email.toLowerCase()));
+    const isAdmin = isUserAdmin(userDoc, req.user);
 
     if (!isAdmin) {
       return res.status(403).json({ success: false, error: "Access denied. Admin authorization required." });

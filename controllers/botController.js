@@ -23,6 +23,7 @@ const {
   buildRagSystemPrompt,
   detectBotIntent
 } = require("../utils/ragEngine");
+const { extractPdfText } = require("../services/pdfExtractionService");
 
 // Helper for SSE streaming
 async function streamTextInChunks(res, text, delayMs = 15) {
@@ -40,7 +41,7 @@ async function streamTextInChunks(res, text, delayMs = 15) {
 
 exports.createBot = async (req, res) => {
   try {
-    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles, botType, responseMode, botSpecificRules, voiceConfig, avatarConfig, capabilities, avatarImage, avatarVideo, avatar3DModel, avatarProvider, voiceProfile, projectId } = req.body;
+    const { name, description, model, botMode, allowedDomains, systemPrompt, rulesText, initialApis, stagedFiles, botType, responseMode, botSpecificRules, voiceConfig, avatarConfig, capabilities, avatarImage, avatarVideo, avatar3DModel, avatarProvider, voiceProfile, projectId, avatarEmoji, avatarColor, maxChunksPerQuery } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ error: "Bot name is required." });
     }
@@ -135,10 +136,13 @@ exports.createBot = async (req, res) => {
       avatarVideo: finalAvatarVideo,
       avatar3DModel: finalAvatar3DModel,
       avatarProvider: finalAvatarProvider,
-      voiceProfile: voiceProfile || voiceConfig || { voiceId: "default-en", voiceType: "PRESET" },
+      avatarEmoji: avatarEmoji || "🤖",
+      avatarColor: avatarColor || "from-blue-500 to-indigo-600",
+      maxChunksPerQuery: Number(maxChunksPerQuery) || 3,
+      voiceProfile: voiceProfile || voiceConfig || { voiceId: "default-en", voiceName: "Sarah", gender: "female", voiceType: "PRESET" },
       botSpecificRules: botSpecificRules || "",
       avatarConfig: finalAvatarConfig,
-      voiceConfig: voiceConfig || {},
+      voiceConfig: voiceConfig || voiceProfile || {},
       allowedDomains: domainsList,
       systemPrompt: systemPrompt || `You are a specialized ${selectedType} AI assistant.`,
       rulesConfig: initialRulesObj
@@ -228,7 +232,27 @@ exports.getBotById = async (req, res) => {
 exports.updateBot = async (req, res) => {
   try {
     const { botId } = req.params;
-    const { name, model, description, systemPrompt, botType, responseMode, botSpecificRules, avatarConfig, voiceConfig, avatarImage, avatarVideo, avatar3DModel, avatarProvider } = req.body;
+    const {
+      name,
+      model,
+      description,
+      systemPrompt,
+      botType,
+      responseMode,
+      botSpecificRules,
+      rulesText,
+      avatarConfig,
+      voiceConfig,
+      voiceProfile,
+      avatarImage,
+      avatarVideo,
+      avatar3DModel,
+      avatarProvider,
+      avatarEmoji,
+      avatarColor,
+      maxChunksPerQuery,
+      capabilities
+    } = req.body;
 
     const updateData = {};
     if (name !== undefined) {
@@ -252,10 +276,20 @@ exports.updateBot = async (req, res) => {
     if (botSpecificRules !== undefined) updateData.botSpecificRules = String(botSpecificRules).trim();
     if (avatarConfig !== undefined) updateData.avatarConfig = avatarConfig;
     if (voiceConfig !== undefined) updateData.voiceConfig = voiceConfig;
+    if (voiceProfile !== undefined) updateData.voiceProfile = voiceProfile;
     if (avatarImage !== undefined) updateData.avatarImage = avatarImage;
     if (avatarVideo !== undefined) updateData.avatarVideo = avatarVideo;
     if (avatar3DModel !== undefined) updateData.avatar3DModel = avatar3DModel;
     if (avatarProvider !== undefined) updateData.avatarProvider = avatarProvider;
+    if (avatarEmoji !== undefined) updateData.avatarEmoji = avatarEmoji;
+    if (avatarColor !== undefined) updateData.avatarColor = avatarColor;
+    if (maxChunksPerQuery !== undefined) updateData.maxChunksPerQuery = Number(maxChunksPerQuery) || 3;
+    if (capabilities !== undefined) updateData.capabilities = capabilities;
+
+    if (rulesText !== undefined || systemPrompt !== undefined) {
+      const activeRules = (rulesText || systemPrompt || "").trim();
+      updateData["rulesConfig.rulesText"] = activeRules;
+    }
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: "Please provide valid bot fields to update." });
@@ -273,6 +307,7 @@ exports.updateBot = async (req, res) => {
 
     const { delCache } = require("../utils/redisClient");
     await delCache(`bot_cfg_${botId}_${req.user.id}`);
+    await delCache(`bot:${botId}:rules`);
 
     return res.json(bot);
   } catch (err) {
@@ -555,12 +590,12 @@ exports.uploadBotFile = async (req, res) => {
       const buffer = Buffer.from(fileContentBase64, "base64");
       if (detectedType === "pdf") {
         try {
-          const pdfParse = require("pdf-parse");
-          const pdfData = await pdfParse(buffer);
-          parsedContent = pdfData.text || "";
+          parsedContent = await extractPdfText(buffer);
+          if (!parsedContent || !parsedContent.trim()) {
+            console.warn("⚠️ PDF text extraction returned empty text for:", cleanName);
+          }
         } catch (pdfErr) {
           console.error("PDF parse error in uploadBotFile:", pdfErr);
-          parsedContent = buffer.toString("utf-8");
         }
       } else {
         parsedContent = buffer.toString("utf-8");
@@ -568,7 +603,11 @@ exports.uploadBotFile = async (req, res) => {
     }
 
     if (!parsedContent || typeof parsedContent !== "string" || !parsedContent.trim()) {
-      return res.status(400).json({ error: "File content could not be read or extracted." });
+      return res.status(400).json({
+        error: detectedType === "pdf"
+          ? "Failed to extract text from the PDF document. Please ensure the PDF is not password-protected and contains selectable text."
+          : "File content could not be read or extracted."
+      });
     }
 
     // Validate Rule Limits if file is a Rules Document
@@ -712,12 +751,12 @@ exports.replaceBotFile = async (req, res) => {
       const buffer = Buffer.from(fileContentBase64, "base64");
       if (detectedType === "pdf") {
         try {
-          const pdfParse = require("pdf-parse");
-          const pdfData = await pdfParse(buffer);
-          parsedContent = pdfData.text || "";
+          parsedContent = await extractPdfText(buffer);
+          if (!parsedContent || !parsedContent.trim()) {
+            console.warn("⚠️ PDF replacement extraction returned empty text for:", cleanName);
+          }
         } catch (pdfErr) {
           console.error("PDF parse error in replaceBotFile:", pdfErr);
-          parsedContent = buffer.toString("utf-8");
         }
       } else {
         parsedContent = buffer.toString("utf-8");
@@ -725,7 +764,11 @@ exports.replaceBotFile = async (req, res) => {
     }
 
     if (!parsedContent || typeof parsedContent !== "string" || !parsedContent.trim()) {
-      return res.status(400).json({ error: "Replacement file content could not be read or parsed." });
+      return res.status(400).json({
+        error: detectedType === "pdf"
+          ? "Failed to extract text from the PDF replacement document. Please ensure the PDF contains selectable text."
+          : "Replacement file content could not be read or parsed."
+      });
     }
 
     const isRulesCategory = existingFile.fileCategory === "rules";
@@ -1376,31 +1419,34 @@ exports.sendBotChatMessage = async (req, res) => {
     // Intent classification via Smart Intent Router
     const intent = detectBotIntent(message, bot.knowledgeSummary);
 
+    // Fast count of uploaded documents for this bot
+    const hasFilesCount = await BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] });
+    const hasUploadedFiles = hasFilesCount > 0;
+
     // Extract bot mode: small (Strict Document Only), medium (Balanced Hybrid), large (Omni AI)
-    const rawBotMode = (bot.botMode || bot.model || "small").toLowerCase();
-    const currentBotMode = ["small", "medium", "large"].includes(rawBotMode) ? rawBotMode : "small";
+    // For VOICE, AVATAR, or any agent without uploaded files, default to large/hybrid so it can naturally converse!
+    const isVoiceOrAvatar = bot.botType === "VOICE" || bot.botType === "AVATAR";
+    const rawBotMode = (bot.botMode || "").toLowerCase();
+    const defaultMode = (isVoiceOrAvatar || !hasUploadedFiles) ? "large" : "small";
+    const currentBotMode = ["small", "medium", "large"].includes(rawBotMode) ? rawBotMode : defaultMode;
 
     let isGeneralQuery = (intent === "GENERAL_QUERY" || intent === "GENERAL_CONVERSATION" || intent === "GREETING");
 
-    // In SMALL Mode (Strict Knowledge Bot), non-greeting queries force document RAG search
-    if (currentBotMode === "small" && intent !== "GREETING") {
+    // In SMALL Mode (Strict Knowledge Bot), non-greeting queries force document RAG search IF files are uploaded
+    if (currentBotMode === "small" && intent !== "GREETING" && hasUploadedFiles) {
       isGeneralQuery = false;
     }
 
-    // Execute parallel fetches: Has Files count, RAG chunks (if intent !== GREETING), and cached Bot Rules
+    // Execute parallel fetches: RAG chunks (if files exist and not a pure greeting) and cached Bot Rules
     const rulesCacheKey = `bot:${botId}:rules`;
     const requestedTopK = bot.maxChunksPerQuery || (currentBotMode === "small" ? 4 : 5);
-    let [hasFilesCount, fetchedRagResult, cachedRulesObj] = await Promise.all([
-      BotFile.countDocuments({ botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] }),
-      intent !== "GREETING"
+    let [fetchedRagResult, cachedRulesObj] = await Promise.all([
+      (hasUploadedFiles && intent !== "GREETING")
         ? retrieveRelevantChunks(req.user.id, botId, message, requestedTopK, sortedHistory, bot.knowledgeSummary)
-        : Promise.resolve({ isFound: true, chunks: [] }),
+        : Promise.resolve({ isFound: false, chunks: [] }),
       getCache(rulesCacheKey)
     ]);
-    const ragResult = fetchedRagResult || { isFound: true, chunks: [] };
-
-    const hasUploadedFiles = hasFilesCount > 0;
-    const ragSearchTime = 0;
+    const ragResult = fetchedRagResult || { isFound: false, chunks: [] };
 
     const sourcesMeta = ragResult.isFound && ragResult.chunks && ragResult.chunks.length > 0
       ? ragResult.chunks.map(c => ({ fileName: c.fileName, snippet: c.snippet.substring(0, 100) + "..." }))
@@ -1410,11 +1456,12 @@ exports.sendBotChatMessage = async (req, res) => {
     console.log(`
 🤖 =================== [BOT CHAT ROUTER DIAGNOSTICS] ===================
   📌 Bot Name:           ${bot.name || "AI Bot"} (ID: ${botId})
+  🎭 Bot Type:           ${bot.botType || "CHAT"}
   🎯 Bot Mode Preset:    ${currentBotMode.toUpperCase()} (${currentBotMode === 'small' ? 'Strict Document Only' : currentBotMode === 'medium' ? 'Balanced Hybrid' : 'Omni General & RAG'})
   💬 User Prompt:        "${message}"
   🏷️ Classified Intent:   ${intent}
   📂 Uploaded Files:      ${hasUploadedFiles ? `YES (${hasFilesCount} Files)` : "NO"}
-  🧠 System Prompt:       ${(hasUploadedFiles || ragResult.chunks?.length > 0) ? "buildRagSystemPrompt (Strict Grounding + Sources)" : `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})`}
+  🧠 System Prompt:       ${(hasUploadedFiles && ragResult.chunks?.length > 0) ? "buildRagSystemPrompt (Strict Grounding + Sources)" : `buildGeneralSystemPrompt (${currentBotMode.toUpperCase()})`}
 ========================================================================\n`);
 
     if (sourcesMeta.length > 0 && isStreamRequested) {
@@ -1422,7 +1469,7 @@ exports.sendBotChatMessage = async (req, res) => {
     }
 
     if (!cachedRulesObj) {
-      const rawText = (bot.rulesConfig?.rulesText || "").trim();
+      const rawText = [bot.systemPrompt, bot.rulesConfig?.rulesText, bot.botSpecificRules].filter(Boolean).join("\n\n").trim();
       const rulesLines = rawText.split(/\r?\n/).filter(l => l.trim().length > 0);
       cachedRulesObj = {
         rulesText: rawText,
@@ -1437,12 +1484,15 @@ exports.sendBotChatMessage = async (req, res) => {
 
     const effectiveRulesText = typeof cachedRulesObj === "object" ? (cachedRulesObj.rulesText || "") : String(cachedRulesObj || "");
 
-    // Build system prompt based on adaptive intent and currentBotMode
+    // Build system prompt based on adaptive intent, files presence, and currentBotMode
     const { buildGeneralSystemPrompt } = require("../utils/ragEngine");
     let systemPrompt;
-    if (intent === "GREETING" && !hasUploadedFiles) {
-      systemPrompt = buildGeneralSystemPrompt(bot.name, bot.description, currentBotMode, effectiveRulesText);
+    if (!hasUploadedFiles || ragResult.chunks?.length === 0) {
+      // Free conversational flow using system prompt and general intelligence
+      const generalMode = (isVoiceOrAvatar || !hasUploadedFiles) ? "large" : currentBotMode;
+      systemPrompt = buildGeneralSystemPrompt(bot.name, bot.description, generalMode, effectiveRulesText);
     } else {
+      // Grounded with uploaded source documents
       systemPrompt = buildRagSystemPrompt(bot.name, bot.description, ragResult.chunks, configuredApis, bot.knowledgeSummary, effectiveRulesText, currentBotMode);
     }
 
@@ -1666,8 +1716,10 @@ exports.deleteBotConversation = async (req, res) => {
     if (!conversation) {
       return res.status(404).json({ error: "Conversation not found or unauthorized." });
     }
-    await BotMessage.deleteMany({ conversationId });
-    await Summary.deleteOne({ chatId: conversationId });
+    await Promise.all([
+      BotMessage.deleteMany({ conversationId }),
+      Summary.deleteOne({ chatId: conversationId })
+    ]);
     return res.json({ message: "Bot conversation deleted successfully." });
   } catch (err) {
     return res.status(500).json({ error: "Failed to delete conversation." });
