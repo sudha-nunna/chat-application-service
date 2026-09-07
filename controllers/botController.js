@@ -1451,13 +1451,14 @@ exports.sendBotChatMessage = async (req, res) => {
 
     const userId = req.user?.id || req.user?._id;
     let userPlan = req.user?.plan || req.headers["x-user-plan"];
+    let userDoc = null;
 
     if (!userPlan && userId) {
       const planCacheKey = `user:plan:${userId}`;
       userPlan = await getCache(planCacheKey);
       if (!userPlan) {
-        const userDoc = await User.findById(userId).select("plan").lean();
-        userPlan = userDoc?.plan || "free";
+        const planUser = await User.findById(userId).select("plan").lean();
+        userPlan = planUser?.plan || "free";
         await setCache(planCacheKey, userPlan, 900);
       }
     }
@@ -1541,18 +1542,24 @@ exports.sendBotChatMessage = async (req, res) => {
       sources: sourcesMeta
     });
 
-    if (userDoc && streamedSuccessfully) {
-      userDoc.credits -= 1;
-      await userDoc.save();
-      
-      const CreditTransaction = require("../models/CreditTransaction");
-      await CreditTransaction.create({
-        userId: userDoc._id,
-        amount: -1,
-        type: "bot_chat",
-        description: `1 credit deducted for bot chat (Bot ID: ${botId})`,
-        balanceAfter: userDoc.credits
-      });
+    if (streamedSuccessfully && userId) {
+      try {
+        const CreditTransaction = require("../models/CreditTransaction");
+        const freshUser = await User.findById(userId);
+        if (freshUser) {
+          freshUser.credits = (freshUser.credits || 0) - 1;
+          await freshUser.save();
+          await CreditTransaction.create({
+            userId: freshUser._id,
+            amount: -1,
+            type: "bot_chat",
+            description: `1 credit deducted for bot chat (Bot ID: ${botId})`,
+            balanceAfter: freshUser.credits
+          });
+        }
+      } catch (creditErr) {
+        console.warn('⚠️ [BOT CHAT] Credit deduction failed (non-fatal):', creditErr.message);
+      }
     }
 
     // Non-blocking background trigger for provider-aware rolling summary

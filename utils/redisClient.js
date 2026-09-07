@@ -26,8 +26,17 @@ redis.on("connect", () => {
   console.log("⚡ [REDIS CONNECTED] High-speed Redis connected successfully.");
 });
 
+let hasLoggedRedisNotice = false;
+
 redis.on("error", (err) => {
-  console.warn("⚠️ [REDIS NOTICE]", err.message);
+  if (err.code === "ECONNREFUSED") {
+    if (!hasLoggedRedisNotice) {
+      console.warn("⚠️ [REDIS NOTICE] Redis is offline (127.0.0.1:6379). Application is running in direct database fallback mode.");
+      hasLoggedRedisNotice = true;
+    }
+  } else {
+    console.warn("⚠️ [REDIS NOTICE]", err.message);
+  }
 });
 
 /**

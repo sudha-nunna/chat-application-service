@@ -419,7 +419,28 @@ exports.sendMessage = async (req, res) => {
     })}\n\n`);
 
     const summaryText = chat.conversationSummary || "";
+    const now = new Date();
+    const currentDateFormatted = now.toLocaleDateString("en-US", {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      timeZone: "UTC"
+    });
+    const currentTimeFormatted = now.toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "short",
+      timeZone: "UTC"
+    });
+
     let unifiedSystemPrompt = `You are a helpful, highly capable, articulate, and intelligent AI Assistant.
+
+TEMPORAL CONTEXT:
+• Current Real-World Date: ${currentDateFormatted}
+• Current Time (UTC): ${currentTimeFormatted}
+Always use this authoritative real-world date reference when answering current date, day, month, year, or calendar queries.
 
 STRICT IDENTITY RULES:
 1. Your name is "AI Assistant".
@@ -479,23 +500,47 @@ CORE BEHAVIOR RULES:
     let searchSources = [];
     let isGuidanceActive = false;
 
+    // Check if an Ollama Cloud node with an active secretKey exists for this model
+    const { getProviderPools, refreshClusterNodesFromDB } = require("../utils/ollamaHelper");
+    await refreshClusterNodesFromDB();
+    const { allNodes } = getProviderPools();
+    const cleanBaseModel = currentModelId.toLowerCase().replace(/:cloud$/, "").split(":")[0];
+    const matchingOllamaCloudNode = enableSearch
+      ? allNodes.find(n =>
+          n.isActive !== false &&
+          (n.format === "ollama" || n.url?.includes("ollama.com")) &&
+          n.secretKey && n.secretKey.length > 5 &&
+          !/[\u2022\*]/.test(n.secretKey) &&
+          (
+            n.url?.includes("ollama.com") ||
+            (Array.isArray(n.supportedModels) && n.supportedModels.some(m =>
+              m.toLowerCase() === currentModelId.toLowerCase() ||
+              m.toLowerCase().startsWith(cleanBaseModel)
+            ))
+          )
+        )
+      : null;
+
     if (searchIntent.shouldSearch && rawUserMessage) {
-      try {
-        const webSearchService = require("../services/webSearchService");
-        const searchResult = await webSearchService.searchOrFetch(rawUserMessage);
-        if (searchResult && searchResult.formattedContext) {
-          finalUserPrompt = `${finalUserPrompt}\n\n${searchResult.formattedContext}`;
-          searchExecuted = true;
-          searchSources = searchResult.sources || [];
+      // If we don't have an agentic Ollama Cloud key, perform prefetch search upfront
+      if (!matchingOllamaCloudNode) {
+        try {
+          const webSearchService = require("../services/webSearchService");
+          const searchResult = await webSearchService.searchOrFetch(rawUserMessage);
+          if (searchResult && searchResult.formattedContext) {
+            finalUserPrompt = `${finalUserPrompt}\n\n${searchResult.formattedContext}`;
+            searchExecuted = true;
+            searchSources = searchResult.sources || [];
+          }
+        } catch (searchErr) {
+          console.warn("⚠️ [SEARCH] Graceful skip on error:", searchErr.message);
         }
-      } catch (searchErr) {
-        console.warn("⚠️ [SEARCH] Graceful skip on error:", searchErr.message);
       }
     } else if (!enableSearch && rawUserMessage) {
       const { isTimeSensitiveQuery } = require("../services/searchIntentService");
       if (isTimeSensitiveQuery(rawUserMessage)) {
         isGuidanceActive = true;
-        const guidanceInstruction = "\n\n[SYSTEM GUIDANCE: The user is asking for real-time live data, market prices, or current news, but Web Search is currently turned OFF in their chat settings. Explain politely that you do not have access to live real-time information in offline mode, and instruct them: \'Please switch on the 🌐 Web Search icon at the bottom of the chat to enable real-time internet search for this request.\']";
+        const guidanceInstruction = "\n\n[SYSTEM GUIDANCE: The user is asking for real-time live data, market prices, or current news, but Web Search is currently turned OFF in their chat settings. Explain politely that you do not have access to live real-time information in offline mode, and instruct them: 'Please switch on the 🌐 Web Search icon at the bottom of the chat to enable real-time internet search for this request.']";
         finalUserPrompt = `${finalUserPrompt}${guidanceInstruction}`;
       }
     }
@@ -524,7 +569,7 @@ CORE BEHAVIOR RULES:
     console.log(`  • ChatId:       ${chatId}`);
     console.log(`  • User:         ${userId} (${isPaid ? "Paid Tier" : "Free Tier"})`);
     console.log(`  • Model:        ${currentModelId} (Provider: ${modelPricing.provider || "auto"})`);
-    console.log(`  • Web Search:   ${!enableSearch ? "Disabled (Normal Flow)" : searchExecuted ? `Active (Injected: ${searchIntent.reason})` : `Bypassed by Guardrail (${searchIntent.reason})`}`);
+    console.log(`  • Web Search:   ${!enableSearch ? "Disabled (Normal Flow)" : matchingOllamaCloudNode ? "Active (Agentic Tool Loop via Ollama Cloud Key)" : searchExecuted ? `Active (Injected: ${searchIntent.reason})` : `Bypassed by Guardrail (${searchIntent.reason})`}`);
     console.log(`  • Prompt Message: "${rawUserMessage || (hasImage ? "[Attachment Only - Image Analysis]" : "[Attachment Only]")}"`);
     if (processedAttachments.length > 0) {
       console.log(`  • Attachments (${processedAttachments.length}):`);
@@ -545,23 +590,63 @@ CORE BEHAVIOR RULES:
       if (typeof res.flush === "function") { try { res.flush(); } catch (e) {} }
     }
 
-    const gatewayResult = await aiGateway.generateStream({
-      provider: modelPricing.provider || "auto",
-      model: currentModelId,
-      messages: historyPayload,
-      attachments: processedAttachments,
-      res,
-      userPriority,
-      jobId,
-      userId: req.user.id,
-      preResolvedNodeHint,
-      onToken: () => {
-        if (!firstTokenTimestamp) {
-          firstTokenTimestamp = performance.now();
-          ttft = firstTokenTimestamp - llmRequestStartTime;
+    let gatewayResult = null;
+
+    // 1. Try Agentic Tool Search if matching Ollama Cloud node with secretKey exists
+    if (matchingOllamaCloudNode) {
+      try {
+        let targetOllamaModel = currentModelId;
+        if (Array.isArray(matchingOllamaCloudNode.supportedModels) && matchingOllamaCloudNode.supportedModels.length > 0) {
+          const exactMatch = matchingOllamaCloudNode.supportedModels.find(m => m.toLowerCase() === currentModelId.toLowerCase());
+          if (exactMatch) {
+            targetOllamaModel = exactMatch;
+          } else {
+            const cleanPrefix = currentModelId.toLowerCase().replace(/:cloud$/, "").split(":")[0];
+            const prefixMatch = matchingOllamaCloudNode.supportedModels.find(m => m.toLowerCase().startsWith(cleanPrefix));
+            targetOllamaModel = prefixMatch || matchingOllamaCloudNode.defaultModel || currentModelId;
+          }
         }
+
+        console.log(`🚀 [OLLAMA TOOL SERVICE] Initiating agentic tool search with node "${matchingOllamaCloudNode.name}" (Model: ${targetOllamaModel})`);
+        const ollamaToolService = require("../services/ollamaToolService");
+        gatewayResult = await ollamaToolService.streamAgenticChat({
+          model: targetOllamaModel,
+          messages: historyPayload,
+          node: matchingOllamaCloudNode,
+          res,
+          onToken: () => {
+            if (!firstTokenTimestamp) {
+              firstTokenTimestamp = performance.now();
+              ttft = firstTokenTimestamp - llmRequestStartTime;
+            }
+          }
+        });
+      } catch (agenticErr) {
+        console.warn(`⚠️ [AGENTIC TOOL SEARCH ERROR] Failed: ${agenticErr.message}. Falling back to standard gateway stream.`);
+        gatewayResult = null;
       }
-    });
+    }
+
+    // 2. Standard Gateway Stream (Fallback or Default Path)
+    if (!gatewayResult) {
+      gatewayResult = await aiGateway.generateStream({
+        provider: modelPricing.provider || "auto",
+        model: currentModelId,
+        messages: historyPayload,
+        attachments: processedAttachments,
+        res,
+        userPriority,
+        jobId,
+        userId: req.user.id,
+        preResolvedNodeHint,
+        onToken: () => {
+          if (!firstTokenTimestamp) {
+            firstTokenTimestamp = performance.now();
+            ttft = firstTokenTimestamp - llmRequestStartTime;
+          }
+        }
+      });
+    }
 
     let accumulatedResponseText = gatewayResult.text || "";
     let streamedSuccessfully = gatewayResult.success;

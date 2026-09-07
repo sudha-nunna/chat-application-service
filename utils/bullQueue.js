@@ -38,6 +38,9 @@ knowledgeWorker.on("failed", (job, err) => {
   console.error(`❌ [BULLMQ JOB FAILED] Job ${job?.id} error:`, err.message);
 });
 
+knowledgeQueue.on("error", () => {});
+knowledgeWorker.on("error", () => {});
+
 module.exports = {
   knowledgeQueue,
   knowledgeWorker
