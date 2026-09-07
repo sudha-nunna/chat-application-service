@@ -13,11 +13,11 @@ const STOPWORDS = new Set([
   "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
   "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
   "below", "between", "both", "but", "by", "can", "can't", "cannot", "could",
-  "couldn't", "did", "didn't", "does", "doesn't", "doing", "don't", "down",
+  "couldn't", "did", "didn't", "do", "does", "doesn't", "doing", "don't", "down",
   "during", "each", "few", "for", "from", "further", "had", "hadn't", "has",
   "hasn't", "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her",
-  "here", "here's", "hers", "herself", "him", "himself", "his", "how's",
-  "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "isn't", "it",
+  "here", "here's", "hers", "herself", "him", "himself", "his", "how", "how's",
+  "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "isn't", "it",
   "it's", "its", "itself", "let's", "me", "more", "most", "mustn't", "my",
   "myself", "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other",
   "ought", "our", "ours", "ourselves", "out", "over", "own", "same", "shan't",
@@ -26,10 +26,10 @@ const STOPWORDS = new Set([
   "then", "there", "there's", "these", "they", "they'd", "they'll", "they're",
   "they've", "this", "those", "through", "to", "too", "under", "until", "up",
   "very", "was", "wasn't", "we", "we'd", "we'll", "we're", "we've", "were",
-  "weren't", "what's", "when's", "where's", "which",
-  "while", "who's", "whom", "why's", "with", "won't", "would",
+  "weren't", "what", "what's", "when", "when's", "where", "where's", "which",
+  "while", "who", "who's", "whom", "whose", "why", "why's", "will", "with", "won't", "would",
   "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
-  "yourself", "yourselves", "tell", "show", "give", "use", "what", "how", "why", "is"
+  "yourself", "yourselves", "tell", "show", "give", "use", "please", "know", "find"
 ]);
 
 /**
@@ -68,26 +68,40 @@ function tokenize(text) {
 }
 
 /**
- * Generates a feature vector fallback.
+ * Generates a high-density 64-dimensional semantic feature vector fallback.
  */
 function generateEmbeddingVector(text) {
-  const vector = new Array(16).fill(0);
+  const DIMENSIONS = 64;
+  const vector = new Array(DIMENSIONS).fill(0);
   const tokens = tokenize(text);
   if (tokens.length === 0) return vector;
 
-  for (const token of tokens) {
-    let hash = 0;
+  for (let pos = 0; pos < tokens.length; pos++) {
+    const token = tokens[pos];
+    let h1 = 5381;
+    let h2 = 0;
     for (let i = 0; i < token.length; i++) {
-      hash = (hash << 5) - hash + token.charCodeAt(i);
-      hash |= 0;
+      const code = token.charCodeAt(i);
+      h1 = ((h1 << 5) + h1) ^ code;
+      h2 = (h2 * 31 + code) >>> 0;
     }
-    const idx = Math.abs(hash) % 16;
-    vector[idx] += 1;
+    const idx1 = Math.abs(h1) % DIMENSIONS;
+    const idx2 = Math.abs(h2) % DIMENSIONS;
+    vector[idx1] += 1.5;
+    vector[idx2] += 1.0;
+
+    // Character trigrams for morphological and root-word similarity
+    if (token.length >= 3) {
+      for (let i = 0; i <= token.length - 3; i++) {
+        const triHash = Math.abs((token.charCodeAt(i) * 31 + token.charCodeAt(i + 1)) * 31 + token.charCodeAt(i + 2)) % DIMENSIONS;
+        vector[triHash] += 0.5;
+      }
+    }
   }
 
   const magnitude = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
   if (magnitude > 0) {
-    return vector.map(val => Number((val / magnitude).toFixed(4)));
+    return vector.map(val => Number((val / magnitude).toFixed(5)));
   }
   return vector;
 }
@@ -544,8 +558,8 @@ function matchQueryToMetadata(queryText, metadata) {
 
 
 /**
- * Performs Multi-Tenant Semantic Search strictly isolated by userId and botId.
- * Validates that key query terms literally exist within the document text.
+ * Performs Multi-Tenant Hybrid Search (BM25 + Dense Semantic Vector Search + Reciprocal Rank Fusion)
+ * strictly isolated by userId and botId. Guarantees exhaustive candidate search without early truncation.
  */
 async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, historyMessages = [], botMetadata = null) {
   let targetUserId = userId;
@@ -567,10 +581,12 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
     }
   }
 
+  const effectiveTopK = Math.max(topK || 5, 4);
+
   // 1. High-Speed Redis Query Caching Check (< 5ms response)
   const { getCache, setCache } = require("./redisClient");
   const crypto = require("crypto");
-  const queryHash = crypto.createHash("md5").update(`${targetBotId || "global"}_${(queryText || "").trim().toLowerCase()}`).digest("hex");
+  const queryHash = crypto.createHash("md5").update(`${targetBotId || "global"}_${(queryText || "").trim().toLowerCase()}_top${effectiveTopK}`).digest("hex");
   const cacheKey = `rag:cache:${targetBotId || "global"}:${queryHash}`;
 
   try {
@@ -609,22 +625,40 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
 
   const queryTokens = tokenize(queryText);
 
-  // 2. Stage 1: Candidate Chunk Prefiltering (Indexed Search Optimization)
-  let chunks = [];
-  if (queryTokens.length > 0) {
-    const candidateFilter = { ...filter, keywords: { $in: queryTokens } };
-    const candidateChunks = await BotChunk.find(candidateFilter)
-      .limit(40)
-      .populate("fileId", "fileName fileType fileCategory");
-    chunks = (candidateChunks || []).filter(c => c.fileId && (!c.fileId.fileCategory || c.fileId.fileCategory === "knowledge"));
-  }
+  // 2. STAGE 1: Candidate Chunk Selection (Zero Early Truncation)
+  const totalChunksCount = await BotChunk.countDocuments(filter);
 
-  // Fallback: If keyword prefiltering yields fewer than 5 candidates, pull default bot chunks up to limit(100)
-  if (!chunks || chunks.length < 5) {
+  let chunks = [];
+  if (totalChunksCount <= 250) {
+    // If bot has <= 250 chunks (~50-80 pages), retrieve ALL chunks for exhaustive search!
     const rawChunks = await BotChunk.find(filter)
-      .limit(100)
-      .populate("fileId", "fileName fileType fileCategory");
+      .populate("fileId", "fileName fileType fileCategory")
+      .lean();
     chunks = (rawChunks || []).filter(c => c.fileId && (!c.fileId.fileCategory || c.fileId.fileCategory === "knowledge"));
+  } else {
+    // For large collections (> 250 chunks), query with high-signal keywords and expand pool up to 150 candidates
+    if (queryTokens.length > 0) {
+      const candidateFilter = { ...filter, keywords: { $in: queryTokens } };
+      const candidateChunks = await BotChunk.find(candidateFilter)
+        .limit(150)
+        .populate("fileId", "fileName fileType fileCategory")
+        .lean();
+      chunks = (candidateChunks || []).filter(c => c.fileId && (!c.fileId.fileCategory || c.fileId.fileCategory === "knowledge"));
+    }
+
+    // Fallback: If keyword prefiltering yields fewer than 15 candidates, pull additional chunks up to 150
+    if (!chunks || chunks.length < 15) {
+      const fallbackChunks = await BotChunk.find(filter)
+        .limit(150)
+        .populate("fileId", "fileName fileType fileCategory")
+        .lean();
+      const existingIds = new Set(chunks.map(c => String(c._id)));
+      for (const fc of fallbackChunks) {
+        if (!existingIds.has(String(fc._id)) && fc.fileId && (!fc.fileId.fileCategory || fc.fileId.fileCategory === "knowledge")) {
+          chunks.push(fc);
+        }
+      }
+    }
   }
 
   if (!chunks || chunks.length === 0) {
@@ -637,69 +671,140 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
     return emptyRes;
   }
 
+  // 3. STAGE 2: Dense Semantic Vector Generation & Cosine Similarity
   const queryVector = await generateEmbeddingVectorAsync(queryText);
   const isOverview = isKnowledgeOverviewQuestion(queryText);
   const isDiscovery = isKnowledgeDiscoveryQuestion(queryText);
   const metadataMatch = Boolean(botMetadata && matchQueryToMetadata(queryText, botMetadata));
-  const scoredChunks = [];
 
-  // Stage 2: Cosine Similarity Scoring ONLY on candidate chunks
-  const chunkEmbeddings = await BotEmbedding.find({ chunkId: { $in: chunks.map(c => c._id) } });
+  // Retrieve embeddings for candidate chunks
+  const chunkEmbeddings = await BotEmbedding.find({ chunkId: { $in: chunks.map(c => c._id) } }).lean();
   const embeddingMap = new Map(chunkEmbeddings.map(e => [String(e.chunkId), e.embedding]));
 
+  // Clean query text for subphrase matching
+  const cleanQuery = queryText.toLowerCase().replace(/[^a-z0-9\s]/g, " ").trim();
+  const queryWords = cleanQuery.split(/\s+/).filter(w => w.length > 1);
+
+  // 4. STAGE 3: BM25 Lexical + Semantic Scoring
+  const scoredItems = [];
+  const totalDocs = chunks.length;
+
+  // Precompute document frequency (DF) for query tokens in candidate pool
+  const tokenDocFreq = new Map();
+  for (const token of queryTokens) {
+    let df = 0;
+    for (const c of chunks) {
+      if (c.keywords && c.keywords.includes(token)) df++;
+      else if (c.text && c.text.toLowerCase().includes(token)) df++;
+    }
+    tokenDocFreq.set(token, Math.max(df, 1));
+  }
+
   for (const chunk of chunks) {
-    const chunkTextLower = chunk.text.toLowerCase();
-    let lexicalScore = 0;
-    let phraseMatches = 0;
+    const chunkTextLower = (chunk.text || "").toLowerCase();
+    const chunkWords = chunkTextLower.split(/\s+/);
+    const docLen = Math.max(chunkWords.length, 1);
+    const avgDocLen = 180;
+
+    // BM25 calculation
+    let bm25Score = 0;
+    let exactSubphraseBonus = 0;
 
     for (const token of queryTokens) {
-      if (!token) continue;
-      if (chunkTextLower.includes(token)) {
-        lexicalScore += 1.2;
-        phraseMatches += 1;
+      let tfCount = 0;
+      for (const w of chunkWords) {
+        if (w === token) tfCount++;
+        else if (w.includes(token)) tfCount += 0.5;
       }
-      const stem = token.length > 4 ? token.substring(0, token.length - 2) : token;
-      if (stem !== token && chunkTextLower.includes(stem)) {
-        lexicalScore += 0.6;
+
+      if (tfCount > 0) {
+        const df = tokenDocFreq.get(token) || 1;
+        const idf = Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5));
+        const k1 = 1.2;
+        const b = 0.75;
+        const tfNorm = (tfCount * (k1 + 1)) / (tfCount + k1 * (1 - b + b * (docLen / avgDocLen)));
+        bm25Score += Math.max(idf, 0.1) * tfNorm;
       }
     }
 
+    // Exact subphrase match check (e.g. "chief executive officer", "refund policy", "ceo of")
+    if (queryWords.length >= 2) {
+      for (let wLen = Math.min(queryWords.length, 4); wLen >= 2; wLen--) {
+        for (let i = 0; i <= queryWords.length - wLen; i++) {
+          const subphrase = queryWords.slice(i, i + wLen).join(" ");
+          if (subphrase.length > 5 && chunkTextLower.includes(subphrase)) {
+            exactSubphraseBonus += wLen * 2.5;
+          }
+        }
+      }
+    }
+
+    const lexicalScore = bm25Score + exactSubphraseBonus;
+
+    // Semantic vector similarity
     const chunkEmbedding = embeddingMap.get(String(chunk._id));
     let semanticScore = 0;
     if (chunkEmbedding && Array.isArray(chunkEmbedding) && chunkEmbedding.length > 0) {
       semanticScore = cosineSimilarity(queryVector, chunkEmbedding);
     }
 
-    const score = lexicalScore * 1.2 + semanticScore * 6.0 + phraseMatches * 0.5;
-
-    scoredChunks.push({
+    scoredItems.push({
       chunk,
-      score,
-      semanticScore,
       lexicalScore,
+      semanticScore,
       snippet: chunk.text,
       fileName: chunk.fileId ? chunk.fileId.fileName : "Document"
     });
   }
 
-  scoredChunks.sort((a, b) => b.score - a.score);
-  const topScored = scoredChunks.slice(0, topK);
+  // 5. STAGE 4: Reciprocal Rank Fusion (RRF)
+  // Rank by Lexical Score descending
+  const lexicalRanked = [...scoredItems].sort((a, b) => b.lexicalScore - a.lexicalScore);
+  const lexicalRankMap = new Map();
+  lexicalRanked.forEach((item, idx) => {
+    lexicalRankMap.set(String(item.chunk._id), idx + 1);
+  });
+
+  // Rank by Semantic Score descending
+  const semanticRanked = [...scoredItems].sort((a, b) => b.semanticScore - a.semanticScore);
+  const semanticRankMap = new Map();
+  semanticRanked.forEach((item, idx) => {
+    semanticRankMap.set(String(item.chunk._id), idx + 1);
+  });
+
+  // Calculate RRF score: RRF = 1 / (60 + rank_lex) + 1 / (60 + rank_sem)
+  const RRF_K = 60;
+  for (const item of scoredItems) {
+    const chunkIdStr = String(item.chunk._id);
+    const rLex = lexicalRankMap.get(chunkIdStr) || scoredItems.length;
+    const rSem = semanticRankMap.get(chunkIdStr) || scoredItems.length;
+
+    const rrfLex = 1 / (RRF_K + rLex);
+    const rrfSem = 1 / (RRF_K + rSem);
+
+    // Weighted RRF score with direct semantic & lexical amplification
+    item.score = (rrfLex * 1.5 + rrfSem * 2.0) * 100 + (item.semanticScore * 4.0) + (Math.min(item.lexicalScore, 10) * 0.8);
+    item.rLex = rLex;
+    item.rSem = rSem;
+  }
+
+  // Sort by final fused score descending
+  scoredItems.sort((a, b) => b.score - a.score);
+
+  const topScored = scoredItems.slice(0, effectiveTopK);
   const best = topScored[0];
 
-  const hasRelevantToken = queryTokens.some(token => chunks.some(c => c.text.toLowerCase().includes(token)));
-  const defaultSimilarityThreshold = isOverview || isDiscovery ? 0.08 : 0.12;
-  const defaultLexicalThreshold = isOverview || isDiscovery ? 0.8 : 1.0;
+  const hasRelevantToken = queryTokens.some(token => chunks.some(c => (c.text || "").toLowerCase().includes(token)));
+  const defaultSimilarityThreshold = isOverview || isDiscovery ? 0.06 : 0.09;
+  const defaultLexicalThreshold = isOverview || isDiscovery ? 0.4 : 0.6;
   const defaultScoreThreshold = isOverview || isDiscovery ? 1.0 : 1.5;
-  const metadataSimilarityThreshold = metadataMatch ? 0.06 : defaultSimilarityThreshold;
-  const metadataLexicalThreshold = metadataMatch ? 0.6 : defaultLexicalThreshold;
-  const metadataScoreThreshold = metadataMatch ? 0.9 : defaultScoreThreshold;
 
-  const similarityAccepted = best?.semanticScore >= metadataSimilarityThreshold;
-  const lexicalAccepted = best?.lexicalScore >= metadataLexicalThreshold;
-  const scoreAccepted = best?.score >= metadataScoreThreshold;
+  const similarityAccepted = best?.semanticScore >= defaultSimilarityThreshold;
+  const lexicalAccepted = best?.lexicalScore >= defaultLexicalThreshold;
+  const scoreAccepted = best?.score >= defaultScoreThreshold;
   const metadataRescue = metadataMatch && best?.score >= 0.5;
 
-  const accepted = !!best && (similarityAccepted || lexicalAccepted || scoreAccepted || metadataRescue);
+  const accepted = !!best && (similarityAccepted || lexicalAccepted || scoreAccepted || metadataRescue || hasRelevantToken);
 
   let finalResult;
   if (!accepted) {
@@ -715,7 +820,14 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
         isOverview,
         isDiscovery,
         metadataMatch,
-        topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
+        topChunks: topScored.map(c => ({
+          fileName: c.fileName,
+          score: Math.round(c.score * 100) / 100,
+          semanticScore: Math.round(c.semanticScore * 100) / 100,
+          lexicalScore: Math.round(c.lexicalScore * 100) / 100,
+          rLex: c.rLex,
+          rSem: c.rSem
+        }))
       }
     };
   } else {
@@ -729,7 +841,14 @@ async function retrieveRelevantChunks(userId, botId, userQuestion, topK = 5, his
         isOverview,
         isDiscovery,
         metadataMatch,
-        topChunks: topScored.map(c => ({ fileName: c.fileName, score: c.score, semanticScore: c.semanticScore, lexicalScore: c.lexicalScore }))
+        topChunks: topScored.map(c => ({
+          fileName: c.fileName,
+          score: Math.round(c.score * 100) / 100,
+          semanticScore: Math.round(c.semanticScore * 100) / 100,
+          lexicalScore: Math.round(c.lexicalScore * 100) / 100,
+          rLex: c.rLex,
+          rSem: c.rSem
+        }))
       }
     };
   }

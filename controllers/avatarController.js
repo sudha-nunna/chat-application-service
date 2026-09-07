@@ -192,8 +192,9 @@ exports.handleAvatarChat = async (req, res) => {
     // RAG Intent & Search
     const intent = detectBotIntent(message, bot.knowledgeSummary || {});
     let ragResult = { isFound: true, chunks: [] };
+    const requestedTopK = bot.maxChunksPerQuery || 4;
     if (intent !== "GREETING" && hasUploadedFiles) {
-      ragResult = await retrieveRelevantChunks(req.user?.id || bot.userId || "guest", effectiveBotId, message, 3, history, bot.knowledgeSummary);
+      ragResult = await retrieveRelevantChunks(req.user?.id || bot.userId || "guest", effectiveBotId, message, requestedTopK, history, bot.knowledgeSummary);
     }
 
     const sourcesMeta = ragResult.isFound && ragResult.chunks.length > 0
