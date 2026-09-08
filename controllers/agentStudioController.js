@@ -596,8 +596,9 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
         });
       } catch (aiErr) {
         console.warn("Notice: AI Gateway stream fallback:", aiErr.message);
-        res.write(`data: ${JSON.stringify({ type: "chunk", chunk: fallbackResponse })}\n\n`);
-        streamReply = fallbackResponse;
+        const errFallback = "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.";
+        res.write(`data: ${JSON.stringify({ type: "chunk", chunk: errFallback })}\n\n`);
+        streamReply = errFallback;
       }
 
       res.write(`data: ${JSON.stringify({
@@ -627,7 +628,7 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
       }
     } catch (aiErr) {
       console.warn("Notice: AI Gateway fallback:", aiErr.message);
-      fullReply = fallbackResponse;
+      fullReply = "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.";
     }
 
     if (!fullReply.trim()) {

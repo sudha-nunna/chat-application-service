@@ -449,12 +449,13 @@ STRICT IDENTITY RULES:
 2. You must NEVER identify as, state, or claim to be "ChatGPT", "OpenAI", "Gemini", "Google", "Ollama", "Claude", "LLaMA", or any underlying AI vendor.
 3. If asked about your name, identity, or creator, introduce yourself simply and warmly: "I am AI Assistant, your dedicated workspace helper."
 
-CORE BEHAVIOR RULES:
-1. Be direct, natural, engaging, and articulate.
-2. For casual, open-ended, or greeting prompts (e.g., "tell me something", "what's up", "tell me a story"), provide an interesting, engaging, or thought-provoking answer right away, and warmly ask how you can help them today.
-3. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
-4. For technical, coding, science, or factual queries, provide detailed, accurate, beautifully formatted markdown explanations with bullet points and code blocks.
-5. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
+CORE BEHAVIOR & OUTPUT FORMAT RULES:
+1. Be direct, natural, engaging, and articulate. Jump straight into the helpful, accurate answer.
+2. NEVER output your internal drafting process, brainstorm notes, planning steps, or meta-commentary (such as "Draft:", "Structure:", "Hook:", or "Since the date is..."). Output ONLY the final, polished response directly to the user.
+3. For casual, open-ended, or greeting prompts (e.g., "tell me something", "what's up", "tell me a story"), provide an interesting, engaging, or thought-provoking answer right away, and warmly ask how you can help them today.
+4. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
+5. For technical, coding, science, or factual queries, provide detailed, accurate, beautifully formatted markdown explanations with bullet points and code blocks.
+6. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
 
     if (summaryText && summaryText.trim()) {
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
@@ -684,22 +685,16 @@ CORE BEHAVIOR RULES:
       // 5. Generate AI Follow-up Suggestions (if enabled in Admin System Settings)
       let followUps = [];
       try {
-        const SystemSetting = require("../models/SystemSetting");
-        const setting = await SystemSetting.findOne({ key: "global_settings" }).lean();
-        const isFollowUpEnabled = setting ? setting.enableFollowUpSuggestions !== false : true;
-
-        if (isFollowUpEnabled) {
-          const followUpService = require("../services/followUpService");
-          followUps = await followUpService.generateFollowUps(
-            rawUserMessage,
-            accumulatedResponseText,
-            {
-              model: currentModelId,
-              nodeId: gatewayResult?.nodeId,
-              preResolvedNodeHint
-            }
-          );
-        }
+        const followUpService = require("../services/followUpService");
+        followUps = await followUpService.generateFollowUps(
+          rawUserMessage,
+          accumulatedResponseText,
+          {
+            model: currentModelId,
+            nodeId: gatewayResult?.nodeId,
+            preResolvedNodeHint
+          }
+        );
       } catch (fErr) {
         console.warn("⚠️ [FOLLOW-UPS NOTICE] Generation skipped on error:", fErr.message);
       }
@@ -811,7 +806,11 @@ CORE BEHAVIOR RULES:
     if (!streamedSuccessfully) {
       if (res.writableEnded) return;
       console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content.");
-      const fallbackText = gatewayResult.errorMessage || "I'm unable to connect to the active AI server node right now. Please check that your server node is running and accessible.";
+      const standardTrafficMsg = "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.";
+      let fallbackText = gatewayResult?.userFriendlyMessage || standardTrafficMsg;
+      if (!fallbackText || fallbackText.includes("HTTP 40") || fallbackText.includes("not found") || fallbackText.includes("errorBody") || fallbackText.includes("model '") || fallbackText.includes("{") || fallbackText.includes("returned HTTP")) {
+        fallbackText = standardTrafficMsg;
+      }
 
       console.log(`\n================================================================================`);
       console.log(`📤 [FALLBACK RESPONSE SENT TO USER]`);
@@ -830,7 +829,8 @@ CORE BEHAVIOR RULES:
       res.status(500).json({ success: false, message: "General chat processing failed.", error: error.message });
     } else {
       res.write(`data: ${JSON.stringify({ type: "error", message: "Stream connection error." })}\n\n`);
-      res.end();
+      res.write("data: [DONE]\n\n");
+      return res.end();
     }
   }
 };

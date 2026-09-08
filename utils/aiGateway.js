@@ -98,75 +98,38 @@ function getProviderApiKey(candidateKeys = []) {
   return sorted[0];
 }
 
-function safeFetch(url, options = {}) {
-  return new Promise((resolve, reject) => {
+async function safeFetch(url, options = {}) {
+  const reqHeaders = { ...(options.headers || {}) };
+  if (!reqHeaders["User-Agent"]) {
+    reqHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+  }
+
+  const isLocalhost = url.includes("127.0.0.1") || url.includes("localhost");
+  const timeoutMs = options.timeout || options.connectTimeout || (isLocalhost ? 10000 : 90000);
+
+  let signal = options.signal;
+  if (!signal) {
     try {
-      const parsedUrl = new URL(url);
-      const isHttps = parsedUrl.protocol === "https:";
-      const client = isHttps ? https : http;
+      signal = AbortSignal.timeout(timeoutMs);
+    } catch (e) {}
+  }
 
-      const reqHeaders = { ...(options.headers || {}) };
-      if (!reqHeaders["User-Agent"]) {
-        reqHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-      }
+  const fetchOptions = {
+    method: options.method || "GET",
+    headers: reqHeaders,
+    body: options.body,
+    signal
+  };
 
-      if (options.body && !reqHeaders["Content-Length"]) {
-        reqHeaders["Content-Length"] = Buffer.byteLength(options.body);
-      }
+  const response = await fetch(url, fetchOptions);
+  const rawStream = response.body ? Readable.fromWeb(response.body) : null;
 
-      const reqOptions = {
-        method: options.method || "GET",
-        headers: reqHeaders,
-        agent: isHttps ? httpsAgent : httpAgent
-      };
-
-      const req = client.request(parsedUrl, reqOptions, (res) => {
-        // Return raw IncomingMessage directly — do NOT convert to Web Streams.
-        // Readable.toWeb() buffers all SSE chunks until completion (35s wait for streaming LLMs).
-        // The stream consumer reads line-by-line using Node.js events.
-        resolve({
-          ok: res.statusCode >= 200 && res.statusCode < 300,
-          status: res.statusCode,
-          headers: res.headers,
-          rawStream: res  // raw Node.js IncomingMessage
-        });
-      });
-
-      // Remote LLM nodes (codegene, etc.) can take 30-60s before first token.
-      // Use a generous socket inactivity timeout (180s) to handle slow cold-start inference.
-      const isLocalhost = url.includes("127.0.0.1") || url.includes("localhost");
-      const socketTimeoutMs = options.connectTimeout || (isLocalhost ? 8000 : 180000);
-
-      req.setTimeout(socketTimeoutMs, () => {
-        req.destroy(new Error(`Node connection timeout (${socketTimeoutMs}ms)`));
-      });
-
-      // Reset the socket timeout on every data chunk so streaming LLMs don't timeout mid-stream
-      req.on("socket", (socket) => {
-        socket.on("data", () => {
-          // Refresh timeout on each received chunk to prevent mid-stream timeouts
-          socket.setTimeout(socketTimeoutMs);
-        });
-      });
-
-      req.on("error", (err) => reject(err));
-
-      if (options.signal) {
-        if (options.signal.aborted) {
-          req.destroy();
-          return reject(new Error("Request aborted"));
-        }
-        options.signal.addEventListener("abort", () => req.destroy(), { once: true });
-      }
-
-      if (options.body) {
-        req.write(options.body);
-      }
-      req.end();
-    } catch (e) {
-      reject(e);
-    }
-  });
+  return {
+    ok: response.ok,
+    status: response.status,
+    headers: response.headers,
+    rawStream
+  };
 }
 
 /**
@@ -212,11 +175,11 @@ function isLocalNodeOrProvider(nodeOrProvider) {
     }
   }
 
-  if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("integrate.api.nvidia.com") || url.includes("anthropic.com") || url.includes("trycloudflare.com")) {
+  if (url.includes("googleapis.com") || url.includes("openai.com") || url.includes("integrate.api.nvidia.com") || url.includes("anthropic.com") || url.includes("trycloudflare.com") || url.includes("ollama.com") || url.includes("codegene")) {
     return false;
   }
 
-  if (format === "ollama" || format === "llama" || url.includes("localhost") || url.includes("127.0.0.1") || url.includes(":11434")) {
+  if ((format === "ollama" || format === "llama") && (url.includes("localhost") || url.includes("127.0.0.1") || url.includes(":11434"))) {
     return true;
   }
 
@@ -279,6 +242,14 @@ function buildProviderAwareContextPayload({ messages = [], conversationSummary =
   }
 
   return finalPayload;
+}
+
+/**
+ * Transforms raw internal AI provider errors into clean, professional user-facing messages.
+ * Prevents leaking provider JSON, URLs, developer/account names, and internal credentials.
+ */
+function sanitizeUserFacingError(rawError, statusCode = 0) {
+  return "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.";
 }
 
 class AIGateway {
@@ -357,10 +328,14 @@ class AIGateway {
       });
     }
 
-    if (providerLower === "gemini") {
+    if (providerLower === "gemini" || (model && model.toLowerCase().includes("gemini") && !/^(auto|best)$/i.test(model))) {
+      const geminiTargetModel = (model === "best" || model === "gemini-2.5-flash" || model === "gemini-2.0-flash")
+        ? "gemini-3.5-flash-lite"
+        : (model || "gemini-3.5-flash-lite");
+
       try {
         return await this._streamCloudGemini({
-          model: model === "best" ? "gemini-2.5-flash" : model,
+          model: geminiTargetModel,
           messages,
           attachments,
           conversationSummary,
@@ -370,7 +345,7 @@ class AIGateway {
       } catch (geminiErr) {
         console.warn("⚠️ [GATEWAY STRICT] Cloud Gemini direct failed:", geminiErr.message, "-> Trying cluster Gemini nodes.");
         return await this._streamOllamaCluster({
-          model: model || "gemini-2.5-flash",
+          model: geminiTargetModel,
           customUrl,
           messages,
           attachments,
@@ -460,30 +435,51 @@ class AIGateway {
     // If matchedNodes has results, use them as the primary pool regardless of provider classification.
     let poolsHierarchy;
     if (matchedNodes.length > 0) {
-      // Start with the specific matched nodes, then fall back to the broader pool
-      if (isGeminiModel) poolsHierarchy = [matchedNodes, geminiPool, allNodes];
-      else if (isGLMModel) poolsHierarchy = [matchedNodes, glmPool, allNodes];
-      else if (isOpenAIModel) poolsHierarchy = [matchedNodes, openAiPool, allNodes];
+      if (isGeminiModel) poolsHierarchy = [matchedNodes, geminiPool];
+      else if (isGLMModel) poolsHierarchy = [matchedNodes, glmPool];
+      else if (isOpenAIModel) poolsHierarchy = [matchedNodes, openAiPool];
+      else if (isOllamaModel) poolsHierarchy = [matchedNodes, llamaPool];
       else poolsHierarchy = [matchedNodes, allNodes];
     } else if (isExplicitModel || strictProvider) {
       if (isOpenAIModel) {
-        poolsHierarchy = [openAiPool, allNodes];
+        poolsHierarchy = [openAiPool];
       } else if (isGeminiModel) {
-        poolsHierarchy = [geminiPool, allNodes];
+        poolsHierarchy = [geminiPool];
       } else if (isGLMModel) {
-        poolsHierarchy = [glmPool, allNodes];
+        poolsHierarchy = [glmPool];
       } else if (isOllamaModel) {
-        // Ollama models (qwen, llama, deepseek, kimi) can run on any node with OpenAI-compat API
-        poolsHierarchy = [allNodes];
+        poolsHierarchy = [llamaPool];
       } else {
         poolsHierarchy = [allNodes];
       }
     } else {
-      // Auto / Best Mode — try all nodes
-      poolsHierarchy = [allNodes];
+      // Auto / Best Mode:
+      // Dynamically discover active server pools from DB.
+      // Prioritize active Ollama and Gemini nodes according to active status and priority.
+      const candidateNodes = allNodes.filter(n => n.isActive !== false && n.status !== "INACTIVE");
+      const activeNodes = candidateNodes.length > 0 ? candidateNodes : allNodes.filter(n => n.isActive !== false);
+
+      const activeOllama = activeNodes.filter(n => n.format === "ollama" || (!n.url.includes("googleapis.com") && !n.url.includes("openai.com") && !n.url.includes("integrate.api.nvidia.com")));
+      const activeGemini = activeNodes.filter(n => n.format === "gemini" || n.url.includes("googleapis.com"));
+      const activeOther = activeNodes.filter(n => !activeOllama.includes(n) && !activeGemini.includes(n));
+
+      const maxOllamaPriority = activeOllama.length > 0 ? Math.max(...activeOllama.map(n => n.priorityScore || n.priority || 10)) : -1;
+      const maxGeminiPriority = activeGemini.length > 0 ? Math.max(...activeGemini.map(n => n.priorityScore || n.priority || 10)) : -1;
+
+      poolsHierarchy = [];
+      if (maxGeminiPriority > maxOllamaPriority) {
+        if (activeGemini.length > 0) poolsHierarchy.push(activeGemini);
+        if (activeOllama.length > 0) poolsHierarchy.push(activeOllama);
+      } else {
+        if (activeOllama.length > 0) poolsHierarchy.push(activeOllama);
+        if (activeGemini.length > 0) poolsHierarchy.push(activeGemini);
+      }
+      if (activeOther.length > 0) poolsHierarchy.push(activeOther);
+      if (poolsHierarchy.length === 0) poolsHierarchy.push(allNodes);
     }
 
     let selectedNode = null;
+    let selectedModel = null;
     let response = null;
     let errorMessage = "";
     let streamedSuccessfully = false;
@@ -554,14 +550,18 @@ class AIGateway {
         currentNode.activeRequests++;
         currentNode.lastUsedAt = new Date();
 
-        const isCodegeneNode = (currentNode.url && currentNode.url.includes("ai.codegene.io")) || (currentNode.name && currentNode.name.toLowerCase().includes("codegene"));
+        const isCodegeneNode = (currentNode.url && (currentNode.url.includes("ai.codegene.io") || currentNode.url.includes("ollama.com"))) || (currentNode.name && currentNode.name.toLowerCase().includes("codegene"));
         const isCurrentGemini = !isCodegeneNode && (currentNode.format === "gemini" || currentNode.url.includes("googleapis.com"));
         const isCurrentGLM = !isCodegeneNode && (currentNode.format === "glm" || currentNode.url.includes("integrate.api.nvidia.com"));
-        let currentModel = (model && model !== "best" && !/^(gpt-4|gpt-3|claude)/i.test(model)) ? model : currentNode.defaultModel;
-        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "gemini-flash-latest" || currentModel === "gemini-1.5-flash" || currentModel === "gemini-2.0-flash" || currentModel === "gemini-2.5-flash" || currentModel === "gemini-3.6-flash")) {
-          currentModel = "gemini-2.5-flash";
+        // For auto/best mode, use the node's defaultModel. For explicit model, use the requested model.
+        // Keep :cloud suffix intact for cloud-hosted nodes (ollama.com / codegene proxy).
+        let currentModel = (model && model !== "best" && model !== "auto" && !/^(gpt-4|gpt-3|claude)/i.test(model))
+          ? model
+          : (currentNode.defaultModel || (Array.isArray(currentNode.supportedModels) && currentNode.supportedModels[0]) || "glm-5.3-flash:cloud");
+        if (isCurrentGemini && (!currentModel || currentModel === "best" || currentModel === "auto" || currentModel === "gemini-2.5-flash" || currentModel.includes("llama"))) {
+          currentModel = currentNode.defaultModel && currentNode.defaultModel !== "gemini-2.5-flash" && !currentNode.defaultModel.includes("llama") ? currentNode.defaultModel : "gemini-3.5-flash-lite";
         }
-        if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "llama3.2:3b")) {
+        if (isCurrentGLM && (!currentModel || currentModel === "best" || currentModel === "auto" || currentModel === "llama3.2:3b" || currentModel.includes("llama"))) {
           currentModel = "z-ai/glm-5.2";
         }
 
@@ -581,6 +581,8 @@ class AIGateway {
         }
 
         const isOfficialCloudService = currentNode.url.includes("api.openai.com") || currentNode.url.includes("googleapis.com") || currentNode.url.includes("integrate.api.nvidia.com");
+        // Cloud-hosted proxy nodes (ollama.com, codegene) also need extended timeout - they do inference in cloud
+        const isCloudHostedProxy = isCodegeneNode;
 
         // DB-only key resolution: use this node's own decrypted secretKey.
         // No process.env fallback — all keys must be set by admin via the dashboard.
@@ -675,11 +677,31 @@ class AIGateway {
             ])).filter(Boolean);
           }
         } else if (isCurrentGemini) {
-          modelsToTry = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
+          modelsToTry = Array.from(new Set([
+            (currentModel && currentModel.toLowerCase().includes("gemini") && currentModel !== "gemini-2.5-flash") ? currentModel : "gemini-3.5-flash-lite",
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash"
+          ])).filter(Boolean);
         } else if (isCurrentGLM) {
           modelsToTry = Array.from(new Set([currentModel, "zhipuai/glm-4-flash", "meta/llama-3.1-8b-instruct"])).filter(Boolean);
         } else if (currentNode.format === "ollama" || isOllamaNode || !isOfficialCloudService) {
-          modelsToTry = Array.from(new Set([currentModel, process.env.OLLAMA_MODEL || "qwen2.5:1.5b", "llama3.2:3b", "llama3.2"])).filter(Boolean);
+          const supported = Array.isArray(currentNode.supportedModels) ? currentNode.supportedModels : [];
+          const validOllamaModels = supported
+            .map(m => m.replace(/:cloud$/, ""))
+            .filter(m => !m.toLowerCase().includes("gemini"));
+
+          let primaryOllamaModel = (currentNode.defaultModel || "").replace(/:cloud$/, "");
+          if (!primaryOllamaModel || primaryOllamaModel.toLowerCase().includes("gemini")) {
+            primaryOllamaModel = validOllamaModels[0] || "glm-5.3-flash";
+          }
+
+          if (isExplicitModel) {
+            modelsToTry = Array.from(new Set([currentModel, primaryOllamaModel, ...validOllamaModels].filter(Boolean)));
+          } else {
+            // Auto Mode: strictly try the primary active model and at most 1 backup
+            const backupModel = validOllamaModels.find(m => m !== primaryOllamaModel) || "kimi-k2.6";
+            modelsToTry = Array.from(new Set([primaryOllamaModel, backupModel].filter(Boolean)));
+          }
         } else {
           modelsToTry = [currentModel];
         }
@@ -763,6 +785,8 @@ class AIGateway {
           }
         }
 
+        const providerTag = isCurrentGemini ? "GEMINI" : (currentNode.format ? currentNode.format.toUpperCase() : "OLLAMA");
+
         for (const candidateModel of modelsToTry) {
           const payload = { model: candidateModel, messages: formattedMessages, stream: true };
           if (cleanBase64List.length > 0 && targetFetchUrl.endsWith("/api/chat")) {
@@ -771,13 +795,11 @@ class AIGateway {
           if (maxTokens) {
             payload.max_tokens = Number(maxTokens);
           }
-          if (currentNode.format === "ollama") payload.keep_alive = "24h";
+          if (currentNode.format === "ollama" && !isCodegeneNode) payload.keep_alive = "24h";
 
           const dispatchStartTime = performance.now();
 
           try {
-            const providerTag = isCurrentGemini ? "GEMINI" : (currentNode.format ? currentNode.format.toUpperCase() : "OLLAMA");
-
             console.log(`\n================================================================================`);
             console.log(`📤 [AI REQUEST -> ${providerTag}]`);
             console.log(`  • JobId:       ${activeJobId}`);
@@ -801,8 +823,9 @@ class AIGateway {
               body: JSON.stringify(payload),
               signal: abortController.signal,
               // Cloud providers (NVIDIA, Gemini, OpenAI) need longer timeout for inference
-              // Local Ollama nodes keep the default 2500ms
-              timeout: isOfficialCloudService ? 30000 : undefined
+              // Cloud proxy nodes (ollama.com, codegene) need 90s - models do chain-of-thought reasoning
+              // Local Ollama nodes keep the default 25s
+              timeout: isOfficialCloudService ? 60000 : (isCloudHostedProxy ? 90000 : undefined)
             });
 
             const elapsedMs = (performance.now() - dispatchStartTime).toFixed(2);
@@ -824,11 +847,19 @@ class AIGateway {
                     if (!jsonStr || jsonStr === "[DONE]") return;
                     try {
                       const parsed = JSON.parse(jsonStr);
-                      const chunkText =
-                        parsed.choices?.[0]?.delta?.content ??
-                        parsed.choices?.[0]?.message?.content ??
-                        parsed.message?.content ??
-                        parsed.response ?? "";
+                      const delta = parsed.choices?.[0]?.delta;
+                      // Only extract user-facing content. Internal reasoning tokens (delta.reasoning) are internal CoT and must NOT be outputted as the message text!
+                      let chunkText = "";
+                      if (delta && typeof delta.content === "string") {
+                        chunkText = delta.content;
+                      } else if (typeof parsed.choices?.[0]?.message?.content === "string") {
+                        chunkText = parsed.choices[0].message.content;
+                      } else if (typeof parsed.message?.content === "string") {
+                        chunkText = parsed.message.content;
+                      } else if (typeof parsed.response === "string") {
+                        chunkText = parsed.response;
+                      }
+
                       if (chunkText) {
                         if (!firstTokenTimestamp) {
                           firstTokenTimestamp = performance.now();
@@ -872,6 +903,7 @@ class AIGateway {
                 if (streamBuffer.cleanText && streamBuffer.cleanText.trim().length > 0) {
                   accumulatedResponseText = streamBuffer.cleanText;
                   selectedNode = currentNode;
+                  selectedModel = candidateModel;
                   currentNode.successRequests = (currentNode.successRequests || 0) + 1;
                   currentNode.consecutiveFailures = 0;
                   currentNode.status = "ACTIVE";
@@ -926,14 +958,40 @@ class AIGateway {
                 errorMessage = `Provider API Rate Limit Exceeded (HTTP 429) on ${currentNode.name}. ${errorBody}`.trim();
                 currentNode.status = "RATE_LIMITED";
                 currentNode.retryAfter = new Date(Date.now() + 90 * 1000);
+                if (currentNode.id && currentNode.id.length === 24) {
+                  ServerNode.findByIdAndUpdate(currentNode.id, {
+                    status: "RATE_LIMITED",
+                    retryAfter: currentNode.retryAfter,
+                    errorMessage: "Session rate limit exceeded (HTTP 429)"
+                  }).catch(() => {});
+                }
                 break;
               } else if (response.status === 400 && errorBody.includes("does not support image input")) {
                 console.warn(`⚠️ [AI GATEWAY VISION NOTICE] Model '${candidateModel}' on node '${currentNode.name}' does not support image input. Trying next candidate model on this node...`);
                 errorMessage = `Model ${candidateModel} does not support image input.`;
                 continue;
-              } else if (response.status === 401 || response.status === 403 || response.status === 404 || response.status === 410) {
-                console.warn(`⚠️ [AI GATEWAY MODEL NOTICE] Model '${candidateModel}' on ${currentNode.name} returned HTTP ${response.status}. Trying next candidate model...`);
+              } else if (response.status === 401 || response.status === 403) {
+                console.warn(`⚠️ [AI GATEWAY AUTH NOTICE] Node '${currentNode.name}' returned HTTP ${response.status} (Auth Error). Skipping to next active cluster node...`);
+                errorMessage = `Authentication rejected on ${currentNode.name} (HTTP ${response.status}). ${errorBody}`.trim();
+                break; // Fast failover: do not retry with other models on this node
+              } else if (response.status === 404 || response.status === 410) {
+                console.warn(`⚠️ [AI GATEWAY MODEL NOTICE] Model '${candidateModel}' on ${currentNode.name} returned HTTP ${response.status}. Auto-removing from supportedModels...`);
                 errorMessage = `Model ${candidateModel} returned HTTP ${response.status}. ${errorBody}`.trim();
+                // Auto-purge: remove this 404'd model from DB so it's never tried again
+                if (currentNode.id && currentNode.id.length === 24) {
+                  const updatedSupported = (Array.isArray(currentNode.supportedModels) ? currentNode.supportedModels : [])
+                    .filter(m => m !== candidateModel && m.replace(/:cloud$/, "") !== candidateModel.replace(/:cloud$/, ""));
+                  const newDefault = (currentNode.defaultModel === candidateModel || currentNode.defaultModel === candidateModel.replace(/:cloud$/, ""))
+                    ? (updatedSupported[0] || "glm-5.3-flash:cloud")
+                    : currentNode.defaultModel;
+                  currentNode.supportedModels = updatedSupported;
+                  if (currentNode.defaultModel !== newDefault) currentNode.defaultModel = newDefault;
+                  ServerNode.findByIdAndUpdate(currentNode.id, {
+                    supportedModels: updatedSupported,
+                    defaultModel: newDefault
+                  }).catch(() => {});
+                  console.warn(`  🗑️ [MODEL PURGED] Removed '${candidateModel}' from node '${currentNode.name}'. New defaultModel: ${currentNode.defaultModel}`);
+                }
               } else {
                 errorMessage = `Server Node ${currentNode.name} returned HTTP ${response.status}. ${errorBody}`.trim();
               }
@@ -979,36 +1037,38 @@ class AIGateway {
 
     if (!accumulatedResponseText || !accumulatedResponseText.trim()) {
       const hasImage = Array.isArray(attachments) && attachments.some(a => (a.fileType === "image" || a.mimeType?.startsWith("image/")) && a.data);
-      if (isGeminiModel || hasImage) {
+      if (isGeminiModel || hasImage || !isExplicitModel) {
         try {
-          console.log(`🔄 [VISION / GEMINI FALLBACK] Attempting Cloud Gemini vision fallback...`);
-          const cloudRes = await this._streamCloudGemini({ model: "gemini-2.5-flash", messages, attachments, conversationSummary, res, onToken });
+          console.log(`🔄 [VISION / GEMINI FALLBACK] Attempting Cloud Gemini fallback (gemini-3.5-flash-lite)...`);
+          const cloudRes = await this._streamCloudGemini({ model: "gemini-3.5-flash-lite", messages, attachments, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
             accumulatedResponseText = cloudRes.text;
             streamedSuccessfully = true;
           }
         } catch (fErr) {
-          console.warn("⚠️ [GATEWAY STRICT] Direct Gemini retry notice:", fErr.message);
+          console.warn("⚠️ [GATEWAY AUTO] Direct Gemini retry notice:", fErr.message);
         }
-      } else if (isGLMModel) {
+      }
+      if (!accumulatedResponseText && (isGLMModel || !isExplicitModel)) {
         try {
-          const cloudRes = await this._streamCloudGLM({ model, messages, conversationSummary, res, onToken });
+          const cloudRes = await this._streamCloudGLM({ model: "z-ai/glm-5.2", messages, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
             accumulatedResponseText = cloudRes.text;
             streamedSuccessfully = true;
           }
         } catch (fErr) {
-          console.warn("⚠️ [GATEWAY STRICT] Direct GLM retry notice:", fErr.message);
+          console.warn("⚠️ [GATEWAY AUTO] Direct GLM retry notice:", fErr.message);
         }
-      } else if (isOpenAIModel) {
+      }
+      if (!accumulatedResponseText && (isOpenAIModel || !isExplicitModel)) {
         try {
-          const cloudRes = await this._streamCloudOpenAI({ model, messages, conversationSummary, res, onToken });
+          const cloudRes = await this._streamCloudOpenAI({ model: "gpt-4o-mini", messages, conversationSummary, res, onToken });
           if (cloudRes && cloudRes.text) {
             accumulatedResponseText = cloudRes.text;
             streamedSuccessfully = true;
           }
         } catch (fErr) {
-          console.warn("⚠️ [GATEWAY STRICT] Direct OpenAI retry notice:", fErr.message);
+          console.warn("⚠️ [GATEWAY AUTO] Direct OpenAI retry notice:", fErr.message);
         }
       }
     }
@@ -1021,9 +1081,13 @@ class AIGateway {
       success: streamedSuccessfully && accumulatedResponseText.trim().length > 0,
       text: accumulatedResponseText,
       errorMessage,
+      userFriendlyMessage: sanitizeUserFacingError(errorMessage),
       ttft,
       totalDurationMs,
       nodeId: selectedNode ? selectedNode.id : "unknown",
+      nodeName: selectedNode ? selectedNode.name : "",
+      model: selectedModel || (selectedNode && selectedNode.defaultModel) || "auto",
+      provider: selectedNode ? (selectedNode.format || "ollama") : "auto",
       promptTokens,
       completionTokens,
       totalTokens: promptTokens + completionTokens
@@ -1156,7 +1220,15 @@ class AIGateway {
       throw new Error("No Gemini API key found. Please add a Gemini Server Node with a valid API key in the Admin Dashboard.");
     }
 
-    const candidateModels = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const requestedModel = (model && model !== "best" && model !== "auto") ? model : "gemini-3.5-flash-lite";
+    const primaryModel = requestedModel === "gemini-2.5-flash" ? "gemini-3.5-flash-lite" : requestedModel;
+    const candidateModels = Array.from(new Set([
+      primaryModel,
+      "gemini-3.5-flash-lite",
+      "gemini-3.1-flash-lite",
+      "gemini-flash-lite-latest",
+      "gemini-flash-latest"
+    ])).filter(Boolean);
     const { GoogleGenAI } = require("@google/genai");
 
     for (const gKey of candidateApiKeys) {
@@ -1171,6 +1243,7 @@ class AIGateway {
       let keySucceeded = false;
 
       for (const gModel of candidateModels) {
+        const geminiStartTime = performance.now();
         try {
           const sysMsg = messages.find(m => m.role === "system")?.content || "";
           const userMsgs = messages.filter(m => m.role !== "system");
@@ -1227,7 +1300,10 @@ class AIGateway {
           const responseStream = await ai.models.generateContentStream({
             model: gModel,
             contents: contentsPayload,
-            config: sysMsg ? { systemInstruction: sysMsg } : undefined
+            config: {
+              ...(sysMsg ? { systemInstruction: sysMsg } : {}),
+              ...(gModel.includes("lite") ? {} : { thinkingConfig: { thinkingBudget: 0 } })
+            }
           });
 
           for await (const chunk of responseStream) {
@@ -1427,10 +1503,26 @@ class ActionStreamBuffer {
     this.cleanText = "";
     this.extractedMeta = [];
     this.firstTokenFired = false;
+    this.inThinkBlock = false;
   }
 
   push(chunkText) {
     if (!chunkText) return;
+
+    // Filter out <think> ... </think> reasoning tags if emitted in content
+    if (chunkText.includes("<think>")) {
+      this.inThinkBlock = true;
+      chunkText = chunkText.replace(/<think>[\s\S]*?(<\/think>|$)/, "");
+    } else if (this.inThinkBlock) {
+      if (chunkText.includes("</think>")) {
+        this.inThinkBlock = false;
+        chunkText = chunkText.replace(/[\s\S]*?<\/think>/, "");
+      } else {
+        return; // Suppress reasoning tokens inside <think>
+      }
+    }
+    if (!chunkText) return;
+
     const sanitizedChunk = this._sanitizeVendorBranding(chunkText);
     this.cleanText += sanitizedChunk;
 
@@ -1468,7 +1560,7 @@ const MODEL_PRICING_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
 
 async function getModelPricingCached(modelId) {
   if (!modelId || modelId === "auto" || modelId === "best") {
-    return { promptTokenCostPer1k: 0.05, completionTokenCostPer1k: 0.1, displayName: "Auto Model", provider: "auto", modelId: "auto" };
+    return { promptTokenCostPer1k: 0.05, completionTokenCostPer1k: 0.1, displayName: "Auto", provider: "auto", modelId: "auto" };
   }
   const cached = modelPricingCache.get(modelId);
   if (cached && (Date.now() - cached.cachedAt < MODEL_PRICING_TTL_MS)) {
@@ -1505,6 +1597,8 @@ function invalidateModelPricingCache(modelId = null) {
 const gatewayInstance = new AIGateway();
 gatewayInstance.getModelPricingCached = getModelPricingCached;
 gatewayInstance.invalidateModelPricingCache = invalidateModelPricingCache;
+gatewayInstance.sanitizeUserFacingError = sanitizeUserFacingError;
 
 module.exports = gatewayInstance;
+module.exports.sanitizeUserFacingError = sanitizeUserFacingError;
 

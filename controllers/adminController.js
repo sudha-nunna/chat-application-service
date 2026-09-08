@@ -341,6 +341,7 @@ async function ensureModelsInCatalog(modelsList, provider) {
           creditCost: isHeavy ? 3 : (isFast ? 1 : 2),
           contextLength: "128k",
           enabled: true,
+          isUserVisible: true,
           recommended: false,
           fallbackModels: []
         });

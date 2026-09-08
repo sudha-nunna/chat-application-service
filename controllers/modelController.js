@@ -55,9 +55,25 @@ exports.getAvailableModels = async (req, res) => {
       status: { $nin: ["INACTIVE", "OFFLINE"] }
     }).sort({ priority: -1, createdAt: 1 }).lean();
 
+    const activeServers = activeNodes.map(node => ({
+      id: String(node._id),
+      name: node.name,
+      format: node.format || "ollama",
+      status: node.status,
+      defaultModel: node.defaultModel,
+      modelsCount: (node.supportedModels || []).length
+    }));
+
     // Fetch disabled model IDs from AIModel catalog to exclude them from chat availability
     const disabledDocs = await AIModel.find({ enabled: false }, { modelId: 1 }).lean();
     const disabledModelIds = new Set(disabledDocs.map((m) => (m.modelId || "").toLowerCase().trim()));
+
+    // Fetch custom display names and pricing from AIModel collection in MongoDB
+    const aiModelDocs = await AIModel.find({}).lean();
+    const aiModelMap = new Map();
+    aiModelDocs.forEach(m => {
+      if (m.modelId) aiModelMap.set(m.modelId.toLowerCase().trim(), m);
+    });
 
     const activeModelList = [];
     const seenModelKeys = new Set();
@@ -90,32 +106,47 @@ exports.getAvailableModels = async (req, res) => {
 
       nodeModelIds.forEach(mId => {
         if (disabledModelIds.has(mId.toLowerCase().trim())) {
-          // Exclude models manually disabled by admin in AI Catalog
           return;
         }
 
         const key = `${node._id}_${mId.toLowerCase()}`;
         if (!seenModelKeys.has(key)) {
           seenModelKeys.add(key);
-          const pricing = deduceTierAndPricing(mId);
+
+          const dbModel = aiModelMap.get(mId.toLowerCase().trim());
+
+          // User View Filter: If an admin explicitly toggles off 'isUserVisible',
+          // hide it from the chat dropdown while keeping it active in backend AI routing!
+          const isVisibleToUser = dbModel ? dbModel.isUserVisible !== false : true;
+          if (!isVisibleToUser) {
+            return;
+          }
+
+          const defaultTierPricing = deduceTierAndPricing(mId);
+
+          const displayName = dbModel?.displayName || formatDisplayName(mId);
+          const tier = dbModel?.tier || defaultTierPricing.tier;
+          const promptTokenCostPer1k = dbModel?.promptTokenCostPer1k ?? defaultTierPricing.promptTokenCostPer1k;
+          const completionTokenCostPer1k = dbModel?.completionTokenCostPer1k ?? defaultTierPricing.completionTokenCostPer1k;
+          const creditCost = dbModel?.creditCost ?? dbModel?.minCreditCost ?? defaultTierPricing.minCreditCost;
 
           activeModelList.push({
             modelId: mId,
-            displayName: formatDisplayName(mId),
-            provider: serverFormat,
+            displayName,
+            provider: node.format || "ollama",
             serverName: serverName,
             serverId: String(node._id),
             serverFormat: serverFormat,
             modelsCount: totalModelsOnNode,
-            tier: pricing.tier,
-            promptTokenCostPer1k: pricing.promptTokenCostPer1k,
-            completionTokenCostPer1k: pricing.completionTokenCostPer1k,
-            creditCost: pricing.minCreditCost,
-            minCreditCost: pricing.minCreditCost,
+            tier,
+            promptTokenCostPer1k,
+            completionTokenCostPer1k,
+            creditCost,
+            minCreditCost: creditCost,
             enabled: true,
-            recommended: mId.toLowerCase() === (node.defaultModel || "").toLowerCase(),
+            recommended: mId.toLowerCase() === (node.defaultModel || "").toLowerCase() || Boolean(dbModel?.recommended),
             isOnline: true,
-            description: `Hosted on active server: ${serverName}`
+            description: dbModel?.description || `Hosted on active server: ${serverName}`
           });
         }
       });
@@ -128,9 +159,34 @@ exports.getAvailableModels = async (req, res) => {
       return (a.promptTokenCostPer1k || 0.1) - (b.promptTokenCostPer1k || 0.1);
     });
 
+    const activeServerNames = activeServers.map(s => s.name).join(", ");
+    // Always provide "Auto" as the very first entry
+    const clusterAutoEntry = {
+      modelId: "auto",
+      displayName: "Auto",
+      provider: "auto",
+      serverName: "Auto",
+      serverId: "cluster_auto",
+      serverFormat: "auto",
+      modelsCount: activeModelList.length,
+      tier: "FAST",
+      promptTokenCostPer1k: 0.05,
+      completionTokenCostPer1k: 0.1,
+      creditCost: 0.5,
+      minCreditCost: 0.5,
+      enabled: true,
+      recommended: true,
+      isOnline: true,
+      isCluster: true,
+      description: `Smart auto-route across all active servers (${activeServerNames || "All Active Servers"})`
+    };
+
+    activeModelList.unshift(clusterAutoEntry);
+
     return res.json({
       success: true,
       total: activeModelList.length,
+      servers: activeServers,
       models: activeModelList
     });
   } catch (error) {
@@ -210,6 +266,7 @@ exports.createModel = async (req, res) => {
       maxTokenLimit,
       contextLength,
       enabled,
+      isUserVisible,
       recommended,
       fallbackModels,
       description
@@ -250,6 +307,7 @@ exports.createModel = async (req, res) => {
       maxTokenLimit: maxTokenLimit !== undefined ? Math.max(128, Number(maxTokenLimit)) : 4096,
       contextLength: contextLength || "128k",
       enabled: enabled !== undefined ? enabled : true,
+      isUserVisible: isUserVisible !== undefined ? isUserVisible : true,
       recommended: recommended !== undefined ? recommended : false,
       fallbackModels: Array.isArray(fallbackModels) ? fallbackModels : [],
       description: description ? description.trim() : ""

@@ -101,32 +101,45 @@ function preemptLowerPriorityJob(incomingPriority, clusterState) {
  */
 function selectBestClusterNodeWithPreemption(userPriority, clusterState, isFailover = false) {
   const reqPriority = Number(userPriority) || 10;
+  const nodes = Array.isArray(clusterState) ? clusterState : [];
 
-  // 1. Check for completely idle healthy node
-  const idleNode = clusterState.find(n => n.status.startsWith("HEALTHY") && n.activeRequests === 0);
-  if (idleNode) {
-    return idleNode;
+  // Filter only active, healthy nodes
+  const activeNodes = nodes.filter(n => n.isActive !== false && n.status === "ACTIVE");
+
+  if (activeNodes.length === 0) {
+    return nodes[0] || null;
   }
 
-  // 2. If server nodes are busy and NOT in failover mode, attempt preemption of lower-priority jobs
+  // 1. Check for idle active node with highest priorityScore
+  const idleNodes = activeNodes.filter(n => n.activeRequests === 0);
+  if (idleNodes.length > 0) {
+    idleNodes.sort((a, b) => {
+      const pA = typeof a.priorityScore === "number" ? a.priorityScore : (a.priority || 10);
+      const pB = typeof b.priorityScore === "number" ? b.priorityScore : (b.priority || 10);
+      if (pB !== pA) return pB - pA;
+      return (a.latency || 0) - (b.latency || 0);
+    });
+    return idleNodes[0];
+  }
+
+  // 2. Preemption of lower-priority jobs if all are busy
   if (!isFailover) {
-    const preemptedVictim = preemptLowerPriorityJob(reqPriority, clusterState);
+    const preemptedVictim = preemptLowerPriorityJob(reqPriority, activeNodes);
     if (preemptedVictim) {
-      const freedNode = clusterState.find(n => n.id === preemptedVictim.nodeId && !n.status.startsWith("OFFLINE"));
-      if (freedNode) {
-        return freedNode;
-      }
+      const freedNode = activeNodes.find(n => n.id === preemptedVictim.nodeId);
+      if (freedNode) return freedNode;
     }
   }
 
-  // 3. Fallback: Select healthy node with lowest active task count
-  const healthyNodes = clusterState.filter(n => !n.status.startsWith("OFFLINE"));
-  if (healthyNodes.length > 0) {
-    healthyNodes.sort((a, b) => a.activeRequests - b.activeRequests);
-    return healthyNodes[0];
-  }
+  // 3. Fallback: Select active node with lowest active task count & highest priority
+  activeNodes.sort((a, b) => {
+    if (a.activeRequests !== b.activeRequests) return a.activeRequests - b.activeRequests;
+    const pA = typeof a.priorityScore === "number" ? a.priorityScore : (a.priority || 10);
+    const pB = typeof b.priorityScore === "number" ? b.priorityScore : (b.priority || 10);
+    return pB - pA;
+  });
 
-  return clusterState[0];
+  return activeNodes[0];
 }
 
 module.exports = {

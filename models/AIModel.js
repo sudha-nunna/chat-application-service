@@ -61,6 +61,11 @@ const aiModelSchema = new mongoose.Schema(
       default: true,
       index: true
     },
+    isUserVisible: {
+      type: Boolean,
+      default: true,
+      index: true
+    },
     recommended: {
       type: Boolean,
       default: false

@@ -14,7 +14,7 @@ const ServerNodeSchema = new mongoose.Schema(
     },
     defaultModel: {
       type: String,
-      default: "llama3.2:3b",
+      default: "",
       trim: true
     },
     supportedModels: {

@@ -15,7 +15,7 @@ let clusterState = [];
 let healthCheckTimer = null;
 let isHealthCheckExecuting = false;
 let lastNodesRefreshTime = 0;
-const NODES_CACHE_TTL_MS = 15 * 1000; // 15 seconds in-memory cache
+const NODES_CACHE_TTL_MS = 3 * 1000; // 3 seconds in-memory cache for fast active server switching
 
 /**
  * Fetches active AI server nodes strictly from MongoDB (ServerNode collection).
@@ -44,7 +44,36 @@ async function refreshClusterNodesFromDB(force = false) {
         }
         let nodeUrl = n.url.trim().replace(/\/$/, "");
         let nodeFormat = (n.format || "openai").toLowerCase();
-        let defaultModel = n.defaultModel || "llama3.2:3b";
+        let defaultModel = n.defaultModel;
+        // Only strip :cloud suffix for strictly local Ollama nodes (localhost/127.0.0.1).
+        // Cloud-hosted Ollama (ollama.com) and Codegene proxy both use :cloud models as valid identifiers.
+        const isLocalOllamaNode = nodeUrl.includes("127.0.0.1") || nodeUrl.includes("localhost") || nodeUrl.includes("0.0.0.0");
+        if (defaultModel && isLocalOllamaNode) {
+          defaultModel = defaultModel.replace(/:cloud$/, "");
+        }
+        const isGeminiNodeEarly = nodeUrl.includes("googleapis.com") || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
+        if (!isGeminiNodeEarly) {
+          // For non-Gemini (e.g. Ollama/GLM) nodes:
+          const badDefaultModels = ["llama3.2:3b", "llama3.2", "llama3:8b", "llama3", "qwen2.5:1.5b"];
+          if (!defaultModel || badDefaultModels.includes(defaultModel) || defaultModel.includes("gemini")) {
+            const preferred = Array.isArray(n.supportedModels)
+              ? (n.supportedModels.find(m => !m.toLowerCase().includes("gemini") && !badDefaultModels.includes(m)) || n.supportedModels[0])
+              : "glm-5.3-flash";
+            defaultModel = preferred || "glm-5.3-flash";
+            ServerNode.findByIdAndUpdate(n._id, { defaultModel }).catch(() => {});
+          } else if (Array.isArray(n.supportedModels) && n.supportedModels.length > 0) {
+            // Check if defaultModel matches any supported model (with or without :cloud suffix)
+            const defaultModelBase = defaultModel.replace(/:cloud$/, "");
+            const matched = n.supportedModels.find(m =>
+              m.toLowerCase() === defaultModel.toLowerCase() ||
+              m.replace(/:cloud$/, "").toLowerCase() === defaultModelBase.toLowerCase()
+            );
+            if (!matched) {
+              defaultModel = n.supportedModels.find(m => !m.toLowerCase().includes("gemini")) || n.supportedModels[0];
+              ServerNode.findByIdAndUpdate(n._id, { defaultModel }).catch(() => {});
+            }
+          }
+        }
 
         // Auto-fix Gemini node properties ONLY if URL or key strictly indicates Google Gemini
         const isGeminiNode = nodeUrl.includes("googleapis.com") || rawSecretKey.startsWith("AQ.Ab") || rawSecretKey.startsWith("AIzaSy");
@@ -54,8 +83,8 @@ async function refreshClusterNodesFromDB(force = false) {
           if (!nodeUrl || (!nodeUrl.includes("googleapis.com") && !nodeUrl.includes("openai.com"))) {
             nodeUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
           }
-          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-flash-latest" || defaultModel === "gemini-2.0-flash" || defaultModel === "gemini-3.6-flash") {
-            defaultModel = "gemini-2.5-flash";
+          if (!defaultModel || defaultModel === "llama3.2:3b" || defaultModel === "gemini-2.5-flash" || defaultModel === "gemini-3.6-flash") {
+            defaultModel = "gemini-3.5-flash-lite";
           }
           if (n.format !== "gemini" || n.defaultModel !== defaultModel) {
             ServerNode.findByIdAndUpdate(n._id, { format: "gemini", defaultModel }).catch(() => { });
@@ -101,6 +130,7 @@ async function refreshClusterNodesFromDB(force = false) {
           status: nodeStatus,
           priority: priorityScore,
           priorityScore: priorityScore,
+          supportedModels: Array.isArray(n.supportedModels) ? n.supportedModels : [],
           activeRequests: activeMap.get(String(n._id)) || 0,
           successRequests: (n.successRequests || 0) + (successMap.get(String(n._id)) || 0),
           failedRequests: (n.failedRequests || 0) + (failedMap.get(String(n._id)) || 0),
@@ -178,9 +208,9 @@ async function checkClusterHealth() {
         console.log(`  ├── 🔄 Node ${node.name} retryAfter period expired. Testing node recovery...`);
       }
 
-      // On-Demand Failover Strategy: Skip background pings for Cloud API nodes (Gemini/OpenAI/GLM)
-      // to preserve 100% of API rate-limit quota for real user chat requests!
-      const isCloudNode = node.format === "gemini" || node.format === "glm" || (node.format === "openai" && node.url.includes("openai.com")) || node.url.includes("googleapis.com") || node.url.includes("nvidia.com");
+      // On-Demand Failover Strategy: Skip background pings for Cloud API nodes (Gemini/OpenAI/GLM/Ollama.com)
+      // to preserve 100% of API quota and avoid false-positive timeout failures for cloud endpoints!
+      const isCloudNode = node.format === "gemini" || node.format === "glm" || node.url.includes("ollama.com") || node.url.includes("codegene") || (node.format === "openai" && node.url.includes("openai.com")) || node.url.includes("googleapis.com") || node.url.includes("nvidia.com");
       if (isCloudNode) {
         if (node.status !== "RATE_LIMITED" || (node.retryAfter && new Date(node.retryAfter) <= now)) {
           node.status = "ACTIVE";

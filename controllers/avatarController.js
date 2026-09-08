@@ -278,6 +278,10 @@ Answer the user's prompt or question directly in 1 to 2 short, concise sentences
       }
     }
 
+    if (!responseText || !responseText.trim()) {
+      responseText = gatewayResult?.userFriendlyMessage || (aiGateway.sanitizeUserFacingError ? aiGateway.sanitizeUserFacingError(gatewayResult?.errorMessage) : "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.");
+    }
+
     // Clean formatting tags while preserving full complete responses
     if (responseText) {
       let cleanText = responseText

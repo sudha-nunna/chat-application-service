@@ -1569,7 +1569,7 @@ exports.sendBotChatMessage = async (req, res) => {
       if (!ragResult.isFound) {
         accumulatedResponseText = "I couldn't find information about that in the uploaded knowledge base.";
       } else {
-        accumulatedResponseText = "I encountered an issue generating a response. Please check that Ollama is running locally.";
+        accumulatedResponseText = gatewayResult.userFriendlyMessage || (aiGateway.sanitizeUserFacingError ? aiGateway.sanitizeUserFacingError(gatewayResult.errorMessage) : "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.");
       }
       if (isStreamRequested) {
         await streamTextInChunks(res, accumulatedResponseText, 15);
