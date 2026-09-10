@@ -50,8 +50,12 @@ function deduceTierAndPricing(modelId = "") {
  */
 exports.getAvailableModels = async (req, res) => {
   try {
+    // Only server nodes where isUserVisible is true (isUserVisible !== false) expose models to end-users.
+    // If a server is in Router Only mode (isUserVisible === false), its models are NOT shown in the user model switcher,
+    // but the server remains active in the backend node pool & smart AI routing.
     const activeNodes = await ServerNode.find({
       isActive: true,
+      isUserVisible: { $ne: false },
       status: { $nin: ["INACTIVE", "OFFLINE"] }
     }).sort({ priority: -1, createdAt: 1 }).lean();
 
@@ -105,26 +109,30 @@ exports.getAvailableModels = async (req, res) => {
       const totalModelsOnNode = nodeModelIds.size;
 
       nodeModelIds.forEach(mId => {
-        if (disabledModelIds.has(mId.toLowerCase().trim())) {
+        const cleanId = mId.toLowerCase().trim();
+        if (disabledModelIds.has(cleanId)) {
           return;
         }
 
-        const key = `${node._id}_${mId.toLowerCase()}`;
+        const key = `${node._id}_${cleanId}`;
         if (!seenModelKeys.has(key)) {
           seenModelKeys.add(key);
 
-          const dbModel = aiModelMap.get(mId.toLowerCase().trim());
+          const dbModel = aiModelMap.get(cleanId);
 
-          // User View Filter: If an admin explicitly toggles off 'isUserVisible',
-          // hide it from the chat dropdown while keeping it active in backend AI routing!
-          const isVisibleToUser = dbModel ? dbModel.isUserVisible !== false : true;
-          if (!isVisibleToUser) {
+          // Senior Developer Quality Assurance:
+          // If the AIModel catalog is configured in the DB, only surface models that are
+          // explicitly registered, enabled, and allowed for user visibility in the Admin Catalog.
+          if (aiModelDocs.length > 0 && !dbModel) {
+            return;
+          }
+          if (dbModel && (dbModel.enabled === false || dbModel.isUserVisible === false)) {
             return;
           }
 
-          const defaultTierPricing = deduceTierAndPricing(mId);
+          const defaultTierPricing = deduceTierAndPricing(cleanId);
 
-          const displayName = dbModel?.displayName || formatDisplayName(mId);
+          const displayName = dbModel?.displayName || formatDisplayName(cleanId);
           const tier = dbModel?.tier || defaultTierPricing.tier;
           const promptTokenCostPer1k = dbModel?.promptTokenCostPer1k ?? defaultTierPricing.promptTokenCostPer1k;
           const completionTokenCostPer1k = dbModel?.completionTokenCostPer1k ?? defaultTierPricing.completionTokenCostPer1k;
@@ -144,12 +152,17 @@ exports.getAvailableModels = async (req, res) => {
             creditCost,
             minCreditCost: creditCost,
             enabled: true,
-            recommended: mId.toLowerCase() === (node.defaultModel || "").toLowerCase() || Boolean(dbModel?.recommended),
+            recommended: cleanId === (node.defaultModel || "").toLowerCase().trim() || Boolean(dbModel?.recommended),
             isOnline: true,
             description: dbModel?.description || `Hosted on active server: ${serverName}`
           });
         }
       });
+    });
+
+    // Update activeServers modelsCount to accurately reflect verified active models
+    activeServers.forEach(srv => {
+      srv.modelsCount = activeModelList.filter(m => m.serverId === srv.id && m.modelId !== "auto").length;
     });
 
     // Sort: Recommended first -> Low cost
@@ -207,14 +220,23 @@ exports.getAllModelsAdmin = async (req, res) => {
 
     const activeFormats = new Set(activeNodes.map((n) => (n.format || "openai").toLowerCase()));
     const activeModelIds = new Set();
+    const userVisibleNodes = activeNodes.filter(n => n.isUserVisible !== false);
+    const userVisibleFormats = new Set(userVisibleNodes.map((n) => (n.format || "openai").toLowerCase()));
+    const userVisibleModelIds = new Set();
+
     activeNodes.forEach((n) => {
+      const isNodeUserVisible = n.isUserVisible !== false;
       if (n.defaultModel && n.defaultModel.trim()) {
-        activeModelIds.add(n.defaultModel.trim().toLowerCase());
+        const dId = n.defaultModel.trim().toLowerCase();
+        activeModelIds.add(dId);
+        if (isNodeUserVisible) userVisibleModelIds.add(dId);
       }
       if (Array.isArray(n.supportedModels)) {
         n.supportedModels.forEach((m) => {
           if (m && typeof m === "string" && m.trim()) {
-            activeModelIds.add(m.trim().toLowerCase());
+            const mId = m.trim().toLowerCase();
+            activeModelIds.add(mId);
+            if (isNodeUserVisible) userVisibleModelIds.add(mId);
           }
         });
       }
@@ -230,16 +252,21 @@ exports.getAllModelsAdmin = async (req, res) => {
       // For Ollama/local nodes: must be explicitly in activeModelIds list of active Ollama nodes
       // For Cloud nodes (Gemini, OpenAI, GLM): node format must be active OR modelId explicitly supported
       let isNodeActive = false;
+      let isServerUserVisible = false;
       if (providerLower === "ollama") {
         isNodeActive = activeModelIds.has(modelIdLower);
+        isServerUserVisible = userVisibleModelIds.has(modelIdLower);
       } else {
         isNodeActive = activeFormats.has(providerLower) || activeModelIds.has(modelIdLower);
+        isServerUserVisible = userVisibleFormats.has(providerLower) || userVisibleModelIds.has(modelIdLower);
       }
 
       return {
         ...m,
         isNodeActive,
-        effectiveEnabled: m.enabled !== false && isNodeActive
+        isServerUserVisible,
+        effectiveEnabled: m.enabled !== false && isNodeActive,
+        effectiveUserVisible: m.enabled !== false && m.isUserVisible !== false && isNodeActive && isServerUserVisible
       };
     });
 

@@ -27,7 +27,7 @@ router.post("/:id/chat", agentStudioController.executeFlowTurn);
 
 // Custom Voice Upload & Recording for F5-TTS
 const multer = require("multer");
-const voiceUpload = multer({ limits: { fileSize: 15 * 1024 * 1024 } });
+const voiceUpload = multer({ limits: { fileSize: 5 * 1024 * 1024, files: 1 } });
 router.post("/voice/upload", voiceUpload.single("audio"), agentStudioController.uploadCustomVoiceSample);
 router.post("/voice/preview", agentStudioController.previewVoiceSpeech);
 

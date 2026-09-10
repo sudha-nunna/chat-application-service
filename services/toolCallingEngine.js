@@ -95,6 +95,41 @@ const executeToolApi = async (botApi, extractedParams = {}) => {
     options.body = JSON.stringify(extractedParams);
   }
 
+  // SSRF Protection: Block internal, loopback, and cloud metadata addresses
+  try {
+    const urlObj = new URL(targetUrl);
+    const hostname = urlObj.hostname.toLowerCase();
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "::1" ||
+      hostname === "0.0.0.0" ||
+      hostname.startsWith("169.254.") ||
+      hostname.startsWith("10.") ||
+      hostname.startsWith("192.168.") ||
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(hostname) ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal");
+
+    if (isLocal) {
+      return {
+        success: false,
+        error: "Access to internal network addresses is blocked for security (SSRF prevention).",
+        endpoint: targetUrl,
+        method: options.method,
+        apiName: botApi.name,
+      };
+    }
+  } catch (urlErr) {
+    return {
+      success: false,
+      error: `Invalid API URL: ${urlErr.message}`,
+      endpoint: targetUrl,
+      method: options.method,
+      apiName: botApi.name,
+    };
+  }
+
   try {
     const response = await fetch(targetUrl, options);
     let responseData;

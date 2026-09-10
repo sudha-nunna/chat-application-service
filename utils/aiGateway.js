@@ -517,7 +517,8 @@ class AIGateway {
         poolCandidates.forEach(n => {
           n.status = "ACTIVE";
           if (n.id && n.id.length === 24) {
-            ServerNode.findByIdAndUpdate(n.id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null }).catch(() => { });
+            ServerNode.findByIdAndUpdate(n.id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null })
+              .catch(err => console.error("Notice: ServerNode status recovery failed:", err.message || err));
           }
         });
       }
@@ -930,7 +931,7 @@ class AIGateway {
                       consecutiveFailures: 0,
                       defaultModel: candidateModel,
                       lastUsedAt: new Date()
-                    }).catch(() => { });
+                    }).catch(err => console.error("Notice: ServerNode update failed:", err.message || err));
                   }
 
                   break; // Successful token streaming! Exit candidate model loop
@@ -963,7 +964,7 @@ class AIGateway {
                     status: "RATE_LIMITED",
                     retryAfter: currentNode.retryAfter,
                     errorMessage: "Session rate limit exceeded (HTTP 429)"
-                  }).catch(() => {});
+                  }).catch(err => console.error("Notice: ServerNode rate limit update failed:", err.message || err));
                 }
                 break;
               } else if (response.status === 400 && errorBody.includes("does not support image input")) {
@@ -989,7 +990,7 @@ class AIGateway {
                   ServerNode.findByIdAndUpdate(currentNode.id, {
                     supportedModels: updatedSupported,
                     defaultModel: newDefault
-                  }).catch(() => {});
+                  }).catch(err => console.error("Notice: ServerNode model purge update failed:", err.message || err));
                   console.warn(`  🗑️ [MODEL PURGED] Removed '${candidateModel}' from node '${currentNode.name}'. New defaultModel: ${currentNode.defaultModel}`);
                 }
               } else {
@@ -1022,7 +1023,7 @@ class AIGateway {
               status: currentNode.status,
               retryAfter: currentNode.retryAfter,
               errorMessage
-            }).catch(() => { });
+            }).catch(err => console.error("Notice: ServerNode failure count update failed:", err.message || err));
           }
           currentNode.activeRequests = Math.max(0, currentNode.activeRequests - 1);
         }

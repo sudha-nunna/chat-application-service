@@ -60,7 +60,7 @@ async function refreshClusterNodesFromDB(force = false) {
               ? (n.supportedModels.find(m => !m.toLowerCase().includes("gemini") && !badDefaultModels.includes(m)) || n.supportedModels[0])
               : "glm-5.3-flash";
             defaultModel = preferred || "glm-5.3-flash";
-            ServerNode.findByIdAndUpdate(n._id, { defaultModel }).catch(() => {});
+            ServerNode.findByIdAndUpdate(n._id, { defaultModel }).catch(err => console.error("Notice: ServerNode defaultModel update failed:", err.message || err));
           } else if (Array.isArray(n.supportedModels) && n.supportedModels.length > 0) {
             // Check if defaultModel matches any supported model (with or without :cloud suffix)
             const defaultModelBase = defaultModel.replace(/:cloud$/, "");
@@ -70,7 +70,7 @@ async function refreshClusterNodesFromDB(force = false) {
             );
             if (!matched) {
               defaultModel = n.supportedModels.find(m => !m.toLowerCase().includes("gemini")) || n.supportedModels[0];
-              ServerNode.findByIdAndUpdate(n._id, { defaultModel }).catch(() => {});
+              ServerNode.findByIdAndUpdate(n._id, { defaultModel }).catch(err => console.error("Notice: ServerNode fallback model update failed:", err.message || err));
             }
           }
         }
@@ -87,7 +87,7 @@ async function refreshClusterNodesFromDB(force = false) {
             defaultModel = "gemini-3.5-flash-lite";
           }
           if (n.format !== "gemini" || n.defaultModel !== defaultModel) {
-            ServerNode.findByIdAndUpdate(n._id, { format: "gemini", defaultModel }).catch(() => { });
+            ServerNode.findByIdAndUpdate(n._id, { format: "gemini", defaultModel }).catch(err => console.error("Notice: ServerNode gemini config update failed:", err.message || err));
           }
         }
 
@@ -103,7 +103,7 @@ async function refreshClusterNodesFromDB(force = false) {
             defaultModel = "zhipuai/glm-4-flash";
           }
           if (n.format !== "glm" || n.defaultModel !== defaultModel) {
-            ServerNode.findByIdAndUpdate(n._id, { format: "glm", defaultModel }).catch(() => { });
+            ServerNode.findByIdAndUpdate(n._id, { format: "glm", defaultModel }).catch(err => console.error("Notice: ServerNode glm config update failed:", err.message || err));
           }
         }
 
@@ -115,7 +115,8 @@ async function refreshClusterNodesFromDB(force = false) {
         if (nodeStatus === "RATE_LIMITED") {
           if (!n.retryAfter || new Date(n.retryAfter) <= new Date()) {
             nodeStatus = "ACTIVE";
-            ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" }).catch(() => {});
+            ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" })
+              .catch(err => console.error("Notice: ServerNode status reset failed:", err.message || err));
             console.log(`  ✅ [RATE_LIMIT RECOVERED] Node ${n.name} retryAfter expired — restored to ACTIVE.`);
           }
         }

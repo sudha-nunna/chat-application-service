@@ -56,23 +56,27 @@ exports.purchaseCredits = async (req, res) => {
       });
     }
 
-    const user = await User.findById(userId);
-    if (!user) {
+    const creditsToAdd = dbPlan.creditsGranted || 100;
+
+    // Update user balance & paid status atomically to prevent race condition overwrites
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      {
+        $inc: { credits: creditsToAdd, totalCreditsPurchased: creditsToAdd },
+        $set: { isPaidUser: true }
+      },
+      { new: true }
+    );
+
+    if (!updatedUser) {
       return res.status(404).json({ success: false, message: "User account not found." });
     }
 
-    const creditsToAdd = dbPlan.creditsGranted || 100;
-    const newBalance = parseFloat(((user.credits || 0) + creditsToAdd).toFixed(4));
-
-    // Update user balance & paid status
-    user.credits = newBalance;
-    user.isPaidUser = true;
-    user.totalCreditsPurchased = (user.totalCreditsPurchased || 0) + creditsToAdd;
-    await user.save();
+    const newBalance = updatedUser.credits;
 
     // Record credit transaction
     const tx = await CreditTransaction.create({
-      userId: user._id,
+      userId: updatedUser._id,
       amount: creditsToAdd,
       type: "purchase",
       description: `Purchased ${dbPlan.name} (+${creditsToAdd.toLocaleString()} credits)`,
@@ -84,7 +88,7 @@ exports.purchaseCredits = async (req, res) => {
       message: `Successfully added ${creditsToAdd.toLocaleString()} credits to your wallet!`,
       data: {
         creditsAdded: creditsToAdd,
-        newBalance: user.credits,
+        newBalance: updatedUser.credits,
         isPaidUser: true,
         transactionId: tx._id
       }

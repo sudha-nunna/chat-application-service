@@ -7,10 +7,70 @@ const botController = require("../controllers/botController");
 const avatarController = require("../controllers/avatarController");
 
 const multer = require("multer");
+
+/**
+ * MIME type allowlist for bot file uploads.
+ * Only explicitly whitelisted types are accepted.
+ * Prevents upload of executables, scripts, or other dangerous file types.
+ */
+const ALLOWED_MIME_TYPES = new Set([
+  // Images (avatar)
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/svg+xml",
+  // Audio (voice samples, TTS references)
+  "audio/wav",
+  "audio/wave",
+  "audio/x-wav",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/mp4",
+  "audio/ogg",
+  "audio/webm",
+  "audio/aac",
+  "audio/flac",
+  "audio/x-m4a",
+  // Documents (knowledge base)
+  "application/pdf",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+  "application/octet-stream" // Fallback for some browser/OS combinations
+]);
+
+function mimeTypeFilter(req, file, cb) {
+  if (ALLOWED_MIME_TYPES.has(file.mimetype)) {
+    cb(null, true);
+  } else {
+    const err = new multer.MulterError("LIMIT_UNEXPECTED_FILE", file.fieldname);
+    err.message = `File type "${file.mimetype}" is not allowed. Accepted types: images, audio, PDF, and plain text.`;
+    cb(err, false);
+  }
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }
+  fileFilter: mimeTypeFilter,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB per file (covers high-quality voice samples & avatars)
+    files: 2,                   // Max 2 files per request
+    fields: 20
+  }
 });
+
+const uploadFieldsHandler = upload.fields([
+  { name: "avatar", maxCount: 1 },
+  { name: "document", maxCount: 1 },
+  { name: "audio", maxCount: 1 },
+  { name: "audioFile", maxCount: 1 },
+  { name: "file", maxCount: 1 },
+  { name: "voice", maxCount: 1 },
+  { name: "image", maxCount: 1 }
+]);
 
 const optionalAuth = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -30,9 +90,10 @@ const optionalAuth = (req, res, next) => {
 };
 
 const handleMulterFields = (req, res, next) => {
-  upload.any()(req, res, (err) => {
+  uploadFieldsHandler(req, res, (err) => {
     if (err) {
       console.warn("Multer upload notice:", err.message);
+      return res.status(400).json({ success: false, error: `Upload error: ${err.message}` });
     }
     next();
   });

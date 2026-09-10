@@ -147,6 +147,31 @@ const botSchema = new mongoose.Schema(
     },
     keyLastUsedAt: {
       type: Date
+    },
+
+    avatarEmoji: {
+      type: String,
+      default: "🤖"
+    },
+    avatarColor: {
+      type: String,
+      default: "from-blue-500 to-indigo-600"
+    },
+    maxChunksPerQuery: {
+      type: Number,
+      default: 3
+    },
+
+    /**
+     * isPublicDemo — When true, this bot is publicly accessible without any API key or JWT.
+     * Use this ONLY for controlled demo/showcase bots.
+     * Default: false (all bots require authentication).
+     * Set via admin dashboard or direct DB update.
+     */
+    isPublicDemo: {
+      type: Boolean,
+      default: false,
+      index: true
     }
   },
   {

@@ -137,8 +137,39 @@ class BoundedMap {
 const embeddingCache = new BoundedMap(500);
 
 /**
+ * Concurrency semaphore for embedding API calls.
+ * Prevents socket exhaustion by limiting simultaneous Ollama embedding requests.
+ * Max concurrency = 4 — balances throughput vs. provider rate limits.
+ */
+const EMBED_CONCURRENCY_LIMIT = parseInt(process.env.EMBED_CONCURRENCY || "4", 10);
+let embeddingActiveCount = 0;
+const embeddingQueue = [];
+
+function acquireEmbeddingSlot() {
+  return new Promise((resolve) => {
+    if (embeddingActiveCount < EMBED_CONCURRENCY_LIMIT) {
+      embeddingActiveCount++;
+      resolve();
+    } else {
+      embeddingQueue.push(resolve);
+    }
+  });
+}
+
+function releaseEmbeddingSlot() {
+  if (embeddingQueue.length > 0) {
+    const next = embeddingQueue.shift();
+    next(); // Give the slot to the next waiter
+  } else {
+    embeddingActiveCount = Math.max(0, embeddingActiveCount - 1);
+  }
+}
+
+/**
  * Generates high-density semantic vector embeddings via Ollama nomic-embed-text API.
  * Uses high-speed in-memory vector caching for instant (< 2ms) lookups.
+ * Concurrency-controlled via semaphore (max 4 simultaneous requests) to prevent
+ * socket exhaustion and Ollama provider rate limit errors.
  */
 async function generateEmbeddingVectorAsync(text) {
   if (!text || typeof text !== "string") return generateEmbeddingVector(text);
@@ -146,6 +177,9 @@ async function generateEmbeddingVectorAsync(text) {
   if (embeddingCache.has(cacheKey)) {
     return embeddingCache.get(cacheKey);
   }
+
+  // Acquire semaphore slot before making the HTTP call
+  await acquireEmbeddingSlot();
 
   try {
     console.log(`\n📤 [AI REQUEST -> OLLAMA (EMBEDDINGS)] Model: ${OLLAMA_EMBED_MODEL} | Text: "${text.slice(0, 80)}..."`);
@@ -155,7 +189,8 @@ async function generateEmbeddingVectorAsync(text) {
       body: JSON.stringify({
         model: OLLAMA_EMBED_MODEL,
         prompt: text
-      })
+      }),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : undefined
     });
     if (response.ok) {
       const data = await response.json();
@@ -169,6 +204,9 @@ async function generateEmbeddingVectorAsync(text) {
     }
   } catch (err) {
     console.warn(`⚠️ [AI EMBEDDINGS ERROR <- OLLAMA] ${err.message}`);
+  } finally {
+    // Always release the semaphore slot — even on error or timeout
+    releaseEmbeddingSlot();
   }
 
   const fallback = generateEmbeddingVector(text);

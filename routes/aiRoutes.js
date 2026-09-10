@@ -52,13 +52,11 @@ router.post("/crm/forward-contact", protect, async (req, res) => {
     if (payload.firstName && payload.lastName && payload.email && payload.phone) {
       try {
         await Contact.findOneAndUpdate(
-          { userId: req.user.id },
+          { userId: req.user.id, email: payload.email },
           {
-            userId: req.user.id,
             chatId: payload.chatId || req.user.id,
             firstName: payload.firstName,
             lastName: payload.lastName,
-            email: payload.email,
             phone: payload.phone === "null" || !payload.phone ? null : payload.phone,
             companyName: payload.companyName === "null" || !payload.companyName ? null : payload.companyName
           },

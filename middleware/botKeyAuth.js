@@ -56,15 +56,17 @@ async function authenticateBotKey(req, res, next) {
       }
     }
 
-    // 4. Ultimate Fallback: If no bot found yet, pick latest active bot
+    // 4. Public Demo Bot Fallback: Only bots explicitly marked isPublicDemo=true
+    //    are accessible without credentials. Removes the previous "any active bot"
+    //    security vulnerability that exposed all bots to unauthenticated requests.
     if (!bot) {
-      bot = await Bot.findOne({ status: "ACTIVE" }).sort({ createdAt: -1 });
+      bot = await Bot.findOne({ isPublicDemo: true, status: "ACTIVE" }).sort({ createdAt: -1 });
     }
 
     if (!bot) {
       return res.status(401).json({
         success: false,
-        message: "Authentication failed. No active Bot or valid Bot API keys provided."
+        message: "Authentication failed. No valid Bot API key, JWT, or public demo bot available."
       });
     }
 

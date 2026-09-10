@@ -158,14 +158,26 @@ exports.stopMessage = async (req, res) => {
         lastMsg.content = content;
       }
       lastMsg.isStoppedMidway = true;
+      if (!lastMsg.followUps || lastMsg.followUps.length === 0) {
+        try {
+          const followUpService = require("../services/followUpService");
+          lastMsg.followUps = followUpService.getSmartFollowUps("", lastMsg.content);
+        } catch (e) {}
+      }
       await lastMsg.save();
       return res.json({ success: true, message: lastMsg });
     } else if (content && typeof content === "string" && content.trim()) {
+      let smartFollowUps = [];
+      try {
+        const followUpService = require("../services/followUpService");
+        smartFollowUps = followUpService.getSmartFollowUps(lastMsg?.role === "user" ? lastMsg.content : "", content.trim());
+      } catch (e) {}
       const newMsg = await Message.create({
         chatId,
         role: "assistant",
         content: content.trim(),
-        isStoppedMidway: true
+        isStoppedMidway: true,
+        followUps: smartFollowUps || []
       });
       return res.json({ success: true, message: newMsg });
     }
@@ -245,8 +257,13 @@ exports.sendMessage = async (req, res) => {
   let firstTokenTimestamp = null;
   let llmRequestStartTime = null;
   let clientDisconnected = false;
-  req.on("close", () => {
+  req.on("aborted", () => {
     clientDisconnected = true;
+  });
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      clientDisconnected = true;
+    }
   });
 
   try {
@@ -311,9 +328,18 @@ exports.sendMessage = async (req, res) => {
       }
     }
 
-    // 3. Credit Reservation Pre-check (Floor: 0.05 credits)
+    // 3. Upfront Atomic Credit Reservation (Floor: 0.05 credits) to prevent negative balance bypass
     const MINIMUM_CHARGE_FLOOR = 0.05;
-    if (currentBalance < MINIMUM_CHARGE_FLOOR) {
+    const reservedAmount = MINIMUM_CHARGE_FLOOR;
+    let creditReserved = false;
+
+    const reservedUser = await User.findOneAndUpdate(
+      { _id: userId, credits: { $gte: MINIMUM_CHARGE_FLOOR } },
+      { $inc: { credits: -reservedAmount } },
+      { new: true }
+    );
+
+    if (!reservedUser) {
       return res.status(402).json({
         success: false,
         error: "INSUFFICIENT_CREDITS",
@@ -323,6 +349,7 @@ exports.sendMessage = async (req, res) => {
         isPaidUser: isPaid
       });
     }
+    creditReserved = true;
 
     let chat = chatDoc;
     if (!chat) {
@@ -699,13 +726,21 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         console.warn("⚠️ [FOLLOW-UPS NOTICE] Generation skipped on error:", fErr.message);
       }
 
-      const isStopped = clientDisconnected || Boolean(req.destroyed);
+      let finalFollowUps = Array.isArray(followUps) && followUps.length > 0 ? followUps : [];
+      if (finalFollowUps.length === 0) {
+        try {
+          const followUpService = require("../services/followUpService");
+          finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
+        } catch (e) {}
+      }
+
+      const isStopped = (clientDisconnected || Boolean(req.destroyed)) && !res.writableEnded;
       const saveAssistantPromise = Message.create({
         chatId,
         role: "assistant",
         content: accumulatedResponseText,
         isStoppedMidway: isStopped,
-        followUps: isStopped ? [] : followUps,
+        followUps: finalFollowUps || [],
         sources: searchSources,
         requiresWebSearch: isGuidanceActive
       });
@@ -713,11 +748,14 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 
       // 6. Post-Stream Atomic Credit Deduction & Async Telemetry Logging
       try {
+        // Settle upfront reservation: adjust for remainder of calculated credits
+        const creditAdjustment = calculatedCredits - reservedAmount;
         const updatedUser = await User.findByIdAndUpdate(
           userId,
-          { $inc: { credits: -calculatedCredits } },
+          { $inc: { credits: -creditAdjustment } },
           { new: true }
         );
+        creditReserved = false;
 
         if (updatedUser) {
           const remainingCredits = Math.max(0, updatedUser.credits);
@@ -762,27 +800,39 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
           ]).catch(e => console.warn("⚠️ [TELEMETRY ERR]", e.message));
 
           // Emit live credit update to frontend
-          res.write(`data: ${JSON.stringify({
-            type: "credit_update",
-            creditsRemaining: remainingCredits,
-            creditsConsumed: calculatedCredits,
-            promptTokens,
-            completionTokens,
-            totalTokens,
-            isPaidUser: isPaid,
-            modelId: currentModelId
-          })}\n\n`);
+          if (!clientDisconnected && !res.writableEnded) {
+            try {
+              res.write(`data: ${JSON.stringify({
+                type: "credit_update",
+                creditsRemaining: remainingCredits,
+                creditsConsumed: calculatedCredits,
+                promptTokens,
+                completionTokens,
+                totalTokens,
+                durationMs: Math.round(totalDuration),
+                modelId: currentModelId
+              })}\n\n`);
+              if (typeof res.flush === "function") {
+                try { res.flush(); } catch (e) {}
+              }
+            } catch (e) {}
+          }
         }
-      } catch (creditErr) {
-        console.warn("⚠️ [CREDIT CONSUMPTION ERROR]", creditErr.message);
+      } catch (postStreamErr) {
+        console.warn("Notice: Post-stream credit deduction telemetry warning:", postStreamErr.message);
       }
 
       // Emit follow-up suggestions event to frontend if generated
-      if (Array.isArray(followUps) && followUps.length > 0) {
-        res.write(`data: ${JSON.stringify({
-          type: "follow_ups",
-          followUps
-        })}\n\n`);
+      if (!clientDisconnected && !res.writableEnded && Array.isArray(finalFollowUps) && finalFollowUps.length > 0) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: "follow_ups",
+            followUps: finalFollowUps
+          })}\n\n`);
+          if (typeof res.flush === "function") {
+            try { res.flush(); } catch (e) {}
+          }
+        } catch (e) {}
       }
 
       await saveAssistantPromise;
@@ -792,18 +842,31 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
       console.log(`  • ChatId:         ${chatId}`);
       console.log(`  • Model:          ${currentModelId}`);
       console.log(`  • Total Tokens:   ${totalTokens} (${promptTokens} prompt + ${completionTokens} completion)`);
-      console.log(`  • Follow-ups:     ${followUps.length > 0 ? followUps.join(" | ") : "None"}`);
+      console.log(`  • Follow-ups:     ${finalFollowUps.length > 0 ? finalFollowUps.join(" | ") : "None"}`);
       console.log(`  • Latency:        ${totalDuration.toFixed(2)} ms (TTFT: ${ttft !== null ? ttft.toFixed(2) + ' ms' : 'N/A'})`);
       console.log(`  • Response Length: ${accumulatedResponseText.length} characters`);
       console.log(`  • Response Text:`);
       console.log(accumulatedResponseText);
       console.log(`================================================================================\n`);
 
-      res.write("data: [DONE]\n\n");
-      return res.end();
+      if (!clientDisconnected && !res.writableEnded) {
+        try {
+          res.write("data: [DONE]\n\n");
+          if (typeof res.flush === "function") {
+            try { res.flush(); } catch (e) {}
+          }
+          return res.end();
+        } catch (e) {}
+      }
+      return;
     }
 
     if (!streamedSuccessfully) {
+      // Refund upfront reserved credit if stream was unsuccessful
+      if (creditReserved) {
+        await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => {});
+        creditReserved = false;
+      }
       if (res.writableEnded) return;
       console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content.");
       const standardTrafficMsg = "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.";
@@ -825,6 +888,10 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
     }
   } catch (error) {
     console.error("General Chat Pipeline Error:", error);
+    if (creditReserved) {
+      await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => {});
+      creditReserved = false;
+    }
     if (!res.headersSent) {
       res.status(500).json({ success: false, message: "General chat processing failed.", error: error.message });
     } else {

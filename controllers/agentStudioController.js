@@ -349,18 +349,19 @@ exports.uploadAgentKnowledge = async (req, res) => {
         keywords
       });
 
-      // Async vector embedding computation
-      ragEngine.generateEmbeddingVector(chunkText)
-        .then(async (vector) => {
-          if (vector && vector.length > 0) {
-            await BotEmbedding.create({
-              botId: id,
-              chunkId: chunkDoc._id,
-              embeddingVector: vector
-            });
-          }
-        })
-        .catch((e) => console.warn("Notice: Async embedding warning:", e.message));
+      // Sequential vector embedding computation to prevent concurrency explosions
+      try {
+        const vector = await ragEngine.generateEmbeddingVector(chunkText);
+        if (vector && vector.length > 0) {
+          await BotEmbedding.create({
+            botId: id,
+            chunkId: chunkDoc._id,
+            embeddingVector: vector
+          });
+        }
+      } catch (e) {
+        console.warn("Notice: Sequential embedding warning:", e.message);
+      }
     }
 
     // 4. Update Agent Knowledge Sources List with human-readable size

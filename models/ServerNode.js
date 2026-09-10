@@ -43,6 +43,11 @@ const ServerNodeSchema = new mongoose.Schema(
       type: Boolean,
       default: true
     },
+    isUserVisible: {
+      type: Boolean,
+      default: true,
+      index: true
+    },
     priority: {
       type: Number,
       default: 10,

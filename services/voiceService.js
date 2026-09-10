@@ -3,36 +3,38 @@ const path = require("path");
 const os = require("os");
 const axios = require("axios");
 const ffmpegPath = require("ffmpeg-static");
-const { spawn, execSync } = require("child_process");
+const util = require("util");
+const { spawn, exec } = require("child_process");
+const execAsync = util.promisify(exec);
 const wavefile = require("wavefile");
 
 /**
  * Converts any input audio Buffer (WebM, M4A, AAC, MP3, OGG, WAV) into a 16kHz mono 16-bit PCM WAV Buffer.
  */
-function convertAudioTo16kPcmWav(inputBuffer) {
+async function convertAudioTo16kPcmWav(inputBuffer) {
   if (!inputBuffer || !Buffer.isBuffer(inputBuffer) || inputBuffer.length === 0) {
-    return Promise.resolve(inputBuffer);
+    return inputBuffer;
   }
   const tmpIn = path.join(os.tmpdir(), "audio_in_" + Date.now() + "_" + Math.random().toString(36).substring(7) + ".tmp");
   const tmpOut = path.join(os.tmpdir(), "audio_out_" + Date.now() + "_" + Math.random().toString(36).substring(7) + ".wav");
 
   try {
-    fs.writeFileSync(tmpIn, inputBuffer);
-    execSync('"' + ffmpegPath + '" -y -i "' + tmpIn + '" -ar 16000 -ac 1 -c:a pcm_s16le -f wav "' + tmpOut + '"', { stdio: "pipe" });
+    await fs.promises.writeFile(tmpIn, inputBuffer);
+    await execAsync(`"${ffmpegPath}" -y -i "${tmpIn}" -ar 16000 -ac 1 -c:a pcm_s16le -f wav "${tmpOut}"`);
 
-    if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 44) {
-      const convertedBuf = fs.readFileSync(tmpOut);
-      if (fs.existsSync(tmpIn)) try { fs.unlinkSync(tmpIn); } catch (e) {}
-      if (fs.existsSync(tmpOut)) try { fs.unlinkSync(tmpOut); } catch (e) {}
-      return Promise.resolve(convertedBuf);
+    if (fs.existsSync(tmpOut) && (await fs.promises.stat(tmpOut)).size > 44) {
+      const convertedBuf = await fs.promises.readFile(tmpOut);
+      try { await fs.promises.unlink(tmpIn); } catch (e) {}
+      try { await fs.promises.unlink(tmpOut); } catch (e) {}
+      return convertedBuf;
     }
   } catch (err) {
     console.warn("Notice: FFmpeg conversion warning:", err.message);
   } finally {
-    if (fs.existsSync(tmpIn)) try { fs.unlinkSync(tmpIn); } catch (e) {}
-    if (fs.existsSync(tmpOut)) try { fs.unlinkSync(tmpOut); } catch (e) {}
+    try { if (fs.existsSync(tmpIn)) await fs.promises.unlink(tmpIn); } catch (e) {}
+    try { if (fs.existsSync(tmpOut)) await fs.promises.unlink(tmpOut); } catch (e) {}
   }
-  return Promise.resolve(inputBuffer);
+  return inputBuffer;
 }
 
 /**
@@ -256,14 +258,14 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
     try {
       const tmpRefIn = path.join(os.tmpdir(), `ref_in_${Date.now()}.tmp`);
       const tmpRefOut = path.join(os.tmpdir(), `ref_out_${Date.now()}.wav`);
-      fs.writeFileSync(tmpRefIn, voiceSampleBuffer);
-      execSync(`"${ffmpegPath}" -y -i "${tmpRefIn}" -ar 24000 -ac 1 -sample_fmt s16 -t 12 "${tmpRefOut}"`, { stdio: 'pipe' });
-      if (fs.existsSync(tmpRefOut) && fs.statSync(tmpRefOut).size > 100) {
-        cleanedVoiceSampleBuffer = fs.readFileSync(tmpRefOut);
+      await fs.promises.writeFile(tmpRefIn, voiceSampleBuffer);
+      await execAsync(`"${ffmpegPath}" -y -i "${tmpRefIn}" -ar 24000 -ac 1 -sample_fmt s16 -t 12 "${tmpRefOut}"`);
+      if (fs.existsSync(tmpRefOut) && (await fs.promises.stat(tmpRefOut)).size > 100) {
+        cleanedVoiceSampleBuffer = await fs.promises.readFile(tmpRefOut);
         console.log(`✅ [VOICE SAMPLE PREP] Converted reference voice sample to 24kHz mono WAV (${cleanedVoiceSampleBuffer.length} bytes)`);
       }
-      try { fs.unlinkSync(tmpRefIn); } catch(e) {}
-      try { fs.unlinkSync(tmpRefOut); } catch(e) {}
+      try { await fs.promises.unlink(tmpRefIn); } catch(e) {}
+      try { await fs.promises.unlink(tmpRefOut); } catch(e) {}
     } catch (convErr) {
       console.warn('⚠️ [VOICE SAMPLE PREP] ffmpeg conversion warning (using raw buffer):', convErr.message);
     }

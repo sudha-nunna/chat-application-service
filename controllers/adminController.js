@@ -8,6 +8,8 @@ const jwt = require("jsonwebtoken");
 const { OAuth2Client } = require("google-auth-library");
 const { performance } = require("perf_hooks");
 const { encrypt, decrypt } = require("../utils/encryption");
+const { validateUrl: ssrfValidateUrl } = require("../utils/ssrfGuard");
+const { auditLog } = require("../middleware/security");
 
 const googleClient = new OAuth2Client(
   process.env.GOOGLE_CLIENT_ID,
@@ -133,6 +135,7 @@ exports.getAllNodes = async (req, res) => {
       doc.failedRequests = (doc.failedRequests || 0) + (failedMap.get(String(n._id)) || 0);
       doc.priorityScore = typeof doc.priorityScore === "number" ? doc.priorityScore : (doc.priority || 10);
       doc.latency = doc.latency || doc.lastLatencyMs || 0;
+      doc.isUserVisible = n.isUserVisible !== false;
 
       if (doc.secretKey) {
         const rawKey = decrypt(doc.secretKey);
@@ -216,6 +219,13 @@ function validateServerNodeUrl(rawUrl, rawSecretKey, format, defaultModel) {
     }
 
     fullUrl = fullUrl.replace(/\/$/, "");
+
+    // SSRF Protection: Block private IPs and cloud metadata endpoints in production.
+    // Localhost is allowed in development (NODE_ENV !== "production") for local Ollama.
+    const ssrfCheck = ssrfValidateUrl(fullUrl);
+    if (!ssrfCheck.valid) {
+      return { error: `Security: ${ssrfCheck.error}` };
+    }
   } catch (err) {
     return { error: `Invalid Server URL syntax "${rawUrl}". Please provide a valid HTTP or HTTPS endpoint URL.` };
   }
@@ -297,6 +307,7 @@ exports.createNode = async (req, res) => {
       secretKey: finalSecret ? encrypt(finalSecret) : "",
       priority: finalPriority,
       isActive: isActive !== undefined ? isActive : true,
+      isUserVisible: req.body.isUserVisible !== undefined ? Boolean(req.body.isUserVisible) : true,
       status: isActive === false ? "INACTIVE" : "ACTIVE"
     });
 
@@ -403,6 +414,9 @@ exports.updateNode = async (req, res) => {
     if (isActive !== undefined) {
       node.isActive = isActive;
       node.status = isActive ? "ACTIVE" : "INACTIVE";
+    }
+    if (req.body.isUserVisible !== undefined) {
+      node.isUserVisible = Boolean(req.body.isUserVisible);
     }
     if (req.body.status !== undefined) {
       node.status = req.body.status;
@@ -934,31 +948,48 @@ exports.updateUserCredits = async (req, res) => {
   try {
     const { id } = req.params;
     const { credits, plan, isPaidUser } = req.body;
-    
-    const user = await User.findById(id);
+
+    // Read current state for audit trail (balance diff calculation)
+    const user = await User.findById(id).lean();
     if (!user) return res.status(404).json({ success: false, error: "User not found." });
 
+    const atomicUpdate = {};
+    const atomicSet = {};
+
     if (credits !== undefined) {
-      const amountDiff = Number(credits) - user.credits;
-      
+      const newBalance = Number(credits);
+      const amountDiff = newBalance - (user.credits || 0);
+
+      // Audit the credit change before writing
       const CreditTransaction = require("../models/CreditTransaction");
       await CreditTransaction.create({
         userId: user._id,
         amount: amountDiff,
         type: amountDiff > 0 ? "admin_grant" : "admin_deduct",
         description: `Admin manual balance adjustment`,
-        balanceAfter: Number(credits)
+        balanceAfter: newBalance
       });
-      
-      user.credits = Number(credits);
+
+      // Atomic write — prevents race conditions with concurrent AI credit deductions.
+      // Using $set for an absolute value (not relative) is correct here since admin
+      // is explicitly setting the target balance, not incrementing.
+      atomicSet.credits = newBalance;
+
+      // Emit structured audit log
+      auditLog("ADMIN_CREDIT_ADJUSTMENT", req, {
+        targetUserId: String(user._id),
+        previousBalance: user.credits,
+        newBalance,
+        delta: amountDiff
+      });
     }
-    
+
     if (plan !== undefined) {
-      user.plan = plan;
+      atomicSet.plan = plan;
     }
 
     if (isPaidUser !== undefined) {
-      user.isPaidUser = Boolean(isPaidUser);
+      atomicSet.isPaidUser = Boolean(isPaidUser);
     }
 
     if (req.body.role !== undefined) {
@@ -968,12 +999,29 @@ exports.updateUserCredits = async (req, res) => {
         if (targetRole === "user" && currentUserId && String(currentUserId) === String(user._id)) {
           return res.status(400).json({ success: false, error: "You cannot revoke your own admin access." });
         }
-        user.role = targetRole;
+        atomicSet.role = targetRole;
+
+        // Audit role changes
+        auditLog("ADMIN_ROLE_CHANGE", req, {
+          targetUserId: String(user._id),
+          previousRole: user.role,
+          newRole: targetRole
+        });
       }
     }
 
-    await user.save();
-    return res.json({ success: true, user });
+    // Single atomic write via findByIdAndUpdate — eliminates all read-modify-save races
+    if (Object.keys(atomicSet).length === 0) {
+      return res.json({ success: true, user });
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      id,
+      { $set: atomicSet },
+      { new: true }
+    ).lean();
+
+    return res.json({ success: true, user: updatedUser });
   } catch (error) {
     console.error("Error updating user credits:", error);
     return res.status(500).json({ success: false, error: "Failed to update user." });

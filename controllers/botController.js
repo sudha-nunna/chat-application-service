@@ -654,19 +654,29 @@ exports.uploadBotFile = async (req, res) => {
       if (chunkDocs.length > 0) {
         const insertedChunks = await BotChunk.insertMany(chunkDocs);
 
-        // Create BotEmbeddings vector records using nomic-embed-text
-        const embeddingDocs = await Promise.all(
-          insertedChunks.map(async (chunk) => ({
-            userId: req.user.id,
-            botId,
-            fileId: botFile._id,
-            chunkId: chunk._id,
-            text: chunk.text,
-            embedding: await generateEmbeddingVectorAsync(chunk.text)
-          }))
-        );
+        // Create BotEmbeddings vector records sequentially to prevent concurrency explosions
+        const embeddingDocs = [];
+        for (const chunk of insertedChunks) {
+          try {
+            const vector = await generateEmbeddingVectorAsync(chunk.text);
+            if (vector && vector.length > 0) {
+              embeddingDocs.push({
+                userId: req.user.id,
+                botId,
+                fileId: botFile._id,
+                chunkId: chunk._id,
+                text: chunk.text,
+                embedding: vector
+              });
+            }
+          } catch (embedErr) {
+            console.warn("Notice: Sequential embedding error on chunk:", embedErr.message);
+          }
+        }
 
-        await BotEmbedding.insertMany(embeddingDocs);
+        if (embeddingDocs.length > 0) {
+          await BotEmbedding.insertMany(embeddingDocs);
+        }
       }
 
       botFile.chunkCount = chunkDocs.length;
@@ -813,18 +823,29 @@ exports.replaceBotFile = async (req, res) => {
       if (chunkDocs.length > 0) {
         const insertedChunks = await BotChunk.insertMany(chunkDocs);
 
-        const embeddingDocs = await Promise.all(
-          insertedChunks.map(async (chunk) => ({
-            userId: req.user.id,
-            botId,
-            fileId: existingFile._id,
-            chunkId: chunk._id,
-            text: chunk.text,
-            embedding: await generateEmbeddingVectorAsync(chunk.text)
-          }))
-        );
+        // Create BotEmbeddings vector records sequentially to prevent concurrency explosions
+        const embeddingDocs = [];
+        for (const chunk of insertedChunks) {
+          try {
+            const vector = await generateEmbeddingVectorAsync(chunk.text);
+            if (vector && vector.length > 0) {
+              embeddingDocs.push({
+                userId: req.user.id,
+                botId,
+                fileId: existingFile._id,
+                chunkId: chunk._id,
+                text: chunk.text,
+                embedding: vector
+              });
+            }
+          } catch (embedErr) {
+            console.warn("Notice: Sequential embedding error on chunk:", embedErr.message);
+          }
+        }
 
-        await BotEmbedding.insertMany(embeddingDocs);
+        if (embeddingDocs.length > 0) {
+          await BotEmbedding.insertMany(embeddingDocs);
+        }
       }
 
       existingFile.chunkCount = chunkDocs.length;

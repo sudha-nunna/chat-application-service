@@ -32,9 +32,7 @@ const serverNodeAccessControl = async (req, res, next) => {
       return next();
     }
 
-    const isAgent =
-      req.user?.type === "agent" ||
-      String(req.headers["x-caller-type"] || "").toLowerCase() === "agent";
+    const isAgent = req.user?.type === "agent" || req.user?.role === "agent";
 
     if (isAgent) {
       if (req.method === "GET") {

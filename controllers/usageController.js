@@ -30,10 +30,10 @@ exports.getUserUsageSummary = async (req, res) => {
       creditsUsedToday: 0
     };
 
-    // 3. Fetch past 7 days usage history
-    const past7Days = await Usage.find({ userId })
+    // 3. Fetch recent daily usage history (up to 14 days)
+    const pastDays = await Usage.find({ userId })
       .sort({ date: -1 })
-      .limit(7)
+      .limit(14)
       .lean();
 
     // 4. Model usage breakdown (aggregated credits and tokens per model)
@@ -52,10 +52,10 @@ exports.getUserUsageSummary = async (req, res) => {
       { $sort: { totalCreditsUsed: -1 } }
     ]);
 
-    // 5. Recent credit/token transactions (last 10)
+    // 5. Recent credit/token transactions (last 20)
     const recentTransactions = await CreditTransaction.find({ userId })
       .sort({ createdAt: -1 })
-      .limit(10)
+      .limit(20)
       .lean();
 
     // 6. Calculate total lifetime tokens & credits used
@@ -104,7 +104,7 @@ exports.getUserUsageSummary = async (req, res) => {
           totalTokens: (item.totalPromptTokens || 0) + (item.totalCompletionTokens || 0),
           avgLatencyMs: Math.round(item.avgResponseTimeMs || 0)
         })),
-        recentHistory: past7Days.reverse(),
+        recentHistory: pastDays.reverse(),
         recentTransactions
       }
     });

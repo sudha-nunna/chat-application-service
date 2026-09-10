@@ -100,31 +100,40 @@ exports.upgradePlan = async (req, res) => {
     user.plan = plan;
     user.activeSubscriptionId = subscription._id;
 
-    // Grant credits configured on this package
+    // Grant credits configured on this package using atomic $inc
     const creditsToAdd = dbPlan?.creditsGranted || (plan.toLowerCase() === "starter" ? 500 : plan.toLowerCase() === "pro" ? 2500 : plan.toLowerCase() === "power" ? 10000 : 0);
+    let updatedUser = user;
     if (creditsToAdd > 0) {
-      const newBalance = parseFloat(((user.credits || 0) + creditsToAdd).toFixed(4));
-      user.credits = newBalance;
-      user.isPaidUser = true;
-      user.totalCreditsPurchased = (user.totalCreditsPurchased || 0) + creditsToAdd;
+      updatedUser = await User.findByIdAndUpdate(
+        user._id,
+        {
+          $inc: { credits: creditsToAdd, totalCreditsPurchased: creditsToAdd },
+          $set: { plan: plan, isPaidUser: true, activeSubscriptionId: subscription._id }
+        },
+        { new: true }
+      );
 
       await CreditTransaction.create({
         userId: user._id,
         amount: creditsToAdd,
         type: "purchase",
         description: `Purchased ${dbPlan ? dbPlan.name : plan} (+${creditsToAdd.toLocaleString()} credits)`,
-        balanceAfter: newBalance,
+        balanceAfter: updatedUser ? updatedUser.credits : 0,
       }).catch(() => {});
+    } else {
+      updatedUser = await User.findByIdAndUpdate(
+        user._id,
+        { $set: { plan: plan, activeSubscriptionId: subscription._id } },
+        { new: true }
+      );
     }
-
-    await user.save();
 
     res.status(200).json({
       success: true,
       message: `Successfully purchased ${dbPlan ? dbPlan.name : plan} (+${creditsToAdd.toLocaleString()} credits added to your wallet)!`,
       subscription,
       creditsAdded: creditsToAdd,
-      newBalance: user.credits,
+      newBalance: updatedUser.credits,
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -261,7 +270,40 @@ exports.getUsage = async (req, res) => {
  */
 exports.handleWebhook = async (req, res) => {
   try {
-    const event = req.body;
+    const signature = req.headers["stripe-signature"] || req.headers["x-webhook-signature"];
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET;
+    let event = req.body;
+
+    // Cryptographic signature verification
+    if (webhookSecret) {
+      if (!signature) {
+        return res.status(400).json({ success: false, error: "Missing webhook signature header" });
+      }
+      try {
+        if (process.env.STRIPE_SECRET_KEY && req.headers["stripe-signature"]) {
+          const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+          event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+        } else {
+          const crypto = require("crypto");
+          const expectedSig = crypto.createHmac("sha256", webhookSecret).update(req.body).digest("hex");
+          if (signature !== expectedSig) {
+            return res.status(400).json({ success: false, error: "Invalid webhook signature verification" });
+          }
+          event = JSON.parse(req.body.toString("utf8"));
+        }
+      } catch (err) {
+        console.error("⚠️ [WEBHOOK VERIFICATION FAILED]:", err.message);
+        return res.status(400).json({ success: false, error: `Webhook signature verification failed: ${err.message}` });
+      }
+    } else if (typeof event === "string" || Buffer.isBuffer(event)) {
+      try {
+        event = JSON.parse(event.toString("utf8"));
+      } catch (e) {}
+    }
+
+    if (!event || !event.type) {
+      return res.status(400).json({ success: false, error: "Invalid webhook payload format" });
+    }
 
     switch (event.type) {
       case "customer.subscription.updated":
