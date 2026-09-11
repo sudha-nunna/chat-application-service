@@ -162,7 +162,8 @@ exports.googleAuth = async (req, res) => {
         isAvatarUploaded: isAvatarSetup,
         isVoiceUploaded: isVoiceSetup,
         voiceSampleId: activeVoiceId,
-        voiceSampleUrl: activeVoiceUrl
+        voiceSampleUrl: activeVoiceUrl,
+        pinnedItemIds: user.pinnedItemIds || []
       },
     });
   } catch (error) {
@@ -297,7 +298,8 @@ exports.googleAuthCallback = async (req, res) => {
         voiceSampleUrl: activeVoiceUrl,
         audioUrl: activeVoiceUrl,
         voiceUrl: activeVoiceUrl,
-        audioSampleUrl: activeVoiceUrl
+        audioSampleUrl: activeVoiceUrl,
+        pinnedItemIds: user.pinnedItemIds || []
       },
     });
   } catch (error) {
@@ -696,6 +698,7 @@ exports.getCurrentUser = async (req, res) => {
         voiceSampleId: activeVoiceId,
         credits: typeof user.credits === "number" ? user.credits : 100,
         isPaidUser: !!user.isPaidUser,
+        pinnedItemIds: user.pinnedItemIds || [],
         createdAt: user.createdAt,
         updatedAt: user.updatedAt
       }
