@@ -60,7 +60,7 @@ router.post("/crm/forward-contact", protect, async (req, res) => {
             phone: payload.phone === "null" || !payload.phone ? null : payload.phone,
             companyName: payload.companyName === "null" || !payload.companyName ? null : payload.companyName
           },
-          { upsert: true, new: true }
+          { upsert: true, returnDocument: "after" }
         );
       } catch (dbErr) {
         console.error("Contact collection saving notice:", dbErr.message);

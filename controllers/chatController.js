@@ -216,7 +216,7 @@ exports.updateChat = async (req, res) => {
     const updatedChat = await Chat.findOneAndUpdate(
       query,
       { title: title.trim() },
-      { new: true }
+      { returnDocument: "after" }
     );
 
     if (!updatedChat) {
@@ -336,7 +336,7 @@ exports.sendMessage = async (req, res) => {
     const reservedUser = await User.findOneAndUpdate(
       { _id: userId, credits: { $gte: MINIMUM_CHARGE_FLOOR } },
       { $inc: { credits: -reservedAmount } },
-      { new: true }
+      { returnDocument: "after" }
     );
 
     if (!reservedUser) {
@@ -753,7 +753,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         const updatedUser = await User.findByIdAndUpdate(
           userId,
           { $inc: { credits: -creditAdjustment } },
-          { new: true }
+          { returnDocument: "after" }
         );
         creditReserved = false;
 

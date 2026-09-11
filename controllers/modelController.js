@@ -368,7 +368,7 @@ exports.updateModel = async (req, res) => {
     if (updateData.completionTokenCostPer1k !== undefined) updateData.completionTokenCostPer1k = Math.max(0, Number(updateData.completionTokenCostPer1k));
     if (updateData.maxTokenLimit !== undefined) updateData.maxTokenLimit = Math.max(128, Number(updateData.maxTokenLimit));
 
-    const updated = await AIModel.findByIdAndUpdate(id, updateData, { new: true });
+    const updated = await AIModel.findByIdAndUpdate(id, updateData, { returnDocument: "after" });
     if (!updated) {
       return res.status(404).json({ success: false, error: "Model not found." });
     }

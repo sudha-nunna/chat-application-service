@@ -1018,7 +1018,7 @@ exports.updateUserCredits = async (req, res) => {
     const updatedUser = await User.findByIdAndUpdate(
       id,
       { $set: atomicSet },
-      { new: true }
+      { returnDocument: "after" }
     ).lean();
 
     return res.json({ success: true, user: updatedUser });
@@ -1197,7 +1197,7 @@ exports.updatePlan = async (req, res) => {
     const isObjectId = mongoose.Types.ObjectId.isValid(id);
     const query = isObjectId ? { _id: id } : { key: id };
 
-    const plan = await Plan.findOneAndUpdate(query, req.body, { new: true, runValidators: false });
+    const plan = await Plan.findOneAndUpdate(query, req.body, { returnDocument: "after", runValidators: false });
     
     if (!plan) return res.status(404).json({ success: false, error: "Credit package not found." });
     return res.json({ success: true, plan });
@@ -1284,7 +1284,7 @@ exports.updateSettings = async (req, res) => {
     const setting = await SystemSetting.findOneAndUpdate(
       { key: "global_settings" },
       { $set: updateFields },
-      { new: true, upsert: true }
+      { returnDocument: "after", upsert: true }
     );
 
     return res.json({ success: true, message: "Platform settings updated successfully.", settings: setting });

@@ -85,7 +85,7 @@ exports.updatePlan = async (req, res) => {
     const plan = await Plan.findOneAndUpdate(
       { key: planKey.toLowerCase() },
       updates,
-      { new: true, runValidators: true }
+      { returnDocument: "after", runValidators: true }
     );
 
     if (!plan) {
@@ -112,7 +112,7 @@ exports.deletePlan = async (req, res) => {
     const plan = await Plan.findOneAndUpdate(
       { key: planKey.toLowerCase() },
       { active: false },
-      { new: true }
+      { returnDocument: "after" }
     );
 
     if (!plan) {

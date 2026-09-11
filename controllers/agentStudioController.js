@@ -196,7 +196,7 @@ exports.updateAgent = async (req, res) => {
     const updatedAgent = await Bot.findByIdAndUpdate(
       id,
       { $set: updateFields },
-      { new: true, runValidators: false }
+      { returnDocument: "after", runValidators: false }
     );
 
     if (!updatedAgent) {

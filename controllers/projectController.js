@@ -90,7 +90,7 @@ exports.updateProject = async (req, res) => {
     const project = await Project.findOneAndUpdate(
       { _id: projectId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] },
       updateData,
-      { new: true }
+      { returnDocument: "after" }
     );
 
     if (!project) {

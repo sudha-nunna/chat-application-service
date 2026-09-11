@@ -110,7 +110,7 @@ exports.upgradePlan = async (req, res) => {
           $inc: { credits: creditsToAdd, totalCreditsPurchased: creditsToAdd },
           $set: { plan: plan, isPaidUser: true, activeSubscriptionId: subscription._id }
         },
-        { new: true }
+        { returnDocument: "after" }
       );
 
       await CreditTransaction.create({
@@ -124,7 +124,7 @@ exports.upgradePlan = async (req, res) => {
       updatedUser = await User.findByIdAndUpdate(
         user._id,
         { $set: { plan: plan, activeSubscriptionId: subscription._id } },
-        { new: true }
+        { returnDocument: "after" }
       );
     }
 

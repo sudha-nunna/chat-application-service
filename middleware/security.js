@@ -55,42 +55,47 @@ function correlationIdMiddleware(req, res, next) {
  * @param {unknown} obj    - Value to sanitize
  * @param {number}  depth  - Recursion depth guard (max 10)
  */
-function sanitizeObject(obj, depth = 0) {
+function mutateSanitize(obj, depth = 0) {
   // Guard: never recurse beyond 10 levels (prevents stack overflow on pathological inputs)
-  if (depth > 10) return obj;
-  if (obj === null || typeof obj !== "object" || Buffer.isBuffer(obj)) return obj;
-  if (Array.isArray(obj)) return obj.map((item) => sanitizeObject(item, depth + 1));
+  if (depth > 10) return;
+  if (obj === null || typeof obj !== "object" || Buffer.isBuffer(obj)) return;
+  
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      mutateSanitize(obj[i], depth + 1);
+    }
+    return;
+  }
 
-  const cleaned = {};
   for (const key of Object.keys(obj)) {
-    if (key.startsWith("$")) {
+    if (key.startsWith("$") || key.includes(".")) {
       // Log the blocked key so security teams can investigate
       logger.warn("NoSQL injection key blocked by sanitizer", {
         key,
         source: "noSqlSanitizerMiddleware",
       });
-      continue; // Drop the key entirely
+      delete obj[key];
+    } else {
+      mutateSanitize(obj[key], depth + 1);
     }
-    cleaned[key] = sanitizeObject(obj[key], depth + 1);
   }
-  return cleaned;
 }
 
 /**
- * Express middleware: sanitizes req.body, req.query, and req.params.
- * Safe to apply globally — only removes unexpected `$`-prefixed keys which are
+ * Express middleware: sanitizes req.body, req.query, and req.params in-place.
+ * Safe to apply globally — only removes unexpected `$` or `.` keys which are
  * never used intentionally in our API payload contracts.
  */
 function noSqlSanitizerMiddleware(req, res, next) {
   try {
     if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body)) {
-      req.body = sanitizeObject(req.body);
+      mutateSanitize(req.body);
     }
     if (req.query && typeof req.query === "object") {
-      req.query = sanitizeObject(req.query);
+      mutateSanitize(req.query);
     }
     if (req.params && typeof req.params === "object") {
-      req.params = sanitizeObject(req.params);
+      mutateSanitize(req.params);
     }
   } catch (err) {
     // Never let the sanitizer crash the request pipeline
@@ -149,7 +154,7 @@ function auditLog(action, req, extra = {}) {
 module.exports = {
   correlationIdMiddleware,
   noSqlSanitizerMiddleware,
-  sanitizeObject,
+  mutateSanitize,
   sanitizeXss,
   auditLog,
 };

@@ -122,7 +122,7 @@ exports.googleAuth = async (req, res) => {
       if (isSuperAdmin && user.role !== "admin") updates.role = "admin";
 
       if (Object.keys(updates).length > 0) {
-        user = await User.findByIdAndUpdate(user._id, updates, { new: true });
+        user = await User.findByIdAndUpdate(user._id, updates, { returnDocument: "after" });
       }
     }
 
@@ -252,7 +252,7 @@ exports.googleAuthCallback = async (req, res) => {
       if (!user.authType) updates.authType = "google";
 
       if (Object.keys(updates).length > 0) {
-        user = await User.findByIdAndUpdate(user._id, updates, { new: true });
+        user = await User.findByIdAndUpdate(user._id, updates, { returnDocument: "after" });
       }
     }
 
@@ -506,7 +506,7 @@ exports.uploadVoiceSample = async (req, res) => {
 
     let updatedUser;
     if (Object.keys(userUpdates).length > 0) {
-      updatedUser = await User.findByIdAndUpdate(userId, userUpdates, { new: true }).select("-password");
+      updatedUser = await User.findByIdAndUpdate(userId, userUpdates, { returnDocument: "after" }).select("-password");
     } else {
       updatedUser = currentUser;
     }
@@ -736,7 +736,7 @@ exports.updateBotName = async (req, res) => {
     const updatedUser = await User.findByIdAndUpdate(
       userId,
       { botName: agentCustomName },
-      { new: true }
+      { returnDocument: "after" }
     ).select("-password");
 
     // 2. Update bot.name on Bot model
@@ -1090,7 +1090,7 @@ exports.selectUserAvatar = async (req, res) => {
         profilePic: fullUrl,
         isProfileSetup: true
       },
-      { new: true }
+      { returnDocument: "after" }
     ).select("-password");
 
     // 3. Purge Redis caches so changes reflect immediately everywhere

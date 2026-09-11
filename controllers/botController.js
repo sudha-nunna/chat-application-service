@@ -298,7 +298,7 @@ exports.updateBot = async (req, res) => {
     const bot = await Bot.findOneAndUpdate(
       { _id: botId, $or: [{ userId: req.user.id }, { ownerId: req.user.id }] },
       updateData,
-      { new: true }
+      { returnDocument: "after" }
     );
 
     if (!bot) {

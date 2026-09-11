@@ -65,7 +65,7 @@ exports.purchaseCredits = async (req, res) => {
         $inc: { credits: creditsToAdd, totalCreditsPurchased: creditsToAdd },
         $set: { isPaidUser: true }
       },
-      { new: true }
+      { returnDocument: "after" }
     );
 
     if (!updatedUser) {
