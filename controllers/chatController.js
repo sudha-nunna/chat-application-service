@@ -479,10 +479,11 @@ STRICT IDENTITY RULES:
 CORE BEHAVIOR & OUTPUT FORMAT RULES:
 1. Be direct, natural, engaging, and articulate. Jump straight into the helpful, accurate answer.
 2. NEVER output your internal drafting process, brainstorm notes, planning steps, or meta-commentary (such as "Draft:", "Structure:", "Hook:", or "Since the date is..."). Output ONLY the final, polished response directly to the user.
-3. For casual, open-ended, or greeting prompts (e.g., "tell me something", "what's up", "tell me a story"), provide an interesting, engaging, or thought-provoking answer right away, and warmly ask how you can help them today.
+3. For casual, open-ended, or greeting prompts, provide an interesting, engaging, or thought-provoking answer right away, and warmly ask how you can help them today.
 4. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
-5. For technical, coding, science, or factual queries, provide detailed, accurate, beautifully formatted markdown explanations with bullet points and code blocks.
-6. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
+5. For ALL coding, React, Vite, and web development tasks, every generated file MUST explicitly specify its exact relative path (e.g., "src/components/NavBar.jsx", "src/pages/Home.jsx", "src/services/countryService.js", "src/components/NavBar.css").
+   CRITICAL REQUIREMENT: Every file imported anywhere in the application MUST be physically generated in the project files. Never omit stylesheets, hooks, utility modules, or component files that are imported in code.
+6. When using JSON Action Protocol or markdown file headers, ensure every file path is fully qualified (e.g. "src/components/NavBar.jsx"). Do not concatenate multiple files into one. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
 
     if (summaryText && summaryText.trim()) {
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
@@ -508,6 +509,18 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 
     const promptForAI = rawUserMessage || (hasImage ? "Please analyze this image and describe what it contains." : "Please analyze the attached document.");
     let finalUserPrompt = extractedTextContext ? `${promptForAI}\n${extractedTextContext}` : promptForAI;
+
+    // Code RAG Engine: Prune multi-file project workspace files to fit LLM token budget
+    if (req.body.projectFiles && Array.isArray(req.body.projectFiles) && req.body.projectFiles.length > 0) {
+      try {
+        const { selectRelevantServerFiles, formatFilesForPrompt } = require("../utils/codeRAGServerEngine");
+        const prunedFiles = selectRelevantServerFiles(req.body.projectFiles, rawUserMessage, 16000);
+        const formattedCodeContext = formatFilesForPrompt(prunedFiles);
+        finalUserPrompt += `\n\n[MULTI-FILE VFS CONTEXT (${prunedFiles.length} of ${req.body.projectFiles.length} files relevant)]\n${formattedCodeContext}`;
+      } catch (ragErr) {
+        console.warn("⚠️ Code RAG pruning error:", ragErr.message);
+      }
+    }
 
     // Web Search Flag: Only execute web search when explicitly requested by user
     const enableSearch = Boolean(

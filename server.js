@@ -51,20 +51,6 @@ process.on("uncaughtException", (err) => {
   setTimeout(() => process.exit(1), 1000).unref();
 });
 
-// ─── Database + Startup Tasks ─────────────────────────────────────────────────
-
-connectDB()
-  .then(() => {
-    seedAIModels();
-    warmOllamaConnection().catch((err) => {
-      logger.warn("warmOllamaConnection failed at startup", { error: err.message });
-    });
-  })
-  .catch((err) => {
-    logger.error("Database connection failed — server cannot start", { error: err.message });
-    process.exit(1);
-  });
-
 // ─── Express App ──────────────────────────────────────────────────────────────
 
 const app = express();
@@ -307,13 +293,29 @@ app.use((err, req, res, next) => {
 
 // ─── Server Start ─────────────────────────────────────────────────────────────
 
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  logger.info("Server started", { port: PORT, env: process.env.NODE_ENV || "development" });
+const PORT = process.env.PORT || 5000;
+let server;
 
-  const f5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
-  logger.info("Voice synthesis endpoint configured", { url: f5Url });
-});
+async function startServer() {
+  try {
+    await connectDB();
+    seedAIModels();
+    warmOllamaConnection().catch((err) => {
+      logger.warn("warmOllamaConnection failed at startup", { error: err.message });
+    });
+
+    server = app.listen(PORT, () => {
+      logger.info("Server started", { port: PORT, env: process.env.NODE_ENV || "development" });
+      const f5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
+      logger.info("Voice synthesis endpoint configured", { url: f5Url });
+    });
+  } catch (err) {
+    logger.error("Database connection failed — server cannot start", { error: err.message });
+    process.exit(1);
+  }
+}
+
+startServer();
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
 
@@ -327,7 +329,7 @@ const server = app.listen(PORT, () => {
 async function gracefulShutdown(signal) {
   logger.info(`${signal} received — initiating graceful shutdown`);
 
-  server.close(async () => {
+  const closeCb = async () => {
     logger.info("HTTP server closed — no new connections accepted");
 
     // Close Redis connection
@@ -351,7 +353,13 @@ async function gracefulShutdown(signal) {
 
     logger.info("Graceful shutdown complete");
     process.exit(0);
-  });
+  };
+
+  if (server) {
+    server.close(closeCb);
+  } else {
+    closeCb();
+  }
 
   // Force exit after 10s if shutdown hangs
   setTimeout(() => {
