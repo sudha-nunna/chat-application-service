@@ -1276,3 +1276,43 @@ exports.deleteAccount = async (req, res) => {
     });
   }
 };
+
+/**
+ * Updates the user's pinned items (chats/bots) array
+ */
+exports.updatePinnedItems = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { pinnedItemIds } = req.body;
+
+    if (!Array.isArray(pinnedItemIds)) {
+      return res.status(400).json({
+        success: false,
+        error: "pinnedItemIds must be an array of strings.",
+      });
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { pinnedItemIds },
+      { new: true, runValidators: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ success: false, error: "User not found." });
+    }
+
+    return res.status(200).json({
+      success: true,
+      pinnedItemIds: updatedUser.pinnedItemIds,
+      message: "Pinned items updated successfully.",
+    });
+  } catch (err) {
+    console.error("Update Pinned Items Error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "Failed to update pinned items.",
+      details: err.message,
+    });
+  }
+};

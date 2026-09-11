@@ -59,6 +59,11 @@ const userSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    
+    pinnedItemIds: {
+      type: [String],
+      default: [],
+    },
 
     activeSubscriptionId: {
       type: mongoose.Schema.Types.ObjectId,

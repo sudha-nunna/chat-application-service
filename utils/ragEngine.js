@@ -1028,7 +1028,7 @@ ${apiDescriptions}
  * System prompt for General Conversational mode (human-like conversational chat & voice agent ready).
  * Adapts based on botMode ("small" | "medium" | "large")
  */
-function buildGeneralSystemPrompt(botName = "AI Assistant", botDescription = "", mode = "small", rulesText = "") {
+function buildGeneralSystemPrompt(botName = "Codegene AI", botDescription = "", mode = "small", rulesText = "") {
   const modeLower = (mode || "small").toLowerCase();
 
   let modeGuidance = "";

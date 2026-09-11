@@ -116,4 +116,7 @@ router.put("/avatar/:avatarId/select", protect, authController.selectUserAvatar)
 router.delete("/avatars/:avatarId", protect, authController.deleteUserAvatar);
 router.delete("/avatar/:avatarId", protect, authController.deleteUserAvatar);
 
+// Pin / Unpin Items
+router.put("/pins", protect, authController.updatePinnedItems);
+
 module.exports = router;
