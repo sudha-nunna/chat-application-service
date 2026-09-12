@@ -13,6 +13,39 @@ const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper")
 const FOLLOW_UP_TIMEOUT_MS = 800;
 
 /**
+ * Extracts a clean topic name from user prompt without filler words, pronouns, or extra prepositions.
+ */
+function extractCleanTopic(prompt) {
+  if (!prompt || typeof prompt !== "string") return "";
+  let clean = prompt.trim();
+
+  // Strip question starters and filler commands
+  clean = clean.replace(/^(hey|hi|hello|please|can you|could you|would you|i want to|i need to|tell|explain|show|give|describe|search|find)\s+/i, "");
+  clean = clean.replace(/^(me|us|him|her|it|them|to me|to us|for me)\s+/i, "");
+  clean = clean.replace(/^(about|for|in|on|with|regarding|concerning|information about|info about|details about|more about)\s+/i, "");
+  clean = clean.replace(/^(what is|what are|who is|who was|where is|why is|how does|how to|difference between)\s+/i, "");
+  clean = clean.replace(/^(a|an|the|this|that|these|those|my|your|his|her|its|our|their)\s+/i, "");
+
+  // Strip trailing punctuation
+  clean = clean.replace(/[?!.,;:\"\`]+$/g, "").trim();
+
+  // Strip residual leading prepositions/pronouns
+  clean = clean.replace(/^(me|us|him|her|it|them|about|for|on|in|with|to)\s+/i, "").trim();
+  clean = clean.replace(/^(a|an|the|this|that|these|those|my|your)\s+/i, "").trim();
+
+  if (/^(image|photo|picture|file|document|attachment|this image|this photo)$/i.test(clean)) {
+    return "this image";
+  }
+
+  // Verify valid topic length and non-stopword string
+  if (clean.length >= 2 && clean.length <= 40 && !/^(me|us|it|this|that|what|how|why)$/i.test(clean)) {
+    return clean;
+  }
+
+  return "";
+}
+
+/**
  * High-performance smart contextual follow-up question generator.
  * Operates in <1ms without network overhead.
  */
@@ -20,12 +53,15 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
   const prompt = (userPrompt || "").trim();
   const response = (assistantResponse || "").trim();
   const combined = `${prompt} ${response}`.toLowerCase();
+  const topic = extractCleanTopic(prompt);
 
-  // Extract core topic/subject phrase from user's prompt if available
-  let topic = "";
-  const topicMatch = prompt.match(/(?:about|for|in|on|with|explain|what is|what are|difference between|how to|why is|how does)\s+([a-zA-Z0-9_\-\s]{2,30})/i);
-  if (topicMatch && topicMatch[1]) {
-    topic = topicMatch[1].trim().replace(/[?!.,]+$/, "");
+  // 0. Image / Vision / Photo queries
+  if (topic === "this image" || /(\bimage\b|\bphoto\b|\bpicture\b|\bscreenshot\b|\bdiagram\b|\bgraphic\b)/i.test(combined)) {
+    return [
+      "Can you explain more details about this image?",
+      "What are the key elements or objects visible here?",
+      "How does this compare to standard examples?"
+    ];
   }
 
   // 1. Math / Calculations / Numbers
@@ -73,11 +109,11 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 6. History / Events / News / People
-  if (/(\bhistory\b|\bwho is\b|\bwho was\b|\bwhen did\b|\bevent\b|\bnews\b|\bcountry\b|\bwar\b|\bcentury\b)/i.test(combined)) {
+  // 6. History / Events / News / People / Places
+  if (/(\bhistory\b|\bwho is\b|\bwho was\b|\bwhen did\b|\bevent\b|\bnews\b|\bcountry\b|\bwar\b|\bcentury\b|\btemple\b|\bcity\b)/i.test(combined)) {
     return [
-      "What were the most significant consequences of this?",
-      "What impact does this have today?",
+      topic ? `What are the key historical highlights of ${topic}?` : "What were the most significant consequences of this?",
+      topic ? `What is the cultural or practical significance of ${topic}?` : "What impact does this have today?",
       "Can you provide a timeline of key milestones?"
     ];
   }

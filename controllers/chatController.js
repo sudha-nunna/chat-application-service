@@ -477,12 +477,17 @@ STRICT IDENTITY RULES:
 3. If asked about your name, identity, or creator, introduce yourself simply and warmly: "I am Codegene AI, your dedicated workspace helper."
 
 CORE BEHAVIOR & OUTPUT FORMAT RULES:
-1. Be direct, natural, engaging, and articulate. Jump straight into the helpful, accurate answer.
-2. NEVER output your internal drafting process, brainstorm notes, planning steps, or meta-commentary (such as "Draft:", "Structure:", "Hook:", or "Since the date is..."). Output ONLY the final, polished response directly to the user.
-3. For casual, open-ended, or greeting prompts (e.g., "tell me something", "what's up", "tell me a story"), provide an interesting, engaging, or thought-provoking answer right away, and warmly ask how you can help them today.
-4. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
-5. For technical, coding, science, or factual queries, provide detailed, accurate, beautifully formatted markdown explanations with bullet points and code blocks.
-6. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
+1. Be direct, natural, engaging, concise, and articulate. Jump straight into the helpful, accurate answer.
+2. FOR GENERAL KNOWLEDGE & EVERYDAY QUESTIONS (e.g., "example of strawberry", "tell me a joke", "what is photosynthesis"):
+   - Provide crisp, direct, ChatGPT-style responses (1 to 3 focused paragraphs or brief bullet points).
+   - Avoid unnecessary preamble or overly lengthy breakdowns unless explicitly requested by the user (e.g., "explain in detail", "elaborate", "deep dive").
+3. FOR TECHNICAL, CODING, DEBUGGING & ARCHITECTURE QUERIES (e.g., "debug this code", "design a REST API", "explain React architecture", "write a python script"):
+   - Provide comprehensive, detailed, accurate, and beautifully formatted markdown explanations with bullet points and code blocks.
+4. FOR EXPLICIT WEB APP & UI GENERATION REQUESTS:
+   - Provide complete, modern, production-ready HTML/JSX/CSS code blocks.
+5. NEVER output your internal drafting process, brainstorm notes, planning steps, or meta-commentary (such as "Draft:", "Structure:", "Hook:", or "Since the date is..."). Output ONLY the final, polished response directly to the user.
+6. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
+7. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
 
     if (summaryText && summaryText.trim()) {
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
@@ -709,28 +714,23 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 `);
 
     if (accumulatedResponseText.trim()) {
-      // 5. Generate AI Follow-up Suggestions (if enabled in Admin System Settings)
-      let followUps = [];
+      // 5. Generate AI Follow-up Suggestions (Instant <1ms heuristic delivery)
+      let finalFollowUps = [];
       try {
         const followUpService = require("../services/followUpService");
-        followUps = await followUpService.generateFollowUps(
-          rawUserMessage,
-          accumulatedResponseText,
-          {
-            model: currentModelId,
-            nodeId: gatewayResult?.nodeId,
-            preResolvedNodeHint
-          }
-        );
-      } catch (fErr) {
-        console.warn("⚠️ [FOLLOW-UPS NOTICE] Generation skipped on error:", fErr.message);
-      }
+        finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
+      } catch (e) {}
 
-      let finalFollowUps = Array.isArray(followUps) && followUps.length > 0 ? followUps : [];
-      if (finalFollowUps.length === 0) {
+      // Emit follow-up suggestions event to frontend IMMEDIATELY so chips show up with 0 delay
+      if (!clientDisconnected && !res.writableEnded && Array.isArray(finalFollowUps) && finalFollowUps.length > 0) {
         try {
-          const followUpService = require("../services/followUpService");
-          finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
+          res.write(`data: ${JSON.stringify({
+            type: "follow_ups",
+            followUps: finalFollowUps
+          })}\n\n`);
+          if (typeof res.flush === "function") {
+            try { res.flush(); } catch (e) {}
+          }
         } catch (e) {}
       }
 
@@ -820,19 +820,6 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         }
       } catch (postStreamErr) {
         console.warn("Notice: Post-stream credit deduction telemetry warning:", postStreamErr.message);
-      }
-
-      // Emit follow-up suggestions event to frontend if generated
-      if (!clientDisconnected && !res.writableEnded && Array.isArray(finalFollowUps) && finalFollowUps.length > 0) {
-        try {
-          res.write(`data: ${JSON.stringify({
-            type: "follow_ups",
-            followUps: finalFollowUps
-          })}\n\n`);
-          if (typeof res.flush === "function") {
-            try { res.flush(); } catch (e) {}
-          }
-        } catch (e) {}
       }
 
       await saveAssistantPromise;
