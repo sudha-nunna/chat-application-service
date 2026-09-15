@@ -295,7 +295,8 @@ exports.sendMessage = async (req, res) => {
     const isExistingChat = chatId && chatId !== "new" && chatId !== "undefined" && chatId !== "null";
 
     // ✅ Promise.all Parallel DB & Pricing Cache Queries (Runs in 1 IO tick)
-    const [userDoc, userUsageToday, modelPricing, chatDoc, dbMessagesHistory] = await Promise.all([
+    let userDoc, userUsageToday, modelPricing, chatDoc, dbMessagesHistory;
+    [userDoc, userUsageToday, modelPricing, chatDoc, dbMessagesHistory] = await Promise.all([
       User.findById(userId),
       Usage.findOne({ userId, date: todayStr }),
       aiGateway.getModelPricingCached(requestedModelId),
@@ -402,15 +403,101 @@ exports.sendMessage = async (req, res) => {
       }
     }
 
-    // Save User message with attachments & update title (only store text user actually typed!)
-    const saveUserMsgPromise = Message.create({
-      chatId,
-      role: "user",
-      content: rawUserMessage,
-      attachments: processedAttachments.map(({ extractedText, ...rest }) => rest)
-    });
+    const isReload = Boolean(req.body.isReload || req.body.isRegenerate);
+    const isEdit = Boolean(req.body.isEdit);
+    const originalContent = req.body.originalContent ? req.body.originalContent.trim() : null;
 
-    if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
+    let userMsgDoc = null;
+    if (isEdit || isReload) {
+      if (isEdit) {
+        // Priority 1: Find by MongoDB _id (most reliable — unique, no text matching issues)
+        if (req.body.messageId) {
+          try {
+            userMsgDoc = await Message.findOne({ _id: req.body.messageId, chatId, role: "user" });
+          } catch (e) { /* invalid ObjectId — skip */ }
+        }
+        // Priority 2: Find by exact originalContent text match (oldest first = correct for editing first message)
+        if (!userMsgDoc && originalContent) {
+          userMsgDoc = await Message.findOne({ chatId, role: "user", content: originalContent }).sort({ createdAt: 1 });
+        }
+        // Priority 3: Fuzzy trim match across all user messages
+        if (!userMsgDoc && originalContent) {
+          const allUserMsgs = await Message.find({ chatId, role: "user" }).sort({ createdAt: 1 });
+          userMsgDoc = allUserMsgs.find(m => m.content.trim() === originalContent) || null;
+        }
+        // Last fallback: pick the oldest user message
+        if (!userMsgDoc) {
+          userMsgDoc = await Message.findOne({ chatId, role: "user" }).sort({ createdAt: 1 });
+        }
+      } else {
+        // For RELOAD: find the user message that matches the current prompt text
+        userMsgDoc = await Message.findOne({ chatId, role: "user", content: rawUserMessage }).sort({ createdAt: -1 });
+        // Fallback: use the most recent user message
+        if (!userMsgDoc) {
+          userMsgDoc = await Message.findOne({ chatId, role: "user" }).sort({ createdAt: -1 });
+        }
+      }
+    }
+
+    if (isEdit && userMsgDoc) {
+      // ChatGPT-Style Edit: Update the target user message content in MongoDB
+      userMsgDoc.content = rawUserMessage;
+      if (processedAttachments && processedAttachments.length > 0) {
+        userMsgDoc.attachments = processedAttachments.map(({ extractedText, ...rest }) => rest);
+      }
+      await userMsgDoc.save();
+
+      // Delete ALL messages after this user message — both assistant replies and subsequent user messages
+      await Message.deleteMany({
+        chatId,
+        createdAt: { $gt: userMsgDoc.createdAt }
+      });
+      // Fetch prior conversation history before this user message for LLM context
+      dbMessagesHistory = await Message.find({
+        chatId,
+        createdAt: { $lt: userMsgDoc.createdAt }
+      }).sort({ createdAt: -1 }).limit(16);
+
+      console.log(`✏️ [EDIT] Updated message "${originalContent?.substring(0, 30)}..." → "${rawUserMessage.substring(0, 30)}..." | Deleted messages after it`);
+    } else if (isReload && userMsgDoc) {
+      // ChatGPT-Style Reload: Delete old assistant reply and regenerate
+      await Message.deleteMany({
+        chatId,
+        createdAt: { $gt: userMsgDoc.createdAt }
+      });
+      // Fetch prior history before this user message for LLM context
+      dbMessagesHistory = await Message.find({
+        chatId,
+        createdAt: { $lt: userMsgDoc.createdAt }
+      }).sort({ createdAt: -1 }).limit(16);
+
+      console.log(`🔄 [RELOAD] Regenerating response for: "${rawUserMessage.substring(0, 40)}..."`);
+    } else if (!isEdit && !isReload) {
+      // Normal new message: save to DB
+      await Message.create({
+        chatId,
+        role: "user",
+        content: rawUserMessage,
+        attachments: processedAttachments.map(({ extractedText, ...rest }) => rest)
+      });
+    } else {
+      // isEdit=true but userMsgDoc is null — treat as normal message to avoid data loss
+      console.warn(`⚠️ [EDIT] Could not find target message to edit. originalContent="${originalContent}". Saving as new message.`);
+      await Message.create({
+        chatId,
+        role: "user",
+        content: rawUserMessage,
+        attachments: processedAttachments.map(({ extractedText, ...rest }) => rest)
+      });
+    }
+
+    // Update chat title: always rename if editing the first message, or if title is still a default placeholder
+    const isFirstMessageEdit = isEdit && userMsgDoc && dbMessagesHistory && dbMessagesHistory.length === 0;
+    if (isFirstMessageEdit) {
+      // The edited message is the first message — update the chat title to the new content
+      chat.title = rawUserMessage.substring(0, 45) || "New Conversation";
+      await chat.save().catch(() => {});
+    } else if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
       const defaultTitle = hasImage ? "Image Analysis" : "Document Analysis";
       chat.title = rawUserMessage.substring(0, 35) || defaultTitle;
       chat.save().catch(() => {});
@@ -581,20 +668,29 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
     }
 
     // Continuation intent detector: when user says "continue", "not done fully", "keep going", etc.
+    const isDevMode = Boolean(req.body.devMode || req.body.isDevModeActive);
     const lastAssistantMsg = historyMsgs.filter((m) => m.role === "assistant").pop();
     const isContinuationIntent = /^(continue|carry on|go on|keep going|proceed|finish|finish it|finish the code|not done|it not done|see it not done|it is not done|not fully done|see it not done fully|complete it|complete the rest|build the rest)\b/i.test((rawUserMessage || "").trim());
 
     if (isContinuationIntent && lastAssistantMsg) {
-      finalUserPrompt = `${finalUserPrompt}\n\n[CRITICAL CONTINUATION DIRECTIVE: The user is explicitly requesting to continue and fully finish their project or code ("${rawUserMessage.trim()}").
+      const lastContent = lastAssistantMsg.content || "";
+      const isContinuingCodeArtifact = isDevMode || (lastContent.includes("```") && (lastContent.includes("jsx") || lastContent.includes("html") || lastContent.includes("App.jsx") || lastContent.includes("Component")));
+
+      if (isContinuingCodeArtifact) {
+        finalUserPrompt = `${finalUserPrompt}\n\n[CRITICAL CONTINUATION DIRECTIVE: The user is explicitly requesting to continue writing their code project ("${rawUserMessage.trim()}").
 1. Do NOT state that you already finished or that the files are complete.
 2. Do NOT say "It looks like you might be typing continue".
-3. Do NOT ask clarifying questions like "Which section should I build first?" or "What would you like me to add next?".
-4. Immediately proceed to write the next remaining sections and components (such as FeaturesSection.jsx, PricingSection.jsx, TestimonialsSection.jsx, Footer.jsx, etc.) and provide the updated App.jsx that integrates all components into a complete, working application. Output the full code blocks directly.]`;
+3. Do NOT ask clarifying questions like "Which section should I build first?".
+4. Immediately proceed to write the next remaining sections and components and output the code blocks directly.]`;
+      } else {
+        finalUserPrompt = `${finalUserPrompt}\n\n[CRITICAL CONTINUATION DIRECTIVE: The user is explicitly requesting to continue their response ("${rawUserMessage.trim()}").
+1. Do NOT repeat what was already written.
+2. Do NOT introduce or create web components, HTML pages, or App.jsx unless explicitly requested.
+3. Seamlessly continue writing the response naturally in standard text format directly from where it stopped.]`;
+      }
     }
 
     historyPayload.push({ role: "user", content: finalUserPrompt });
-
-    await saveUserMsgPromise;
 
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();
@@ -855,7 +951,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         creditReserved = false;
       }
       if (res.writableEnded) return;
-      console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content.");
+      console.warn("⚠️ [AI GATEWAY NOTICE] Stream failed or returned empty content. Detail:", gatewayResult?.errorMessage || gatewayResult?.userFriendlyMessage || "No response received");
       const standardTrafficMsg = "I'm sorry, I am experiencing difficulty connecting at the moment due to high traffic. Please try again in a few minutes.";
       let fallbackText = gatewayResult?.userFriendlyMessage || standardTrafficMsg;
       if (!fallbackText || fallbackText.includes("HTTP 40") || fallbackText.includes("not found") || fallbackText.includes("errorBody") || fallbackText.includes("model '") || fallbackText.includes("{") || fallbackText.includes("returned HTTP")) {
@@ -875,9 +971,8 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
     }
   } catch (error) {
     console.error("General Chat Pipeline Error:", error);
-    if (creditReserved) {
+    if (typeof creditReserved !== "undefined" && creditReserved && typeof User !== "undefined" && userId) {
       await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => {});
-      creditReserved = false;
     }
     if (!res.headersSent) {
       res.status(500).json({ success: false, message: "General chat processing failed.", error: error.message });
