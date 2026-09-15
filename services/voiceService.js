@@ -188,8 +188,20 @@ async function generateSpeechAndVisemes(text, voiceConfig = {}, reqHost = "", op
 
     const cleanText = text.replace(/[*_#`~]/g, " ").trim();
     if (cleanText) {
+      let targetLang = voiceConfig.lang || "en-US";
+      const vId = (voiceConfig.voiceId || voiceConfig.id || voiceConfig.name || "").toLowerCase();
+      const vAccent = (voiceConfig.accent || "").toLowerCase();
+
+      if (vAccent.includes("uk") || vAccent.includes("gb") || ["chloe", "emily", "david"].includes(vId)) {
+        targetLang = "en-GB";
+      } else if (vAccent.includes("au") || vId === "michael") {
+        targetLang = "en-AU";
+      } else if (vAccent.includes("in")) {
+        targetLang = "en-IN";
+      }
+
       const base64Results = await googleTTS.getAllAudioBase64(cleanText, {
-        lang: voiceConfig.lang || "en",
+        lang: targetLang,
         slow: false,
         host: "https://translate.google.com",
         timeout: 10000,

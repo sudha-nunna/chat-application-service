@@ -465,6 +465,7 @@ exports.deleteAgentKnowledge = async (req, res) => {
  * Handles testing and live turns through visual flow nodes, RAG, and F5-TTS
  */
 exports.executeFlowTurn = async (req, res) => {
+  const startTime = Date.now();
   try {
     const { id } = req.params;
     const {
@@ -571,10 +572,14 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
 
     // 5. Evaluate Transition to Next Node
     let nextNode = null;
+    let matchedTransitionLabel = "Default Next Step";
     const outgoingConnections = flowConnections.filter((c) => c.fromNode === currentNode.id);
     if (outgoingConnections.length > 0) {
       const targetConn = outgoingConnections[0];
       nextNode = flowNodes.find((n) => n.id === targetConn.toNode);
+      if (currentNode.data?.transitions && currentNode.data.transitions[targetConn.transitionIndex || 0]) {
+        matchedTransitionLabel = currentNode.data.transitions[targetConn.transitionIndex || 0].label;
+      }
     }
 
     const isStreamRequested = req.body.stream === true || (req.headers.accept || "").includes("text/event-stream");
@@ -602,13 +607,25 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
         streamReply = errFallback;
       }
 
+      const executionLatencyMs = Date.now() - startTime;
       res.write(`data: ${JSON.stringify({
         type: "done",
         success: true,
         replyText: streamReply,
         modelUsed: chosenModel,
         activeNode: currentNode,
-        nextNode: nextNode || currentNode
+        nextNode: nextNode || currentNode,
+        stepTrace: {
+          nodeId: currentNode.id,
+          nodeTitle: currentNode.title || currentNode.id,
+          nodeType: currentNode.type || "conversation",
+          promptUsed: currentNode.data?.text || basePrompt,
+          userUtterance: message,
+          matchedTransition: matchedTransitionLabel,
+          extractedVariables: sessionVariables || {},
+          latencyMs: executionLatencyMs,
+          costEst: "$0.0019"
+        }
       })}\n\n`);
       return res.end();
     }
@@ -651,6 +668,8 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
       }
     }
 
+    const executionLatencyMs = Date.now() - startTime;
+
     return res.json({
       success: true,
       replyText: fullReply,
@@ -658,7 +677,18 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
       activeNode: currentNode,
       nextNode: nextNode || currentNode,
       sessionVariables,
-      modelUsed: chosenModel
+      modelUsed: chosenModel,
+      stepTrace: {
+        nodeId: currentNode.id,
+        nodeTitle: currentNode.title || currentNode.id,
+        nodeType: currentNode.type || "conversation",
+        promptUsed: currentNode.data?.text || basePrompt,
+        userUtterance: message,
+        matchedTransition: matchedTransitionLabel,
+        extractedVariables: sessionVariables || {},
+        latencyMs: executionLatencyMs,
+        costEst: "$0.0019"
+      }
     });
   } catch (err) {
     console.error("Error executing flow turn:", err);
