@@ -958,20 +958,25 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         const isMsgForCurrentPrompt = existingAssistantMsg && lastUserMsg && existingAssistantMsg.createdAt > lastUserMsg.createdAt;
 
         if (existingAssistantMsg && isMsgForCurrentPrompt) {
-          existingAssistantMsg.content = accumulatedResponseText;
-          existingAssistantMsg.isStoppedMidway = clientDisconnected || Boolean(existingAssistantMsg.isStoppedMidway);
-          existingAssistantMsg.followUps = finalFollowUps || [];
-          if (Array.isArray(searchSources) && searchSources.length > 0) {
-            existingAssistantMsg.sources = searchSources;
+          if (existingAssistantMsg.isStoppedMidway) {
+            console.log(`🛑 [STREAM COMPLETE] Message ${existingAssistantMsg._id} was stopped midway. Preserving partial content (${existingAssistantMsg.content?.length || 0} chars).`);
+            saveAssistantPromise = Promise.resolve(existingAssistantMsg);
+          } else {
+            existingAssistantMsg.content = accumulatedResponseText;
+            existingAssistantMsg.isStoppedMidway = Boolean(clientDisconnected);
+            existingAssistantMsg.followUps = finalFollowUps || [];
+            if (Array.isArray(searchSources) && searchSources.length > 0) {
+              existingAssistantMsg.sources = searchSources;
+            }
+            existingAssistantMsg.requiresWebSearch = isGuidanceActive;
+            saveAssistantPromise = existingAssistantMsg.save();
           }
-          existingAssistantMsg.requiresWebSearch = isGuidanceActive;
-          saveAssistantPromise = existingAssistantMsg.save();
         } else {
           saveAssistantPromise = Message.create({
             chatId,
             role: "assistant",
             content: accumulatedResponseText,
-            isStoppedMidway: clientDisconnected,
+            isStoppedMidway: Boolean(clientDisconnected),
             followUps: finalFollowUps || [],
             sources: searchSources,
             requiresWebSearch: isGuidanceActive
