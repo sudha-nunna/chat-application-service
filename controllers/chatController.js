@@ -145,38 +145,63 @@ exports.getChats = async (req, res) => {
 exports.stopMessage = async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { content } = req.body;
+    const { content, messageId, stoppedMessageId } = req.body;
 
     if (!chatId) {
       return res.status(400).json({ success: false, message: "chatId is required." });
     }
 
-    const lastMsg = await Message.findOne({ chatId }).sort({ createdAt: -1 });
+    const targetId = messageId || stoppedMessageId;
+    let targetMsg = null;
 
-    if (lastMsg && lastMsg.role === "assistant") {
+    if (targetId) {
+      try {
+        targetMsg = await Message.findOne({ _id: targetId, chatId });
+      } catch (e) {}
+    }
+
+    const lastUserMsg = await Message.findOne({ chatId, role: "user" }).sort({ createdAt: -1 });
+    const lastAssistantMsg = await Message.findOne({ chatId, role: "assistant" }).sort({ createdAt: -1 });
+
+    const isNewStreamAfterUserMsg = lastUserMsg && (!lastAssistantMsg || lastUserMsg.createdAt > lastAssistantMsg.createdAt);
+
+    if (targetMsg && targetMsg.role === "assistant") {
       if (content && typeof content === "string") {
-        lastMsg.content = content;
+        targetMsg.content = content;
       }
-      lastMsg.isStoppedMidway = true;
-      if (!lastMsg.followUps || lastMsg.followUps.length === 0) {
-        try {
-          const followUpService = require("../services/followUpService");
-          lastMsg.followUps = followUpService.getSmartFollowUps("", lastMsg.content);
-        } catch (e) {}
+      targetMsg.isStoppedMidway = true;
+      targetMsg.continuationResolved = false;
+      await targetMsg.save();
+      return res.json({ success: true, message: targetMsg });
+    } else if (lastAssistantMsg && !isNewStreamAfterUserMsg) {
+      if (content && typeof content === "string") {
+        lastAssistantMsg.content = content;
       }
-      await lastMsg.save();
-      return res.json({ success: true, message: lastMsg });
+      lastAssistantMsg.isStoppedMidway = true;
+      lastAssistantMsg.continuationResolved = false;
+      await lastAssistantMsg.save();
+      return res.json({ success: true, message: lastAssistantMsg });
     } else if (content && typeof content === "string" && content.trim()) {
       let smartFollowUps = [];
       try {
         const followUpService = require("../services/followUpService");
-        smartFollowUps = followUpService.getSmartFollowUps(lastMsg?.role === "user" ? lastMsg.content : "", content.trim());
+        smartFollowUps = followUpService.getSmartFollowUps(lastUserMsg?.content || "", content.trim());
       } catch (e) {}
+
+      if (lastUserMsg) {
+        await Message.deleteMany({
+          chatId,
+          role: "assistant",
+          createdAt: { $gt: lastUserMsg.createdAt }
+        });
+      }
+
       const newMsg = await Message.create({
         chatId,
         role: "assistant",
         content: content.trim(),
         isStoppedMidway: true,
+        continuationResolved: false,
         followUps: smartFollowUps || []
       });
       return res.json({ success: true, message: newMsg });
@@ -192,7 +217,20 @@ exports.stopMessage = async (req, res) => {
 exports.getMessages = async (req, res) => {
   try {
     const messages = await Message.find({ chatId: req.params.chatId }).sort({ createdAt: 1 });
-    res.json(messages);
+
+    const sanitizedMessages = messages.map((msg, idx) => {
+      const msgObj = msg.toObject ? msg.toObject() : { ...msg };
+      const isLastMessage = idx === messages.length - 1;
+
+      if (!isLastMessage && msgObj.role === "assistant" && msgObj.isStoppedMidway) {
+        msgObj.isStoppedMidway = false;
+        msgObj.continuationResolved = true;
+        Message.updateOne({ _id: msgObj._id }, { $set: { isStoppedMidway: false, continuationResolved: true } }).catch(() => {});
+      }
+      return msgObj;
+    });
+
+    res.json(sanitizedMessages);
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -271,10 +309,11 @@ exports.sendMessage = async (req, res) => {
     let chatId = req.params.chatId;
     const rawAttachments = req.body.attachments || [];
 
+    const isContinuation = Boolean(req.body.isContinuation);
     const hasAttachments = Array.isArray(rawAttachments) && rawAttachments.length > 0;
     const hasMessage = typeof message === "string" && message.trim().length > 0;
 
-    if (!hasMessage) {
+    if (!hasMessage && !isContinuation) {
       return res.status(400).json({ success: false, message: "A text prompt is required with your submission." });
     }
 
@@ -405,7 +444,35 @@ exports.sendMessage = async (req, res) => {
 
     const isReload = Boolean(req.body.isReload || req.body.isRegenerate);
     const isEdit = Boolean(req.body.isEdit);
+    const isLastMessage = req.body.isLastMessage !== undefined ? Boolean(req.body.isLastMessage) : true;
+    const stoppedMessageId = req.body.stoppedMessageId || req.body.messageId;
+    const baseContent = typeof req.body.baseContent === "string" ? req.body.baseContent : (typeof req.body.stoppedContent === "string" ? req.body.stoppedContent : "");
     const originalContent = req.body.originalContent ? req.body.originalContent.trim() : null;
+
+    let targetAssistantMsg = null;
+    if (isContinuation) {
+      if (stoppedMessageId) {
+        try {
+          targetAssistantMsg = await Message.findOne({ _id: stoppedMessageId, chatId, role: "assistant" });
+        } catch (e) {}
+      }
+      if (!targetAssistantMsg && baseContent) {
+        try {
+          targetAssistantMsg = await Message.findOne({ chatId, role: "assistant", content: baseContent.trim() });
+        } catch (e) {}
+      }
+      if (!targetAssistantMsg && baseContent) {
+        try {
+          const prefix = baseContent.trim().substring(0, 40);
+          if (prefix) {
+            targetAssistantMsg = await Message.findOne({ chatId, role: "assistant", content: { $regex: prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: "i" } });
+          }
+        } catch (e) {}
+      }
+      if (!targetAssistantMsg) {
+        targetAssistantMsg = await Message.findOne({ chatId, role: "assistant" }).sort({ createdAt: -1 });
+      }
+    }
 
     let userMsgDoc = null;
     if (isEdit || isReload) {
@@ -472,6 +539,20 @@ exports.sendMessage = async (req, res) => {
       }).sort({ createdAt: -1 }).limit(16);
 
       console.log(`🔄 [RELOAD] Regenerating response for: "${rawUserMessage.substring(0, 40)}..."`);
+    } else if (isContinuation) {
+      // Continuation mode: Delete downstream messages after targetAssistantMsg (Edit/Reload style)
+      if (targetAssistantMsg) {
+        await Message.deleteMany({
+          chatId,
+          createdAt: { $gt: targetAssistantMsg.createdAt }
+        });
+
+        dbMessagesHistory = await Message.find({
+          chatId,
+          createdAt: { $lt: targetAssistantMsg.createdAt }
+        }).sort({ createdAt: -1 }).limit(16);
+      }
+      console.log(`▶️ [CONTINUATION] Resuming response for assistant message ${targetAssistantMsg?._id} from baseContent length ${baseContent.length} | Deleted downstream messages`);
     } else if (!isEdit && !isReload) {
       // Normal new message: save to DB
       await Message.create({
@@ -690,7 +771,31 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
       }
     }
 
-    historyPayload.push({ role: "user", content: finalUserPrompt });
+    if (isContinuation && targetAssistantMsg) {
+      const partialText = baseContent || targetAssistantMsg.content || "";
+      const tailSnippet = partialText.slice(-120).trim();
+      const openFences = (partialText.match(/```/g) || []).length;
+      const isInsideCode = openFences % 2 !== 0;
+
+      historyPayload.push({
+        role: "assistant",
+        content: partialText
+      });
+
+      let continuationDirective = "";
+      if (isInsideCode) {
+        continuationDirective = `[CONTINUATION DIRECTIVE: Continue writing the code directly from where it was stopped. Do not repeat what was already written. Do not open a new code block. Continue directly with the remaining code from: "${tailSnippet}"]`;
+      } else {
+        continuationDirective = `[CONTINUATION DIRECTIVE: Continue the response directly from where it was stopped without repeating. Continue immediately from: "${tailSnippet}"]`;
+      }
+
+      historyPayload.push({
+        role: "user",
+        content: continuationDirective
+      });
+    } else {
+      historyPayload.push({ role: "user", content: finalUserPrompt });
+    }
 
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();
@@ -830,16 +935,49 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         } catch (e) {}
       }
 
-      const isStopped = (clientDisconnected || Boolean(req.destroyed)) && !res.writableEnded;
-      const saveAssistantPromise = Message.create({
-        chatId,
-        role: "assistant",
-        content: accumulatedResponseText,
-        isStoppedMidway: isStopped,
-        followUps: finalFollowUps || [],
-        sources: searchSources,
-        requiresWebSearch: isGuidanceActive
-      });
+      // Normal stream completion: set isStopped to false.
+      // Explicit user stops hit the /chats/:id/messages/stop endpoint which sets isStoppedMidway: true.
+      const isStopped = false;
+      let saveAssistantPromise;
+
+      if (isContinuation && targetAssistantMsg) {
+        const initialPrefix = baseContent || targetAssistantMsg.content || "";
+        const fullContent = initialPrefix + (accumulatedResponseText || "");
+        targetAssistantMsg.content = fullContent;
+        targetAssistantMsg.isStoppedMidway = false;
+        targetAssistantMsg.continuationResolved = true;
+        targetAssistantMsg.followUps = finalFollowUps || [];
+        if (Array.isArray(searchSources) && searchSources.length > 0) {
+          targetAssistantMsg.sources = searchSources;
+        }
+        targetAssistantMsg.requiresWebSearch = isGuidanceActive;
+        saveAssistantPromise = targetAssistantMsg.save();
+      } else {
+        const existingAssistantMsg = await Message.findOne({ chatId, role: "assistant" }).sort({ createdAt: -1 });
+        const lastUserMsg = await Message.findOne({ chatId, role: "user" }).sort({ createdAt: -1 });
+        const isMsgForCurrentPrompt = existingAssistantMsg && lastUserMsg && existingAssistantMsg.createdAt > lastUserMsg.createdAt;
+
+        if (existingAssistantMsg && isMsgForCurrentPrompt) {
+          existingAssistantMsg.content = accumulatedResponseText;
+          existingAssistantMsg.isStoppedMidway = clientDisconnected || Boolean(existingAssistantMsg.isStoppedMidway);
+          existingAssistantMsg.followUps = finalFollowUps || [];
+          if (Array.isArray(searchSources) && searchSources.length > 0) {
+            existingAssistantMsg.sources = searchSources;
+          }
+          existingAssistantMsg.requiresWebSearch = isGuidanceActive;
+          saveAssistantPromise = existingAssistantMsg.save();
+        } else {
+          saveAssistantPromise = Message.create({
+            chatId,
+            role: "assistant",
+            content: accumulatedResponseText,
+            isStoppedMidway: clientDisconnected,
+            followUps: finalFollowUps || [],
+            sources: searchSources,
+            requiresWebSearch: isGuidanceActive
+          });
+        }
+      }
       updateRollingSummaryIfNeeded(chat, chatId).catch(() => {});
 
       // 6. Post-Stream Atomic Credit Deduction & Async Telemetry Logging

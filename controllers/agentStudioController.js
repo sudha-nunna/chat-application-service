@@ -483,7 +483,9 @@ exports.executeFlowTurn = async (req, res) => {
     const flowNodes = (req.body.nodes && Array.isArray(req.body.nodes) && req.body.nodes.length > 0)
       ? req.body.nodes
       : (agent?.flowGraph?.nodes || DEFAULT_FLOW_NODES);
-    const flowConnections = agent?.flowGraph?.connections || DEFAULT_CONNECTIONS;
+    const flowConnections = (req.body.connections && Array.isArray(req.body.connections))
+      ? req.body.connections
+      : (agent?.flowGraph?.connections || DEFAULT_CONNECTIONS);
 
     const chosenModel = req.body.model || agent?.model || "glm-5.3-flash:cloud";
     const agentName = agent?.name || req.body.name || "Conversational Agent";
@@ -493,7 +495,136 @@ exports.executeFlowTurn = async (req, res) => {
     // 1. Identify current active node
     let currentNode = flowNodes.find((n) => n.id === activeNodeId) || flowNodes.find((n) => n.id === "welcome-node") || flowNodes[0];
 
-    // 2. RAG Context Retrieval: Query indexed chunks from knowledge base (if agent exists)
+    // 2. Evaluate Transition to Next Node matching user utterance
+    let nextNode = null;
+    let matchedTransitionLabel = "Default Next Step";
+    let matchedTransition = null;
+
+    const transitions = currentNode?.data?.transitions || [];
+    const msgLower = (message || "").toLowerCase().trim();
+
+    if (transitions.length > 0) {
+      matchedTransition = transitions.find((t) => {
+        const lbl = (t.label || "").toLowerCase().replace(/^=\s*/, "").trim();
+        const cond = (t.condition || "").toLowerCase().trim();
+        return (lbl && (msgLower.includes(lbl) || lbl.includes(msgLower))) ||
+               (cond && msgLower.includes(cond));
+      });
+      if (!matchedTransition) {
+        matchedTransition = transitions[0];
+      }
+    }
+
+    if (matchedTransition) {
+      matchedTransitionLabel = matchedTransition.label || "Matched Transition";
+      if (matchedTransition.targetNodeId) {
+        nextNode = flowNodes.find((n) => n.id === matchedTransition.targetNodeId);
+      }
+      if (!nextNode && flowConnections.length > 0) {
+        const conn = flowConnections.find((c) =>
+          c.fromNode === currentNode.id &&
+          (c.transitionId === matchedTransition.id || c.transitionIndex === transitions.indexOf(matchedTransition))
+        );
+        if (conn) {
+          nextNode = flowNodes.find((n) => n.id === conn.toNode);
+        }
+      }
+    }
+
+    if (!nextNode && flowConnections.length > 0) {
+      const conn = flowConnections.find((c) => c.fromNode === currentNode.id);
+      if (conn) {
+        nextNode = flowNodes.find((n) => n.id === conn.toNode);
+      }
+    }
+
+    // 3. Node Type Specialized Action Execution (Call Transfer, MCP, Subagent)
+    if (nextNode && nextNode.type === "call_transfer") {
+      const transferDestination = nextNode.data?.phone || "+1 (800) 555-0199";
+      const transferMessage = `📞 **Initiating Call Transfer**\n\nTransferring your ongoing call to **${transferDestination}**... Please hold while I connect your call.`;
+      const executionLatencyMs = Date.now() - startTime;
+
+      if (req.body.stream === true || (req.headers.accept || "").includes("text/event-stream")) {
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+        res.write(`data: ${JSON.stringify({ type: "chunk", chunk: transferMessage })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          type: "done",
+          success: true,
+          replyText: transferMessage,
+          modelUsed: chosenModel,
+          activeNode: currentNode,
+          nextNode: nextNode,
+          stepTrace: {
+            nodeId: currentNode.id,
+            nodeTitle: currentNode.title || currentNode.id,
+            nodeType: "call_transfer",
+            userUtterance: message,
+            matchedTransition: matchedTransitionLabel,
+            extractedVariables: sessionVariables || {},
+            latencyMs: executionLatencyMs
+          }
+        })}\n\n`);
+        return res.end();
+      }
+
+      return res.json({
+        success: true,
+        replyText: transferMessage,
+        audioUrl: "",
+        activeNode: currentNode,
+        nextNode: nextNode,
+        sessionVariables,
+        modelUsed: chosenModel,
+        stepTrace: {
+          nodeId: currentNode.id,
+          nodeTitle: currentNode.title || currentNode.id,
+          nodeType: "call_transfer",
+          userUtterance: message,
+          matchedTransition: matchedTransitionLabel,
+          extractedVariables: sessionVariables || {},
+          latencyMs: executionLatencyMs
+        }
+      });
+    }
+
+    if (nextNode && nextNode.type === "mcp") {
+      const serverUrl = nextNode.data?.serverUrl || "MCP Server";
+      const mcpMessage = `🔌 **MCP Tool Server Invocation**\n\nInvoking Model Context Protocol tool endpoint: \`${serverUrl}\`...\n\nProcessing external payload and returning status.`;
+      const executionLatencyMs = Date.now() - startTime;
+
+      if (req.body.stream === true || (req.headers.accept || "").includes("text/event-stream")) {
+        res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+        res.write(`data: ${JSON.stringify({ type: "chunk", chunk: mcpMessage })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          type: "done",
+          success: true,
+          replyText: mcpMessage,
+          modelUsed: chosenModel,
+          activeNode: currentNode,
+          nextNode: nextNode,
+          stepTrace: {
+            nodeId: currentNode.id,
+            nodeTitle: currentNode.title || currentNode.id,
+            nodeType: "mcp",
+            userUtterance: message,
+            matchedTransition: matchedTransitionLabel,
+            extractedVariables: sessionVariables || {},
+            latencyMs: executionLatencyMs
+          }
+        })}\n\n`);
+        return res.end();
+      }
+    }
+
+    // 4. RAG Context Retrieval: Query indexed chunks from knowledge base (if agent exists)
     let ragContext = "";
     if (message.trim() && id && mongoose.Types.ObjectId.isValid(id)) {
       try {
@@ -521,7 +652,7 @@ exports.executeFlowTurn = async (req, res) => {
       }
     }
 
-    // 3. Strict Operational Guardrails & Prompt Construction
+    // 5. Operational Guardrails & Prompt Construction
     const isVoiceCall = Boolean(req.body.channel === "voice" || req.body.isVoice || req.body.returnAudio);
     const voiceSpokenGuardrails = isVoiceCall
       ? `\n### LIVE TELEPHONE & VOICE CALL MODE:
@@ -538,9 +669,9 @@ exports.executeFlowTurn = async (req, res) => {
 - Present lists with one bullet per item.`
       : "";
 
-    const strictRules = agent?.securityConfig?.strictGuardrails
+    const strictRules = (agent?.securityConfig?.strictGuardrails && !nextNode)
       ? "STRICT RULES: You must ONLY answer using factual information directly provided in the knowledge context. If the user asks anything outside the knowledge context, you MUST politely refuse."
-      : "Answer accurately and professionally based on the conversation context.";
+      : "Answer accurately and professionally based on the conversation step.";
 
     const fallbackResponse = agent?.securityConfig?.fallbackMessage || "I'm sorry, I cannot find information regarding that in my knowledge base.";
 
@@ -557,7 +688,7 @@ ${textChatFormattingGuidelines}
 Fallback phrase: "${fallbackResponse}"
 ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
 
-    // 4. Generate AI Response via Multi-LLM AI Gateway
+    // 6. Generate AI Response via Multi-LLM AI Gateway
     const messagesPayload = [
       { role: "system", content: systemPrompt },
       { role: "user", content: message }
@@ -569,18 +700,6 @@ ${ragContext ? `\n\n### RETRIEVED KNOWLEDGE CONTEXT:\n${ragContext}` : ""}`;
     else if (mLower.includes("gemini")) provider = "gemini";
     else if (mLower.includes("glm") || mLower.includes("nvidia")) provider = "glm";
     else if (mLower.includes("claude") || mLower.includes("anthropic")) provider = "anthropic";
-
-    // 5. Evaluate Transition to Next Node
-    let nextNode = null;
-    let matchedTransitionLabel = "Default Next Step";
-    const outgoingConnections = flowConnections.filter((c) => c.fromNode === currentNode.id);
-    if (outgoingConnections.length > 0) {
-      const targetConn = outgoingConnections[0];
-      nextNode = flowNodes.find((n) => n.id === targetConn.toNode);
-      if (currentNode.data?.transitions && currentNode.data.transitions[targetConn.transitionIndex || 0]) {
-        matchedTransitionLabel = currentNode.data.transitions[targetConn.transitionIndex || 0].label;
-      }
-    }
 
     const isStreamRequested = req.body.stream === true || (req.headers.accept || "").includes("text/event-stream");
 

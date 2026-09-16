@@ -25,6 +25,11 @@ const messageSchema = new mongoose.Schema(
       default: false,
     },
 
+    continuationResolved: {
+      type: Boolean,
+      default: false,
+    },
+
     attachments: [
       {
         name: { type: String, required: true },
