@@ -507,13 +507,6 @@ exports.sendMessage = async (req, res) => {
     }
 
     if (isEdit && userMsgDoc) {
-      // ChatGPT-Style Edit: Update the target user message content in MongoDB
-      userMsgDoc.content = rawUserMessage;
-      if (processedAttachments && processedAttachments.length > 0) {
-        userMsgDoc.attachments = processedAttachments.map(({ extractedText, ...rest }) => rest);
-      }
-      await userMsgDoc.save();
-
       // Delete ALL messages after this user message — both assistant replies and subsequent user messages
       await Message.deleteMany({
         chatId,
@@ -525,7 +518,19 @@ exports.sendMessage = async (req, res) => {
         createdAt: { $lt: userMsgDoc.createdAt }
       }).sort({ createdAt: -1 }).limit(16);
 
-      console.log(`✏️ [EDIT] Updated message "${originalContent?.substring(0, 30)}..." → "${rawUserMessage.substring(0, 30)}..." | Deleted messages after it`);
+      // ChatGPT-Style Edit: Update the target user message content AND timestamp to today
+      userMsgDoc.content = rawUserMessage;
+      userMsgDoc.createdAt = new Date();
+      if (processedAttachments && processedAttachments.length > 0) {
+        userMsgDoc.attachments = processedAttachments.map(({ extractedText, ...rest }) => rest);
+      }
+      await userMsgDoc.save();
+
+      // Touch chat updatedAt timestamp to reflect edit today
+      chat.updatedAt = new Date();
+      await chat.save().catch(() => {});
+
+      console.log(`✏️ [EDIT] Updated message "${originalContent?.substring(0, 30)}..." → "${rawUserMessage.substring(0, 30)}..." to today | Deleted messages after it`);
     } else if (isReload && userMsgDoc) {
       // ChatGPT-Style Reload: Delete old assistant reply and regenerate
       await Message.deleteMany({
@@ -661,6 +666,52 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
     }
 
+    // ─── MCP Slack Context Pre-fetch (runs BEFORE historyPayload is frozen) ────────
+    // Fetches real Slack data and appends it to unifiedSystemPrompt so the LLM
+    // can intelligently answer ANY Slack-related question with live data.
+    let isSlackQueryPre = false;
+    if (rawUserMessage) {
+      const lowerMsgPre = rawUserMessage.toLowerCase();
+      isSlackQueryPre = /\b(slack|channel|channels|dm|dms|direct message|direct messages|unread|recent|messages|history|active messages|last\s+\d+\s+messages|new messages|any messages|workspace|work space|workspaces|people|members|users|headcount|member list|who is in|how many|who are|team)\b/i.test(lowerMsgPre);
+      const isPostIntentPre = /\b(send|post|write|msg|text)\b/i.test(lowerMsgPre) &&
+        (/\b(message|hello|hi|hey|text|dm|dms|channel|chat)\b/i.test(lowerMsgPre) || /\b(?:to|in|into|on)\s+/i.test(lowerMsgPre) || /#[a-zA-Z0-9_-]+/.test(lowerMsgPre));
+
+      if (isPostIntentPre) {
+        const McpRuntimeServicePre = require("../services/mcp/McpRuntimeService");
+        const mcpAuthCheck = await McpRuntimeServicePre.getToolsForUser(userId, "slack");
+
+        if (!mcpAuthCheck.connected) {
+          unifiedSystemPrompt +=
+            `\n\n[SLACK INTEGRATION ACCESS REQUIRED]\n` +
+            `Their Slack account is currently NOT connected.\n` +
+            `You MUST respond in exact ChatGPT style:\n` +
+            `"To send messages to your Slack workspace, please allow access by connecting your Slack workspace under **MCP Host Servers** in the sidebar."\n\n`;
+        }
+      } else if (isSlackQueryPre) {
+        try {
+          const McpRuntimeServicePre = require("../services/mcp/McpRuntimeService");
+          const mcpAuthCheck = await McpRuntimeServicePre.getToolsForUser(userId, "slack");
+          if (mcpAuthCheck.connected) {
+            const slackContextPre = await McpRuntimeServicePre.buildSlackContext(userId, rawUserMessage);
+            if (slackContextPre) {
+              const teamPre = mcpAuthCheck.authContext?.teamName || "Your Slack Workspace";
+              unifiedSystemPrompt +=
+                `\n\n[SLACK WORKSPACE INTEGRATION — ${teamPre}]\n` +
+                `You have live, real-time access to the user's Slack workspace via the MCP Host integration.\n` +
+                `Answer ALL Slack-related questions using ONLY the real data provided below.\n` +
+                `Do NOT say you lack access to Slack. Be specific: name channels, users, message content.\n` +
+                `If a channel has no messages, say so clearly. If the user asks about DMs, look at DM entries.\n` +
+                `CRITICAL: Never mention Web Search or tell the user to turn on Web Search for Slack requests.\n\n` +
+                slackContextPre;
+              console.log(`[MCP] Slack context injected into system prompt (${slackContextPre.length} chars)`);
+            }
+          }
+        } catch (slackErrPre) {
+          console.warn("[MCP] Slack pre-fetch warning (non-blocking):", slackErrPre.message);
+        }
+      }
+    }
+
     const historyPayload = [{ role: "system", content: unifiedSystemPrompt }];
     historyMsgs.forEach((msg) => {
       if (
@@ -739,7 +790,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
           console.warn("⚠️ [SEARCH] Graceful skip on error:", searchErr.message);
         }
       }
-    } else if (!enableSearch && rawUserMessage) {
+    } else if (!enableSearch && rawUserMessage && !isSlackQueryPre) {
       const { isTimeSensitiveQuery } = require("../services/searchIntentService");
       if (isTimeSensitiveQuery(rawUserMessage)) {
         isGuidanceActive = true;
@@ -799,6 +850,150 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 
     const jobId = `general_${chatId}_${Date.now()}`;
     llmRequestStartTime = performance.now();
+
+    // ─── MCP: Handle send/post Slack message (single execution point) ────────────
+    if (rawUserMessage) {
+      const lowerMsgAction = rawUserMessage.toLowerCase();
+      const isPostAction =
+        /\b(send|post|write)\b/i.test(lowerMsgAction) &&
+        (
+          /\b(message|hello|hi|hey|text|dm|dms|channel|chat)\b/i.test(lowerMsgAction) ||
+          /\b(?:to|in|into|on)\s+/i.test(lowerMsgAction) ||
+          /#[a-zA-Z0-9_-]+/.test(lowerMsgAction)
+        );
+
+      if (isPostAction) {
+        const text = rawUserMessage.trim();
+        let recipient = "";
+        let messageText = "";
+        let replyText = "";
+
+        // Step 1: Quoted text → message body (highest priority)
+        const quoteMatch = text.match(/['""]([^'""]+)['""]|'([^']+)'|"([^"]+)"/);
+        if (quoteMatch) {
+          messageText = (quoteMatch[1] || quoteMatch[2] || quoteMatch[3]).trim();
+        }
+
+        // Step 2: Explicit #channel tag (e.g. #social, #general)
+        const hashMatch = text.match(/#([a-zA-Z0-9_-]+)/);
+        if (hashMatch) {
+          recipient = hashMatch[1].trim();
+        }
+
+        // Step 3: Explicit @user tag (e.g. @sudha)
+        if (!recipient) {
+          const atMatch = text.match(/@([a-zA-Z0-9._-]+)/);
+          if (atMatch) {
+            recipient = atMatch[1].trim();
+          }
+        }
+
+        // Step 4: Natural language recipient — trailing "to <Name>" or "in <Name>"
+        // Handles: "send hello to Sudha", "send hello what is project status message to Sudha",
+        //          "send message to Sudha with hello", "send msg in Nunna Sudha"
+        if (!recipient) {
+          // Match LAST occurrence of "to/in/into/on <Name>" towards end of sentence
+          // The lazy .*? ensures we find the LAST preposition group
+          const lastPrepMatch = text.match(
+            /\b(?:to|in|into|on)\s+([A-Za-z][A-Za-z\s]{0,40}?)\s*(?:with\b|saying\b|that\b|as\b|\s*$)/i
+          );
+          if (lastPrepMatch && lastPrepMatch[1].trim()) {
+            const candidate = lastPrepMatch[1].trim();
+            // Reject if candidate is just a noise word like "me", "us", "the", etc.
+            if (!/^(me|us|you|them|the|a|an|it|slack|channel|dm|chat)$/i.test(candidate)) {
+              recipient = candidate;
+            }
+          }
+        }
+
+        // Step 5: Extract message body (if not from quotes)
+        if (!messageText) {
+          // Pattern A: "with <body>", "saying <body>", "that <body>"
+          const withMatch = text.match(/\b(?:saying|with|that)\s+(.+)/i);
+          if (withMatch) {
+            // Strip any trailing "to <recipient>" from the body
+            messageText = withMatch[1]
+              .replace(/\s+(?:to|in|into|on)\s+[A-Za-z0-9_\s.#@-]+\s*$/i, "")
+              .trim();
+          } else {
+            // Pattern B: strip verb prefix and trailing "to <recipient>" from the body
+            let body = text
+              .replace(/^\s*(?:send|post|write|msg|text)\s+/i, "")      // strip "send "
+              .replace(/\s+(?:message\s+)?(?:to|in|into|on)\s+[A-Za-z][A-Za-z\s]{0,40}?\s*$/i, "") // strip "to Sudha"
+              .replace(/\b(?:message|msg|text)\s*$/i, "")                // strip trailing noise
+              .trim();
+
+            // Only use body if it's substantively different from the raw input
+            if (body && body.toLowerCase() !== text.toLowerCase() && body.length > 0) {
+              messageText = body;
+            }
+          }
+        }
+
+        // Step 6: Final clean — strip noise words from recipient
+        if (recipient) {
+          recipient = recipient
+            .replace(/\b(dm|dms|direct\s+message|channel|chanel|chat|message|text|msg)\b/gi, "")
+            .replace(/\s{2,}/g, " ")
+            .trim();
+        }
+
+        // Guard: recipient is required — do NOT default to any hardcoded value
+        if (!recipient) {
+          replyText = "I need to know who to send the message to. Try:\n- `send hello to Sudha`\n- `send hi in #general`\n- `post hello to @john`";
+          const assistantMsgDoc = await Message.create({ chatId, role: "assistant", content: replyText });
+          await streamTextInChunks(res, replyText, 10);
+          res.write(`data: ${JSON.stringify({ type: "done", messageId: assistantMsgDoc._id, isComplete: true })}\n\n`);
+          return res.end();
+        }
+
+        // Guard: message body must not be empty or identical to the raw prompt
+        if (!messageText || messageText.toLowerCase() === rawUserMessage.toLowerCase()) {
+          replyText = `What message would you like to send to **${recipient}**?`;
+          const assistantMsgDoc = await Message.create({ chatId, role: "assistant", content: replyText });
+          await streamTextInChunks(res, replyText, 10);
+          res.write(`data: ${JSON.stringify({ type: "done", messageId: assistantMsgDoc._id, isComplete: true })}\n\n`);
+          return res.end();
+        }
+
+        const McpRuntimeService = require("../services/mcp/McpRuntimeService");
+        const McpExecutor = require("../services/mcp/McpExecutor");
+
+        const mcpAuthCheck = await McpRuntimeService.getToolsForUser(userId, "slack");
+
+        if (!mcpAuthCheck.connected) {
+          replyText = "To send Slack messages, please connect your Slack workspace under **MCP Host Servers** in the sidebar.";
+        } else {
+          const postResult = await McpExecutor.sendSlackMessage(userId, recipient, messageText);
+          if (postResult.success) {
+            const displayTarget = postResult.recipientName || recipient;
+            const isDm = !displayTarget.startsWith("#");
+            const destLabel = isDm ? displayTarget : displayTarget;
+            replyText = `✓ Message sent to **${destLabel}**\n\n**Message:** ${postResult.message}`;
+          } else {
+            replyText = `❌ Could not send Slack message:\n\n${postResult.error}`;
+          }
+        }
+
+        const followUpService = require("../services/followUpService");
+        const actionFollowUps = followUpService.getSmartFollowUps(rawUserMessage, replyText);
+
+        const assistantMsgDoc = await Message.create({
+          chatId,
+          role: "assistant",
+          content: replyText,
+          followUps: actionFollowUps || [],
+        });
+        await streamTextInChunks(res, replyText, 10);
+        if (Array.isArray(actionFollowUps) && actionFollowUps.length > 0) {
+          res.write(`data: ${JSON.stringify({ type: "follow_ups", followUps: actionFollowUps })}\n\n`);
+        }
+        res.write(`data: ${JSON.stringify({ type: "done", messageId: assistantMsgDoc._id, isComplete: true })}\n\n`);
+        return res.end();
+      }
+    }
+
+
 
     console.log(`\n================================================================================`);
     console.log(`📥 [USER REQUEST RECEIVED IN BACKEND]`);

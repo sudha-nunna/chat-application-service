@@ -55,7 +55,17 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
   const combined = `${prompt} ${response}`.toLowerCase();
   const topic = extractCleanTopic(prompt);
 
-  // 0. Image / Vision / Photo queries
+  // 0. Slack / Messaging action queries
+  if (/(\bslack\b|\bmessage sent to\b|\bsent message\b|\bsend message\b|\bdm\b|\bchannel\b|#\w+)/i.test(combined)) {
+    const targetName = topic ? topic : "Slack";
+    return [
+      `Check recent messages in ${targetName}`,
+      `Send another message to ${targetName}`,
+      `List available Slack channels & members`
+    ];
+  }
+
+  // 0. Vision / Photo queries
   if (topic === "this image" || /(\bimage\b|\bphoto\b|\bpicture\b|\bscreenshot\b|\bdiagram\b|\bgraphic\b)/i.test(combined)) {
     return [
       "Can you explain more details about this image?",

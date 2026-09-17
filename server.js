@@ -224,6 +224,7 @@ const modelRoutes = require("./routes/modelRoutes");
 const usageRoutes = require("./routes/usageRoutes");
 const creditRoutes = require("./routes/creditRoutes");
 const agentStudioRoutes = require("./routes/agentStudioRoutes");
+const mcpAuthRoutes = require("./routes/mcpAuthRoutes");
 
 app.use("/chats", chatRoutes);
 app.use("/chat", chatRoutes);
@@ -245,6 +246,8 @@ app.use("/api/usage", usageRoutes);
 app.use("/api/v1/usage", usageRoutes);
 app.use("/credits", creditRoutes);
 app.use("/api/credits", creditRoutes);
+app.use("/api/mcp", mcpAuthRoutes);
+
 
 const promoController = require("./controllers/promoController");
 app.get("/offers/active", promoController.getActiveOffer);
