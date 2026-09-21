@@ -9,8 +9,8 @@
 
 const { selectBestClusterNode, clusterState } = require("../utils/ollamaHelper");
 
-// Strict 800ms cap to guarantee instant response completion without lag
-const FOLLOW_UP_TIMEOUT_MS = 800;
+// 3000ms cap to allow active LLM server node to return dynamic follow-up questions
+const FOLLOW_UP_TIMEOUT_MS = 3000;
 
 /**
  * Extracts a clean topic name from user prompt without filler words, pronouns, or extra prepositions.
@@ -20,25 +20,39 @@ function extractCleanTopic(prompt) {
   let clean = prompt.trim();
 
   // Strip question starters and filler commands
-  clean = clean.replace(/^(hey|hi|hello|please|can you|could you|would you|i want to|i need to|tell|explain|show|give|describe|search|find)\s+/i, "");
+  clean = clean.replace(/^(hey|hi|hello|please|can you|could you|would you|i want to|i need to|tell|explain|show|give|describe|search|find|create|build|make|design|generate|write|develop|implement|add|construct|render|draft|setup|set up|code|style|draw)\s+/i, "");
   clean = clean.replace(/^(me|us|him|her|it|them|to me|to us|for me)\s+/i, "");
   clean = clean.replace(/^(about|for|in|on|with|regarding|concerning|information about|info about|details about|more about)\s+/i, "");
-  clean = clean.replace(/^(what is|what are|who is|who was|where is|why is|how does|how to|difference between)\s+/i, "");
-  clean = clean.replace(/^(a|an|the|this|that|these|those|my|your|his|her|its|our|their)\s+/i, "");
+  clean = clean.replace(/^(full form of|fullform of|meaning of|definition of|abbreviation of|what is full form of|what is the full form of|what does|what do|what is|what are|who is|who was|where is|why is|how does|how to|difference between)\s+/i, "");
+  clean = clean.replace(/\s+(stand for|stands for)\b/i, "");
+  clean = clean.replace(/^(a|an|the|this|that|these|those|my|your|his|her|its|our|their|one|some|any)\s+/i, "");
+
+  // Strip prepositions and trailing clauses from multi-word topics
+  clean = clean.replace(/\s+(for|to|in|with|using|on|by|of|about)\b.*/i, "");
 
   // Strip trailing punctuation
   clean = clean.replace(/[?!.,;:\"\`]+$/g, "").trim();
 
-  // Strip residual leading prepositions/pronouns
+  // Strip residual leading prepositions/pronouns/verbs/articles
   clean = clean.replace(/^(me|us|him|her|it|them|about|for|on|in|with|to)\s+/i, "").trim();
-  clean = clean.replace(/^(a|an|the|this|that|these|those|my|your)\s+/i, "").trim();
+  clean = clean.replace(/^(a|an|the|this|that|these|those|my|your|one|some|full form)\s+/i, "").trim();
+  clean = clean.replace(/^(design|create|build|make|generate|write|develop|implement|add)\s+/i, "").trim();
 
   if (/^(image|photo|picture|file|document|attachment|this image|this photo)$/i.test(clean)) {
     return "this image";
   }
 
-  // Verify valid topic length and non-stopword string
-  if (clean.length >= 2 && clean.length <= 40 && !/^(me|us|it|this|that|what|how|why)$/i.test(clean)) {
+  // If topic is still multiple words, keep the first 3 key words
+  const words = clean.split(/\s+/);
+  if (words.length > 3) {
+    clean = words.slice(0, 3).join(" ");
+  }
+
+  // Blacklist invalid topics: verbs/participles (-ing words), filler words, generic pronouns
+  const isInvalidTopic = /^(me|us|it|this|that|what|how|why|one|some|here|there|saying|doing|going|talking|asking|telling|being|getting|having|making|full form|form|say|do|go|get|be|have|make)$/i.test(clean) ||
+    (/ing$/i.test(clean) && !/^(programming|landing|learning|banking|caching|testing|debugging|housing|mining|imaging|tracking|routing|shopping|billing)$/i.test(clean));
+
+  if (clean.length >= 2 && clean.length <= 30 && !isInvalidTopic) {
     return clean;
   }
 
@@ -52,12 +66,34 @@ function extractCleanTopic(prompt) {
 function getSmartFollowUps(userPrompt, assistantResponse) {
   const prompt = (userPrompt || "").trim();
   const response = (assistantResponse || "").trim();
+  const promptLower = prompt.toLowerCase();
   const combined = `${prompt} ${response}`.toLowerCase();
   const topic = extractCleanTopic(prompt);
 
-  // 0. Slack / Messaging action queries
-  if (/(\bslack\b|\bmessage sent to\b|\bsent message\b|\bsend message\b|\bdm\b|\bchannel\b|#\w+)/i.test(combined)) {
-    const targetName = topic ? topic : "Slack";
+  // 0. Greetings & Casual Chat Starters
+  if (/^(hey|hi|hello|greetings|good morning|good afternoon|good evening|hey there|hi there|howdy|sup)\b/i.test(promptLower)) {
+    return [
+      "What can you help me build today?",
+      "What are your core capabilities and features?",
+      "Can you give an example of what we can create?"
+    ];
+  }
+
+  // 1. Security / OTP / Authentication / 2FA queries
+  if (/\b(otp|one time password|2fa|mfa|verification code)\b/i.test(promptLower)) {
+    return [
+      "How does OTP verification work in 2FA security?",
+      "What are best practices for sending secure OTPs via SMS or email?",
+      "How do TOTP apps like Google Authenticator differ from SMS OTP?"
+    ];
+  }
+
+  // 2. Slack / Messaging action queries (STRICT MATCH: require user's prompt to explicitly ask about Slack)
+  const isUserSlackQuery = /(\bslack\b|\bslack workspace\b|\bslack channel\b|\bpost to slack\b|\bsend to slack\b|\bcheck slack\b|\blist slack\b|\bconnect slack\b)/i.test(promptLower);
+
+  if (isUserSlackQuery) {
+    const channelMatch = combined.match(/#(general|random|announcements|dev|design|support|help|team|tech|chat)\b/i);
+    const targetName = channelMatch ? channelMatch[0] : "Slack";
     return [
       `Check recent messages in ${targetName}`,
       `Send another message to ${targetName}`,
@@ -65,8 +101,39 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 0. Vision / Photo queries
-  if (topic === "this image" || /(\bimage\b|\bphoto\b|\bpicture\b|\bscreenshot\b|\bdiagram\b|\bgraphic\b)/i.test(combined)) {
+  // 3. UI / Web Design / Frontend / Landing & Login Pages / Components
+  // Strictly prevent "full form" or "form of" from matching web design forms
+  const isUiWebDesign = /(\blogin page\b|\blanding page\b|\bsignup page\b|\bregister page\b|\bauth page\b|\bui form\b|\bweb form\b|\binput form\b|\bform validation\b|\bcard component\b|\bnavbar\b|\bsidebar\b|\bdashboard\b|\bui design\b|\bux design\b|\bfrontend\b|\bcss styling\b|\btailwind\b|\bhtml layout\b|\bweb page\b|\bwebsite design\b|\bhero section\b|\bbutton style\b|\bmodal popup\b|\bdark mode\b|\bresponsive layout\b)/i.test(promptLower);
+
+  if (isUiWebDesign) {
+    // Subcategory: Login / Signup / Authentication pages
+    if (/(\blogin\b|\bsignup\b|\bregister\b|\bauth\b|\bauthentication\b|\bform validation\b)/i.test(promptLower)) {
+      return [
+        "Can you add form validation and password show/hide toggle?",
+        "How do I connect this form to an authentication backend API?",
+        "Can you design a matching signup/registration page?"
+      ];
+    }
+
+    // Subcategory: Landing page / Hero section / Full websites
+    if (/(\blanding page\b|\bhero section\b|\bhomepage\b|\bportfolio\b|\bwebsite\b)/i.test(promptLower)) {
+      return [
+        "Can you add a features grid, pricing table, and footer?",
+        "How can I make this layout fully responsive for mobile screens?",
+        "Can you convert this design into a React or Next.js component?"
+      ];
+    }
+
+    // Subcategory: General UI / Components / CSS / Tailwind
+    return [
+      "Can you add responsive dark mode styling?",
+      "How can I add smooth micro-animations and hover effects?",
+      topic ? `Can you convert ${topic} into a reusable React component?` : "Can you convert this design into a reusable React component?"
+    ];
+  }
+
+  // 4. Vision / Photo queries
+  if (topic === "this image" || /(\bimage\b|\bphoto\b|\bpicture\b|\bscreenshot\b|\bdiagram\b|\bgraphic\b)/i.test(promptLower)) {
     return [
       "Can you explain more details about this image?",
       "What are the key elements or objects visible here?",
@@ -74,8 +141,8 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 1. Math / Calculations / Numbers
-  if (/(\d+\s*[\+\-\*\/=]\s*\d+|\bcalculate\b|\bformula\b|\bequation\b|\bsolve\b|\bmath\b|\balgebra\b|\bgeometry\b)/i.test(combined)) {
+  // 5. Math / Calculations / Numbers
+  if (/(\d+\s*[\+\-\*\/=]\s*\d+|\bcalculate\b|\bformula\b|\bequation\b|\bsolve\b|\bmath\b|\balgebra\b|\bgeometry\b|\bcalculus\b)/i.test(promptLower)) {
     return [
       "Can you show the step-by-step calculations?",
       "Can you give another practice problem like this?",
@@ -83,8 +150,8 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 2. Coding / Technical / Software Development
-  if (/(\bcode\b|\bfunction\b|\bcomponent\b|\berror\b|\bbug\b|\bapi\b|\bdatabase\b|\bquery\b|\bcss\b|\bhtml\b|\breact\b|\bnode\b|\bpython\b|\bjavascript\b|\btypescript\b|\bgit\b|\bdocker\b|\bsql\b)/i.test(combined)) {
+  // 6. Coding / Technical / Software Development
+  if (/(\bcode\b|\bfunction\b|\bcomponent\b|\berror\b|\bbug\b|\bapi\b|\bdatabase\b|\bquery\b|\breact\b|\bnode\b|\bpython\b|\bjavascript\b|\btypescript\b|\bgit\b|\bdocker\b|\bsql\b|\bbackend\b|\bendpoint\b|\bexpress\b)/i.test(promptLower)) {
     return [
       topic ? `Can you show a complete code example for ${topic}?` : "Can you show a complete code example?",
       topic ? `How do I handle errors and edge cases in ${topic}?` : "How do I handle errors and edge cases for this?",
@@ -92,8 +159,8 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 3. Comparisons & Pros / Cons
-  if (/(\bcompare\b|\bdifference\b|\bvs\b|\bversus\b|\balternative\b|\bpros and cons\b|\btradeoff\b)/i.test(combined)) {
+  // 7. Comparisons & Pros / Cons
+  if (/(\bcompare\b|\bdifference\b|\bvs\b|\bversus\b|\balternative\b|\bpros and cons\b|\btradeoff\b|\bbenchmark\b)/i.test(promptLower)) {
     return [
       topic ? `What are the main trade-offs with ${topic}?` : "What are the main pros and cons?",
       "Which option is better for production use?",
@@ -101,8 +168,8 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 4. Conceptual / Architectural / Deep Explanations
-  if (/(\bwhy\b|\bhow does\b|\bexplain\b|\bconcept\b|\btheory\b|\barchitecture\b|\bunder the hood\b)/i.test(combined)) {
+  // 8. Conceptual / Architectural / Deep Explanations
+  if (/(\bwhy\b|\bhow does\b|\bexplain\b|\bconcept\b|\btheory\b|\barchitecture\b|\bunder the hood\b)/i.test(promptLower)) {
     return [
       topic ? `Can you give a real-world analogy for ${topic}?` : "Can you give a real-world analogy for this?",
       topic ? `What are common misconceptions about ${topic}?` : "What are common misconceptions about this?",
@@ -110,8 +177,8 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 5. Guides / How-to / Deployments / Tutorials
-  if (/(\bhow to\b|\bguide\b|\btutorial\b|\bstep\b|\bdeploy\b|\binstall\b|\bsetup\b|\bconfig\b)/i.test(combined)) {
+  // 9. Guides / How-to / Deployments / Tutorials
+  if (/(\bhow to\b|\bguide\b|\btutorial\b|\bstep\b|\bdeploy\b|\binstall\b|\bsetup\b|\bconfig\b|\bconfigure\b)/i.test(promptLower)) {
     return [
       "What are common pitfalls or mistakes to avoid?",
       "What tools or prerequisites are recommended?",
@@ -119,21 +186,13 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
     ];
   }
 
-  // 6. History / Events / News / People / Places
-  if (/(\bhistory\b|\bwho is\b|\bwho was\b|\bwhen did\b|\bevent\b|\bnews\b|\bcountry\b|\bwar\b|\bcentury\b|\btemple\b|\bcity\b)/i.test(combined)) {
+  // 10. Definitions / Meanings / Concepts / General Knowledge
+  if (/(\bfull form\b|\babbreviation\b|\bmeaning\b|\bdefinition\b|\bhistory\b|\bwho is\b|\bwho was\b|\bwhen did\b|\bevent\b|\bnews\b|\bcity\b|\bwhat is\b)/i.test(promptLower) || (topic && topic.length >= 2)) {
+    const topicLabel = topic || "this topic";
     return [
-      topic ? `What are the key historical highlights of ${topic}?` : "What were the most significant consequences of this?",
-      topic ? `What is the cultural or practical significance of ${topic}?` : "What impact does this have today?",
-      "Can you provide a timeline of key milestones?"
-    ];
-  }
-
-  // 7. Conversational with extracted topic
-  if (topic && topic.length > 2 && topic.length < 35) {
-    return [
-      `Can you share practical examples of ${topic}?`,
-      `What are the most important things to know about ${topic}?`,
-      `What would you recommend doing next with ${topic}?`
+      `What are key details and main uses of ${topicLabel}?`,
+      `What is the background or origin of ${topicLabel}?`,
+      `Can you share practical examples or interesting facts about ${topicLabel}?`
     ];
   }
 
@@ -244,17 +303,17 @@ async function generateFollowUps(userPrompt, assistantResponse, options = {}) {
     return getSmartFollowUps(cleanUser, cleanAssistant);
   }
 
-  const prompt = `Based on this conversation, generate exactly 3 concise, relevant follow-up questions the user might ask next.
+  const prompt = `Based on this exact user prompt and AI response, generate 3 relevant, logical follow-up questions the user might ask next.
 
-User: "${cleanUser}"
-Assistant: "${cleanAssistant}"
+User Prompt: "${cleanUser}"
+AI Response Summary: "${cleanAssistant.substring(0, 500)}"
 
 RULES:
-- Return ONLY a JSON array of 3 short question strings.
-- No markdown, no numbering, no explanations.
-- Each question under 70 characters.
-
-Example: ["Can you show an example?", "What are the common mistakes?", "How do I test this?"]`;
+- Return ONLY a JSON array of 3 short question strings (e.g. ["Question 1?", "Question 2?", "Question 3?"]).
+- Questions must directly relate to the user's specific topic or intent.
+- If user prompt is a greeting like "hey" or "hi", generate general conversational questions (e.g. "What can you help me build today?", "What are your core capabilities?").
+- No markdown formatting, no explanations, no numbering outside the JSON array.
+- Each question under 75 characters.`;
 
   try {
     const isCodegene = cleanUrl.includes("ai.codegene.io") || (node.name && node.name.toLowerCase().includes("codegene"));
@@ -268,9 +327,9 @@ Example: ["Can you show an example?", "What are the common mistakes?", "How do I
         : cleanUrl.endsWith("/v1")
         ? `${cleanUrl}/chat/completions`
         : `${cleanUrl}/v1/chat/completions`;
-    } else if (cleanUrl.includes("googleapis.com")) {
-      endpoint = `${cleanUrl}/openai/chat/completions`;
-    } else if (isStandardOpenAi || isGemini || node.format === "glm") {
+    } else if (cleanUrl.includes("googleapis.com") || node.format === "gemini") {
+      endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+    } else if (isStandardOpenAi || node.format === "glm") {
       endpoint = cleanUrl.endsWith("/chat/completions")
         ? cleanUrl
         : cleanUrl.endsWith("/v1")
@@ -280,7 +339,15 @@ Example: ["Can you show an example?", "What are the common mistakes?", "How do I
       endpoint = cleanUrl.endsWith("/api/chat") ? cleanUrl : `${cleanUrl}/api/chat`;
     }
 
-    const resolvedApiKey = (node.secretKey && !/[\u2022\*]/.test(node.secretKey)) ? node.secretKey : "";
+    let resolvedApiKey = (node.secretKey && !/[\u2022\*]/.test(node.secretKey)) ? node.secretKey : "";
+    if (resolvedApiKey) {
+      try {
+        const { decrypt } = require("../utils/encryption");
+        const dec = decrypt(resolvedApiKey);
+        if (dec) resolvedApiKey = dec;
+      } catch (_) {}
+    }
+
     const headers = {
       "Content-Type": "application/json",
       "User-Agent": "Mozilla/5.0 (AI-Assistant)"

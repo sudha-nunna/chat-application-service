@@ -63,4 +63,7 @@ const messageSchema = new mongoose.Schema(
   }
 );
 
+// Compound index for high-performance cursor-based pagination
+messageSchema.index({ chatId: 1, createdAt: -1, _id: -1 });
+
 module.exports = mongoose.model("Message", messageSchema);

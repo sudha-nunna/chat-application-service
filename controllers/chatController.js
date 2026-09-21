@@ -157,7 +157,7 @@ exports.stopMessage = async (req, res) => {
     if (targetId) {
       try {
         targetMsg = await Message.findOne({ _id: targetId, chatId });
-      } catch (e) {}
+      } catch (e) { }
     }
 
     const lastUserMsg = await Message.findOne({ chatId, role: "user" }).sort({ createdAt: -1 });
@@ -186,7 +186,7 @@ exports.stopMessage = async (req, res) => {
       try {
         const followUpService = require("../services/followUpService");
         smartFollowUps = followUpService.getSmartFollowUps(lastUserMsg?.content || "", content.trim());
-      } catch (e) {}
+      } catch (e) { }
 
       if (lastUserMsg) {
         await Message.deleteMany({
@@ -216,21 +216,77 @@ exports.stopMessage = async (req, res) => {
 
 exports.getMessages = async (req, res) => {
   try {
-    const messages = await Message.find({ chatId: req.params.chatId }).sort({ createdAt: 1 });
+    const chatId = req.params.chatId;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+    const beforeCursor = req.query.before || null;
 
-    const sanitizedMessages = messages.map((msg, idx) => {
+    let query = { chatId };
+
+    if (beforeCursor && typeof beforeCursor === "string") {
+      const parts = beforeCursor.split("_");
+      if (parts.length === 2) {
+        const cursorTime = new Date(parseInt(parts[0], 10));
+        const cursorId = parts[1];
+        if (!isNaN(cursorTime.getTime())) {
+          query = {
+            chatId,
+            $or: [
+              { createdAt: { $lt: cursorTime } },
+              { createdAt: cursorTime, _id: { $lt: cursorId } }
+            ]
+          };
+        }
+      }
+    }
+
+    // Fetch limit + 1 documents sorted newest to oldest to evaluate hasMore
+    const rawMessages = await Message.find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1);
+
+    const hasMore = rawMessages.length > limit;
+    const itemsToReturn = hasMore ? rawMessages.slice(0, limit) : rawMessages;
+
+    // Re-sort itemsToReturn chronologically (oldest -> newest) for rendering in UI
+    itemsToReturn.reverse();
+
+    const followUpService = require("../services/followUpService");
+
+    const sanitizedMessages = itemsToReturn.map((msg, idx) => {
       const msgObj = msg.toObject ? msg.toObject() : { ...msg };
-      const isLastMessage = idx === messages.length - 1;
+      const isLastMessage = idx === itemsToReturn.length - 1;
 
       if (!isLastMessage && msgObj.role === "assistant" && msgObj.isStoppedMidway) {
         msgObj.isStoppedMidway = false;
         msgObj.continuationResolved = true;
-        Message.updateOne({ _id: msgObj._id }, { $set: { isStoppedMidway: false, continuationResolved: true } }).catch(() => {});
+        Message.updateOne({ _id: msgObj._id }, { $set: { isStoppedMidway: false, continuationResolved: true } }).catch(() => { });
       }
+
+      // Re-evaluate stored followUps if they contain stale false-positive Slack items
+      if (msgObj.role === "assistant" && Array.isArray(msgObj.followUps) && msgObj.followUps.length > 0) {
+        const hasSlackFollowUp = msgObj.followUps.some(f => /slack/i.test(f));
+        const prevUserMsg = idx > 0 && itemsToReturn[idx - 1].role === "user" ? itemsToReturn[idx - 1] : null;
+        const userPromptText = (prevUserMsg?.content || "").toLowerCase();
+        const hasRealSlackContext = /(\bslack\b|\bslack workspace\b|\bslack channel\b|\bpost to slack\b|\bsend to slack\b|\bcheck slack\b|\blist slack\b|\bconnect slack\b)/i.test(userPromptText);
+
+        if (hasSlackFollowUp && !hasRealSlackContext) {
+          const freshFollowUps = followUpService.getSmartFollowUps(prevUserMsg?.content || "", msgObj.content || "");
+          msgObj.followUps = freshFollowUps;
+          Message.updateOne({ _id: msgObj._id }, { $set: { followUps: freshFollowUps } }).catch(() => { });
+        }
+      }
+
       return msgObj;
     });
 
-    res.json(sanitizedMessages);
+    const oldestItem = itemsToReturn[0];
+    const nextCursor = (hasMore && oldestItem) ? `${new Date(oldestItem.createdAt).getTime()}_${oldestItem._id}` : null;
+
+    res.json({
+      messages: sanitizedMessages,
+      hasMore,
+      nextCursor
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -360,7 +416,7 @@ exports.sendMessage = async (req, res) => {
         return res.status(429).json({
           success: false,
           error: "DAILY_FREE_LIMIT_REACHED",
-          message: "You have reached your daily free tier limit of 50 messages. Purchase credits to unlock unlimited daily messages.",
+          message: "You have reached your daily free limit of 50 messages. Please upgrade your plan or try again tomorrow.",
           dailyLimit: FREE_DAILY_LIMIT,
           messagesUsedToday: messagesSentToday,
           isPaidUser: false
@@ -454,12 +510,12 @@ exports.sendMessage = async (req, res) => {
       if (stoppedMessageId) {
         try {
           targetAssistantMsg = await Message.findOne({ _id: stoppedMessageId, chatId, role: "assistant" });
-        } catch (e) {}
+        } catch (e) { }
       }
       if (!targetAssistantMsg && baseContent) {
         try {
           targetAssistantMsg = await Message.findOne({ chatId, role: "assistant", content: baseContent.trim() });
-        } catch (e) {}
+        } catch (e) { }
       }
       if (!targetAssistantMsg && baseContent) {
         try {
@@ -467,7 +523,7 @@ exports.sendMessage = async (req, res) => {
           if (prefix) {
             targetAssistantMsg = await Message.findOne({ chatId, role: "assistant", content: { $regex: prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: "i" } });
           }
-        } catch (e) {}
+        } catch (e) { }
       }
       if (!targetAssistantMsg) {
         targetAssistantMsg = await Message.findOne({ chatId, role: "assistant" }).sort({ createdAt: -1 });
@@ -528,7 +584,7 @@ exports.sendMessage = async (req, res) => {
 
       // Touch chat updatedAt timestamp to reflect edit today
       chat.updatedAt = new Date();
-      await chat.save().catch(() => {});
+      await chat.save().catch(() => { });
 
       console.log(`✏️ [EDIT] Updated message "${originalContent?.substring(0, 30)}..." → "${rawUserMessage.substring(0, 30)}..." to today | Deleted messages after it`);
     } else if (isReload && userMsgDoc) {
@@ -582,11 +638,11 @@ exports.sendMessage = async (req, res) => {
     if (isFirstMessageEdit) {
       // The edited message is the first message — update the chat title to the new content
       chat.title = rawUserMessage.substring(0, 45) || "New Conversation";
-      await chat.save().catch(() => {});
+      await chat.save().catch(() => { });
     } else if (!chat.title || chat.title === "New Conversation" || chat.title === "New Chat" || chat.title === "General Chat") {
       const defaultTitle = hasImage ? "Image Analysis" : "Document Analysis";
       chat.title = rawUserMessage.substring(0, 35) || defaultTitle;
-      chat.save().catch(() => {});
+      chat.save().catch(() => { });
     }
 
     const historyMsgs = (dbMessagesHistory || []).slice().reverse();
@@ -761,18 +817,18 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
     const cleanBaseModel = currentModelId.toLowerCase().replace(/:cloud$/, "").split(":")[0];
     const matchingOllamaCloudNode = enableSearch
       ? allNodes.find(n =>
-          n.isActive !== false &&
-          (n.format === "ollama" || n.url?.includes("ollama.com")) &&
-          n.secretKey && n.secretKey.length > 5 &&
-          !/[\u2022\*]/.test(n.secretKey) &&
-          (
-            n.url?.includes("ollama.com") ||
-            (Array.isArray(n.supportedModels) && n.supportedModels.some(m =>
-              m.toLowerCase() === currentModelId.toLowerCase() ||
-              m.toLowerCase().startsWith(cleanBaseModel)
-            ))
-          )
+        n.isActive !== false &&
+        (n.format === "ollama" || n.url?.includes("ollama.com")) &&
+        n.secretKey && n.secretKey.length > 5 &&
+        !/[\u2022\*]/.test(n.secretKey) &&
+        (
+          n.url?.includes("ollama.com") ||
+          (Array.isArray(n.supportedModels) && n.supportedModels.some(m =>
+            m.toLowerCase() === currentModelId.toLowerCase() ||
+            m.toLowerCase().startsWith(cleanBaseModel)
+          ))
         )
+      )
       : null;
 
     if (searchIntent.shouldSearch && rawUserMessage) {
@@ -1015,10 +1071,10 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
     // Emit web search status or guidance event to frontend via SSE
     if (searchExecuted && searchSources.length > 0) {
       res.write(`data: ${JSON.stringify({ type: "search_status", sources: searchSources, query: rawUserMessage })}\n\n`);
-      if (typeof res.flush === "function") { try { res.flush(); } catch (e) {} }
+      if (typeof res.flush === "function") { try { res.flush(); } catch (e) { } }
     } else if (isGuidanceActive) {
       res.write(`data: ${JSON.stringify({ type: "search_guidance", requiresWebSearch: true, query: rawUserMessage })}\n\n`);
-      if (typeof res.flush === "function") { try { res.flush(); } catch (e) {} }
+      if (typeof res.flush === "function") { try { res.flush(); } catch (e) { } }
     }
 
     let gatewayResult = null;
@@ -1111,11 +1167,27 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 
     if (accumulatedResponseText.trim()) {
       // 5. Generate AI Follow-up Suggestions (Instant <1ms heuristic delivery)
-      let finalFollowUps = [];
+      {/* let finalFollowUps = [];
       try {
         const followUpService = require("../services/followUpService");
         finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
-      } catch (e) {}
+      } catch (e) {}*/}
+      // 5. Generate AI Follow-up Suggestions dynamically from the active serving cluster node
+      let finalFollowUps = [];
+      try {
+        const followUpService = require("../services/followUpService");
+        finalFollowUps = await followUpService.generateFollowUps(rawUserMessage, accumulatedResponseText, {
+          preResolvedNodeHint: preResolvedNodeHint || (gatewayResult && gatewayResult.node),
+          model: currentModelId
+        });
+      } catch (e) {
+        // Graceful fallback to smart contextual questions if active server times out
+        try {
+          const followUpService = require("../services/followUpService");
+          finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
+        } catch (_) { }
+      }
+
 
       // Emit follow-up suggestions event to frontend IMMEDIATELY so chips show up with 0 delay
       if (!clientDisconnected && !res.writableEnded && Array.isArray(finalFollowUps) && finalFollowUps.length > 0) {
@@ -1125,9 +1197,9 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
             followUps: finalFollowUps
           })}\n\n`);
           if (typeof res.flush === "function") {
-            try { res.flush(); } catch (e) {}
+            try { res.flush(); } catch (e) { }
           }
-        } catch (e) {}
+        } catch (e) { }
       }
 
       // Normal stream completion: set isStopped to false.
@@ -1178,7 +1250,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
           });
         }
       }
-      updateRollingSummaryIfNeeded(chat, chatId).catch(() => {});
+      updateRollingSummaryIfNeeded(chat, chatId).catch(() => { });
 
       // 6. Post-Stream Atomic Credit Deduction & Async Telemetry Logging
       try {
@@ -1247,9 +1319,9 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
                 modelId: currentModelId
               })}\n\n`);
               if (typeof res.flush === "function") {
-                try { res.flush(); } catch (e) {}
+                try { res.flush(); } catch (e) { }
               }
-            } catch (e) {}
+            } catch (e) { }
           }
         }
       } catch (postStreamErr) {
@@ -1274,10 +1346,10 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         try {
           res.write("data: [DONE]\n\n");
           if (typeof res.flush === "function") {
-            try { res.flush(); } catch (e) {}
+            try { res.flush(); } catch (e) { }
           }
           return res.end();
-        } catch (e) {}
+        } catch (e) { }
       }
       return;
     }
@@ -1285,7 +1357,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
     if (!streamedSuccessfully) {
       // Refund upfront reserved credit if stream was unsuccessful
       if (creditReserved) {
-        await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => {});
+        await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => { });
         creditReserved = false;
       }
       if (res.writableEnded) return;
@@ -1310,7 +1382,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
   } catch (error) {
     console.error("General Chat Pipeline Error:", error);
     if (typeof creditReserved !== "undefined" && creditReserved && typeof User !== "undefined" && userId) {
-      await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => {});
+      await User.findByIdAndUpdate(userId, { $inc: { credits: reservedAmount } }).catch(() => { });
     }
     if (!res.headersSent) {
       res.status(500).json({ success: false, message: "General chat processing failed.", error: error.message });

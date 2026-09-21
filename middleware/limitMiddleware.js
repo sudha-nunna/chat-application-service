@@ -38,7 +38,8 @@ const checkMessageLimit = async (req, res, next) => {
     if (usage.messagesUsedToday >= maxMessages) {
       return res.status(429).json({
         success: false,
-        message: `Daily message limit reached (${maxMessages} messages/day). Please upgrade your plan to send more messages.`,
+        error: "DAILY_FREE_LIMIT_REACHED",
+        message: `You have reached your daily free limit of ${maxMessages} messages. Please upgrade your plan or try again tomorrow.`,
         limitExceeded: true,
         currentUsage: usage.messagesUsedToday,
         maxLimit: maxMessages,
