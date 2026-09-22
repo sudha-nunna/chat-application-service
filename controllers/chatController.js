@@ -771,7 +771,71 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
    - Provide complete, modern, production-ready HTML/JSX/CSS code blocks.
 5. NEVER output your internal drafting process, brainstorm notes, planning steps, or meta-commentary (such as "Draft:", "Structure:", "Hook:", or "Since the date is..."). Output ONLY the final, polished response directly to the user.
 6. NEVER output robotic filler phrases like "It seems like you might have misinterpreted my previous response" or "I am an AI language model".
-7. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.`;
+7. Maintain natural multi-turn conversation flow by using the conversation history seamlessly.
+8. LANGUAGE & SCRIPT LOCK: Always detect the language and script of the user's input prompt. You MUST respond in the exact same language and script. Do NOT switch languages or scripts during reloads or re-generations under any circumstances.`;
+
+    // Comprehensive 30-Language Catalog Mapping from voiceLanguages.js
+    const VOICE_LANGUAGE_CATALOG = {
+      "te-IN": "Telugu (తెలుగు)",
+      "hi-IN": "Hindi (हिन्दी)",
+      "ta-IN": "Tamil (தமிழ்)",
+      "kn-IN": "Kannada (ಕನ್ನಡ)",
+      "ml-IN": "Malayalam (മലയാളം)",
+      "mr-IN": "Marathi (मराठी)",
+      "bn-IN": "Bengali (বাংলা)",
+      "gu-IN": "Gujarati (ગુજરાતી)",
+      "pa-IN": "Punjabi (ਪੰਜਾਬੀ)",
+      "ur-IN": "Urdu (اردو)",
+      "es-ES": "Spanish (Español)",
+      "es-MX": "Spanish (Español México)",
+      "fr-FR": "French (Français)",
+      "de-DE": "German (Deutsch)",
+      "it-IT": "Italian (Italiano)",
+      "ja-JP": "Japanese (日本語)",
+      "ko-KR": "Korean (한국어)",
+      "zh-CN": "Chinese (中文 普通话)",
+      "ar-SA": "Arabic (العربية)",
+      "ru-RU": "Russian (Русский)",
+      "pt-BR": "Portuguese (Português)",
+      "tr-TR": "Turkish (Türkçe)",
+      "vi-VN": "Vietnamese (Tiếng Việt)",
+      "id-ID": "Indonesian (Bahasa Indonesia)",
+      "nl-NL": "Dutch (Nederlands)",
+      "pl-PL": "Polish (Polski)",
+      "sv-SE": "Swedish (Svenska)",
+      "en-US": "English",
+      "en-IN": "English",
+      "en-GB": "English"
+    };
+
+    // 1. Detect native input script from message content
+    let detectedScriptLanguage = null;
+    if (rawUserMessage && typeof rawUserMessage === "string") {
+      const msg = rawUserMessage.trim();
+      if (/[\u0600-\u06FF]/.test(msg)) detectedScriptLanguage = "Urdu / Arabic script (اردو)";
+      else if (/[\u0C00-\u0C7F]/.test(msg)) detectedScriptLanguage = "Telugu (తెలుగు)";
+      else if (/[\u0900-\u097F]/.test(msg)) detectedScriptLanguage = "Hindi / Devanagari (हिन्दी)";
+      else if (/[\u0B80-\u0BFF]/.test(msg)) detectedScriptLanguage = "Tamil (தமிழ்)";
+      else if (/[\u0C80-\u0CFF]/.test(msg)) detectedScriptLanguage = "Kannada (ಕನ್ನಡ)";
+      else if (/[\u0D00-\u0D7F]/.test(msg)) detectedScriptLanguage = "Malayalam (മലയാളം)";
+      else if (/[\u0980-\u09FF]/.test(msg)) detectedScriptLanguage = "Bengali (বাংলা)";
+      else if (/[\u0A80-\u0AFF]/.test(msg)) detectedScriptLanguage = "Gujarati (ગુજરાતી)";
+      else if (/[\u0A00-\u0A7F]/.test(msg)) detectedScriptLanguage = "Punjabi (ਪੰਜਾਬੀ)";
+      else if (/[\u0400-\u04FF]/.test(msg)) detectedScriptLanguage = "Russian / Cyrillic (Русский)";
+      else if (/[\u3040-\u30FF\u4E00-\u9FAF]/.test(msg)) detectedScriptLanguage = "Japanese (日本語)";
+      else if (/[\uAC00-\uD7AF]/.test(msg)) detectedScriptLanguage = "Korean (한국어)";
+      else if (/[\u4E00-\u9FFF]/.test(msg)) detectedScriptLanguage = "Chinese (中文)";
+    }
+
+    // 2. Fall back to user's selected Voice Language from request/localStorage
+    const userSelectedVoiceCode = req.body.voiceLang || req.body.language || req.body.selectedVoiceLang;
+    const selectedCatalogName = userSelectedVoiceCode ? VOICE_LANGUAGE_CATALOG[userSelectedVoiceCode] : null;
+
+    const targetLockLanguage = detectedScriptLanguage || selectedCatalogName;
+
+    if (targetLockLanguage && !targetLockLanguage.startsWith("English")) {
+      unifiedSystemPrompt += `\n\n[STRICT LANGUAGE CONSISTENCY DIRECTIVE]\nThe user's active language/script is ${targetLockLanguage}. You MUST respond exclusively in ${targetLockLanguage}. Do NOT switch languages or scripts under any circumstances (including on reloads or re-generations).`;
+    }
 
     if (summaryText && summaryText.trim()) {
       unifiedSystemPrompt += `\n\n[CONVERSATION SUMMARY SO FAR]\n${summaryText}`;
