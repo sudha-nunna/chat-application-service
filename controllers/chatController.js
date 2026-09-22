@@ -4,6 +4,61 @@ const Summary = require("../models/Summary");
 const { generateLLMSummary } = require("../utils/ragEngine");
 const { getOllamaBaseUrl, getAvailableOllamaModel } = require("../utils/ollamaHelper");
 
+function mergeContinuationText(baseText = "", newText = "") {
+  if (!baseText) return newText || "";
+  if (!newText) return baseText || "";
+
+  let cleanedNew = newText;
+
+  // 1. Remove leading continuation artifacts like "... ", "...", "…", "\n...", etc.
+  cleanedNew = cleanedNew.replace(/^(\s*(\.\.\.|\u2026)\s*)+/, "");
+
+  let effectiveBase = baseText;
+
+  // 2. Check for partial hyphenated word duplicate (e.g. baseText ends with "Content-" and newText starts with "Content &")
+  const hyphenMatch = effectiveBase.match(/(\b[a-zA-Z0-9]+)-$/);
+  if (hyphenMatch) {
+    const wordBeforeHyphen = hyphenMatch[1];
+    const newWordMatch = cleanedNew.match(/^([a-zA-Z0-9]+)/);
+    if (newWordMatch && newWordMatch[1].toLowerCase() === wordBeforeHyphen.toLowerCase()) {
+      effectiveBase = effectiveBase.slice(0, -(wordBeforeHyphen.length + 1));
+    }
+  }
+
+  // 3. Substring overlap detection
+  const baseTrimmed = effectiveBase.trimEnd();
+  const maxOverlapLen = Math.min(80, baseTrimmed.length, cleanedNew.length);
+  let bestOverlapLen = 0;
+
+  for (let len = maxOverlapLen; len >= 3; len--) {
+    const baseSuffix = baseTrimmed.slice(-len);
+    const newPrefix = cleanedNew.slice(0, len);
+
+    if (baseSuffix.toLowerCase() === newPrefix.toLowerCase()) {
+      bestOverlapLen = len;
+      break;
+    }
+  }
+
+  if (bestOverlapLen > 0) {
+    cleanedNew = cleanedNew.slice(bestOverlapLen);
+  }
+
+  // 4. Spacing and boundary normalization
+  const baseEndsWithWordOrPunct = /[a-zA-Z0-9.!?:;,)]$/.test(effectiveBase);
+  const newStartsWithWord = /^[a-zA-Z0-9]/.test(cleanedNew);
+  const needsSpace =
+    baseEndsWithWordOrPunct &&
+    newStartsWithWord &&
+    !effectiveBase.endsWith("-") &&
+    !effectiveBase.endsWith(" ") &&
+    !effectiveBase.endsWith("\n");
+
+  const joiner = needsSpace ? " " : "";
+
+  return effectiveBase + joiner + cleanedNew;
+}
+
 /**
  * Streams text chunk-by-chunk over SSE to simulate word-by-word typing like ChatGPT.
  */
@@ -831,6 +886,33 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
       )
       : null;
 
+    let followUpPromise = null;
+    let followUpStarted = false;
+    let partialTokenAccumulator = "";
+
+    const triggerParallelFollowUp = (tokenChunk) => {
+      if (typeof tokenChunk === "string") {
+        partialTokenAccumulator += tokenChunk;
+      }
+      if (followUpStarted) return;
+
+      if (partialTokenAccumulator.trim().length >= 100) {
+        followUpStarted = true;
+        const snapshotText = partialTokenAccumulator.trim();
+        console.log(`⚡ [PARALLEL FOLLOW-UP] Triggering parallel follow-up generation during stream (${snapshotText.length} chars accumulated)...`);
+        try {
+          const followUpService = require("../services/followUpService");
+          followUpPromise = followUpService.generateFollowUps(rawUserMessage, snapshotText, {
+            preResolvedNodeHint,
+            model: currentModelId
+          }).catch((err) => {
+            console.warn(`⚠️ [PARALLEL FOLLOW-UP RECOVERY] Background generation warning: ${err?.message}`);
+            return followUpService.getSmartFollowUps(rawUserMessage, snapshotText);
+          });
+        } catch (_) { }
+      }
+    };
+
     if (searchIntent.shouldSearch && rawUserMessage) {
       // If we don't have an agentic Ollama Cloud key, perform prefetch search upfront
       if (!matchingOllamaCloudNode) {
@@ -891,9 +973,9 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 
       let continuationDirective = "";
       if (isInsideCode) {
-        continuationDirective = `[CONTINUATION DIRECTIVE: Continue writing the code directly from where it was stopped. Do not repeat what was already written. Do not open a new code block. Continue directly with the remaining code from: "${tailSnippet}"]`;
+        continuationDirective = `[CONTINUATION DIRECTIVE: Seamlessly continue writing the code directly from where it was stopped. Do NOT output leading dots (...), do NOT repeat the code already written, do NOT open a new code block, and do NOT include any conversational preamble. Continue directly with the next characters of code after: "${tailSnippet}"]`;
       } else {
-        continuationDirective = `[CONTINUATION DIRECTIVE: Continue the response directly from where it was stopped without repeating. Continue immediately from: "${tailSnippet}"]`;
+        continuationDirective = `[CONTINUATION DIRECTIVE: Seamlessly continue writing the response directly from where it was stopped. Do NOT output leading dots (...), do NOT repeat any text or words already written at the end of the previous message, and do NOT include any introductory greetings. Continue directly with the next word after: "${tailSnippet}"]`;
       }
 
       historyPayload.push({
@@ -1101,11 +1183,12 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
           messages: historyPayload,
           node: matchingOllamaCloudNode,
           res,
-          onToken: () => {
+          onToken: (token) => {
             if (!firstTokenTimestamp) {
               firstTokenTimestamp = performance.now();
               ttft = firstTokenTimestamp - llmRequestStartTime;
             }
+            triggerParallelFollowUp(token);
           }
         });
       } catch (agenticErr) {
@@ -1126,16 +1209,17 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
         jobId,
         userId: req.user.id,
         preResolvedNodeHint,
-        onToken: () => {
+        onToken: (token) => {
           if (!firstTokenTimestamp) {
             firstTokenTimestamp = performance.now();
             ttft = firstTokenTimestamp - llmRequestStartTime;
           }
+          triggerParallelFollowUp(token);
         }
       });
     }
 
-    let accumulatedResponseText = gatewayResult.text || "";
+    let accumulatedResponseText = gatewayResult.text || partialTokenAccumulator || "";
     let streamedSuccessfully = gatewayResult.success;
 
     const totalDuration = performance.now() - reqStartTime;
@@ -1166,22 +1250,30 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 `);
 
     if (accumulatedResponseText.trim()) {
-      // 5. Generate AI Follow-up Suggestions (Instant <1ms heuristic delivery)
-      {/* let finalFollowUps = [];
-      try {
-        const followUpService = require("../services/followUpService");
-        finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
-      } catch (e) {}*/}
-      // 5. Generate AI Follow-up Suggestions dynamically from the active serving cluster node
+      // 5. Generate AI Follow-up Suggestions (Parallel stream resolution with <1ms post-stream latency)
       let finalFollowUps = [];
       try {
         const followUpService = require("../services/followUpService");
-        finalFollowUps = await followUpService.generateFollowUps(rawUserMessage, accumulatedResponseText, {
-          preResolvedNodeHint: preResolvedNodeHint || (gatewayResult && gatewayResult.node),
-          model: currentModelId
-        });
+        const fullText = (accumulatedResponseText || partialTokenAccumulator).trim();
+
+        if (!followUpPromise) {
+          console.log(`⚡ [PARALLEL FOLLOW-UP] Stream finished (<100 chars). Triggering follow-up generation now (${fullText.length} chars)...`);
+          followUpPromise = followUpService.generateFollowUps(rawUserMessage, fullText, {
+            preResolvedNodeHint: preResolvedNodeHint || (gatewayResult && gatewayResult.node),
+            model: currentModelId
+          }).catch(() => {
+            return followUpService.getSmartFollowUps(rawUserMessage, fullText);
+          });
+        }
+
+        // Await parallel execution with max 800ms timeout cap (promise was already running during stream)
+        const timeoutCap = new Promise(resolve => setTimeout(() => resolve(null), 800));
+        finalFollowUps = await Promise.race([followUpPromise, timeoutCap]);
+
+        if (!finalFollowUps || !Array.isArray(finalFollowUps) || finalFollowUps.length === 0) {
+          finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, fullText);
+        }
       } catch (e) {
-        // Graceful fallback to smart contextual questions if active server times out
         try {
           const followUpService = require("../services/followUpService");
           finalFollowUps = followUpService.getSmartFollowUps(rawUserMessage, accumulatedResponseText);
@@ -1209,7 +1301,7 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 
       if (isContinuation && targetAssistantMsg) {
         const initialPrefix = baseContent || targetAssistantMsg.content || "";
-        const fullContent = initialPrefix + (accumulatedResponseText || "");
+        const fullContent = mergeContinuationText(initialPrefix, accumulatedResponseText || "");
         targetAssistantMsg.content = fullContent;
         targetAssistantMsg.isStoppedMidway = false;
         targetAssistantMsg.continuationResolved = true;
