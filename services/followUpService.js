@@ -70,8 +70,9 @@ function getSmartFollowUps(userPrompt, assistantResponse) {
   const combined = `${prompt} ${response}`.toLowerCase();
   const topic = extractCleanTopic(prompt);
 
-  // 0. Greetings & Casual Chat Starters
-  if (/^(hey|hi|hello|greetings|good morning|good afternoon|good evening|hey there|hi there|howdy|sup)\b/i.test(promptLower)) {
+  // 0. Greetings & Casual Chat Starters (Punctuation and Whitespace check ensures ONLY pure greetings match)
+  const isPureGreeting = /^(hey|hi|hello|greetings|good morning|good afternoon|good evening|hey there|hi there|howdy|sup)[\s!.,?]*$/i.test(promptLower);
+  if (isPureGreeting) {
     return [
       "What can you help me build today?",
       "What are your core capabilities and features?",

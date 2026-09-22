@@ -254,10 +254,10 @@ exports.stopMessage = async (req, res) => {
       const newMsg = await Message.create({
         chatId,
         role: "assistant",
-        content: content.trim(),
+        content: typeof content === "string" ? content : "",
         isStoppedMidway: true,
         continuationResolved: false,
-        followUps: smartFollowUps || []
+        followUps: []
       });
       return res.json({ success: true, message: newMsg });
     }
