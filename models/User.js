@@ -102,6 +102,16 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+
+    unreadNotificationCount: {
+      type: Number,
+      default: 0,
+    },
+
+    lastActiveAt: {
+      type: Date,
+      default: Date.now,
+    },
   },
   {
     timestamps: true,

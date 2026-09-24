@@ -59,6 +59,8 @@ connectDB()
     warmOllamaConnection().catch((err) => {
       logger.warn("warmOllamaConnection failed at startup", { error: err.message });
     });
+    const { startWorker } = require("./services/schedulerWorker");
+    startWorker();
   })
   .catch((err) => {
     logger.error("Database connection failed — server cannot start", { error: err.message });
@@ -225,6 +227,7 @@ const usageRoutes = require("./routes/usageRoutes");
 const creditRoutes = require("./routes/creditRoutes");
 const agentStudioRoutes = require("./routes/agentStudioRoutes");
 const mcpAuthRoutes = require("./routes/mcpAuthRoutes");
+const notificationRoutes = require("./routes/notificationRoutes");
 
 app.use("/chats", chatRoutes);
 app.use("/chat", chatRoutes);
@@ -247,6 +250,9 @@ app.use("/api/v1/usage", usageRoutes);
 app.use("/credits", creditRoutes);
 app.use("/api/credits", creditRoutes);
 app.use("/api/mcp", mcpAuthRoutes);
+app.use("/notifications", notificationRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/v1/notifications", notificationRoutes);
 
 
 const promoController = require("./controllers/promoController");
