@@ -13,15 +13,47 @@ const CHAT_ID = "-1003503757676";
 const recentAlerts = new Map();
 const DUP_WINDOW_MS = 60 * 1000; // 60 Seconds
 
+function getHostUrl() {
+  const rawUrl = (
+    process.env.RENDER_EXTERNAL_URL ||
+    process.env.APP_URL ||
+    process.env.SERVER_URL ||
+    process.env.CLIENT_URL ||
+    PROD_DOMAIN
+  ).trim();
+
+  let cleanUrl = rawUrl.replace(/\/$/, "");
+  if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
+    cleanUrl = `https://${cleanUrl}`;
+  }
+  return cleanUrl;
+}
+
 /**
  * Checks if the current execution environment is allowed to dispatch live Telegram alerts.
+ * Live alerts are STRICTLY restricted to primary production (aibe.codegene.io)
+ * or when process.env.ENABLE_TELEGRAM_ALERTS is explicitly set to "true".
+ * Preview/staging Render deployments (e.g. *.onrender.com) are skipped by default.
  */
 function isProductionEnv() {
-  const isProdEnv = process.env.NODE_ENV === "production";
-  const appUrl = (process.env.APP_URL || "").trim().toLowerCase();
-  const isProdDomain = appUrl === PROD_DOMAIN || appUrl.includes("aibe.codegene.io");
+  if (process.env.ENABLE_TELEGRAM_ALERTS === "false") {
+    return false;
+  }
+  if (process.env.ENABLE_TELEGRAM_ALERTS === "true") {
+    return true;
+  }
 
-  return isProdEnv || isProdDomain;
+  const appUrl = (
+    process.env.APP_URL ||
+    process.env.SERVER_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    ""
+  ).trim().toLowerCase();
+
+  // Strict Production Check: Must explicitly be the production domain aibe.codegene.io
+  const isStrictProdDomain = appUrl.includes("aibe.codegene.io") || appUrl === PROD_DOMAIN;
+
+  return isStrictProdDomain;
 }
 
 /**
@@ -116,12 +148,14 @@ async function sendAlert({
   }
   recentAlerts.set(alertHash, Date.now());
 
+  const hostUrl = getHostUrl();
+
   // 3. Format Standardized Markdown Card
   const formattedText = 
     `*${title}*\n\n` +
     `⚡ *Severity:* \`${severity}\`\n` +
     `🖥️ *Service:* \`CodeGene-Backend\`\n` +
-    `🌐 *Host:* \`https://aibe.codegene.io\`\n` +
+    `🌐 *Host:* \`${hostUrl}\`\n` +
     `⏰ *Time:* \`${new Date().toISOString()}\`\n\n` +
     `*Message:*\n${message}` +
     (Object.keys(meta).length > 0 ? `\n\n\`\`\`json\n${JSON.stringify(meta, null, 2)}\n\`\`\`` : "");
