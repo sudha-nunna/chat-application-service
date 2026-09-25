@@ -3,6 +3,7 @@ const ApiKey = require("../models/ApiKey");
 const ApiKeyUsage = require("../models/ApiKeyUsage");
 const CreditTransaction = require("../models/CreditTransaction");
 const aiGateway = require("../utils/aiGateway");
+const { extractPdfText } = require("../services/pdfExtractionService");
 
 /**
  * Estimate token count using word/character heuristic (fallback if tiktoken unavailable)
@@ -26,7 +27,7 @@ exports.listModels = async (req, res) => {
         object: "model",
         created: 1700000000,
         owned_by: "system",
-        description: "API-only auto-routing to highest performing available node pool"
+        description: "API-only auto-routing with full Multimodal Vision & PDF support"
       }
     ];
 
@@ -48,14 +49,14 @@ exports.listModels = async (req, res) => {
 
 /**
  * Handle OpenAI Compatible POST /api/v1/chat/completions
- * API-only auto-routing enforced.
+ * Supports Text, OpenAI Vision (image_url), and PDF/File Attachments.
  */
 exports.chatCompletions = async (req, res) => {
   const reqId = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).substring(2, 7)}`;
   const createdTimestamp = Math.floor(Date.now() / 1000);
 
   try {
-    const { messages, stream = false } = req.body;
+    const { messages, stream = false, attachments: rawAttachments = [] } = req.body;
 
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({
@@ -90,16 +91,82 @@ exports.chatCompletions = async (req, res) => {
       });
     }
 
-    // Sanitize and format messages array
-    const formattedMessages = messages.map(m => ({
-      role: m.role || "user",
-      content: typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")
-    }));
+    const processedAttachments = [];
+
+    // 2. Process explicit attachments array (Base64 PDF, Image, TXT)
+    if (Array.isArray(rawAttachments) && rawAttachments.length > 0) {
+      for (const att of rawAttachments) {
+        const cleanData = (att.data || "").replace(/^data:.*?;base64,/, "");
+        const fileBuffer = Buffer.from(cleanData, "base64");
+        let fileText = "";
+
+        const isPdf = att.fileType === "pdf" || att.mimeType === "application/pdf" || att.name?.toLowerCase().endsWith(".pdf");
+        const isImg = att.fileType === "image" || att.mimeType?.startsWith("image/");
+
+        if (isPdf && fileBuffer.length > 0) {
+          try {
+            fileText = await extractPdfText(fileBuffer);
+          } catch (e) {}
+        } else if (!isImg && fileBuffer.length > 0) {
+          fileText = fileBuffer.toString("utf-8");
+        }
+
+        processedAttachments.push({
+          name: att.name || "attachment",
+          fileType: isImg ? "image" : isPdf ? "pdf" : "txt",
+          mimeType: att.mimeType || (isImg ? "image/png" : isPdf ? "application/pdf" : "text/plain"),
+          data: cleanData,
+          size: att.size || fileBuffer.length,
+          extractedText: fileText
+        });
+      }
+    }
+
+    // 3. Process OpenAI Standard Vision format: content: [{ type: "text" }, { type: "image_url" }]
+    const formattedMessages = [];
+    for (const m of messages) {
+      if (Array.isArray(m.content)) {
+        let textStr = "";
+        for (const item of m.content) {
+          if (item.type === "text" && item.text) {
+            textStr += item.text;
+          } else if (item.type === "image_url" && item.image_url?.url) {
+            const imgUrl = item.image_url.url;
+            const cleanData = imgUrl.replace(/^data:.*?;base64,/, "");
+            const mimeMatch = imgUrl.match(/^data:(image\/[a-zA-Z]+);base64,/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "image/png";
+
+            processedAttachments.push({
+              name: "image.png",
+              fileType: "image",
+              mimeType,
+              data: cleanData
+            });
+          }
+        }
+        formattedMessages.push({ role: m.role || "user", content: textStr || "Analyze the provided image." });
+      } else {
+        formattedMessages.push({
+          role: m.role || "user",
+          content: typeof m.content === "string" ? m.content : JSON.stringify(m.content || "")
+        });
+      }
+    }
+
+    // Append extracted PDF text into context if PDFs were provided
+    for (const att of processedAttachments) {
+      if (att.extractedText && att.extractedText.trim()) {
+        const lastMsg = formattedMessages[formattedMessages.length - 1];
+        if (lastMsg) {
+          lastMsg.content += `\n\n[ATTACHED DOCUMENT: ${att.name}]\n${att.extractedText.slice(0, 32000)}\n[END OF DOCUMENT: ${att.name}]`;
+        }
+      }
+    }
 
     const promptTokens = estimateTokens(formattedMessages);
     const userPriority = req.user.priorityScore || req.user.priority || 10;
 
-    // 2. Handle Streaming Response (stream: true)
+    // 4. Handle Streaming Response (stream: true)
     if (Boolean(stream)) {
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -122,6 +189,7 @@ exports.chatCompletions = async (req, res) => {
         provider: "auto",
         model: "auto",
         messages: formattedMessages,
+        attachments: processedAttachments,
         userPriority,
         userId: userId.toString(),
         onToken: (chunkText) => {
@@ -202,11 +270,12 @@ exports.chatCompletions = async (req, res) => {
       return;
     }
 
-    // 3. Handle Non-Streaming Response (stream: false)
+    // 5. Handle Non-Streaming Response (stream: false)
     const result = await aiGateway.generateStream({
       provider: "auto",
       model: "auto",
       messages: formattedMessages,
+      attachments: processedAttachments,
       userPriority,
       userId: userId.toString()
     });
