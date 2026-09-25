@@ -324,6 +324,11 @@ exports.createNode = async (req, res) => {
     const sanitizedNode = newNode.toObject();
     sanitizedNode.secretKey = sanitizedNode.secretKey ? "••••••••" : "";
 
+    try {
+      const { notifyServerNodeToggled } = require("../services/notifications/alertManager");
+      notifyServerNodeToggled(req.user?.email || "Admin", newNode.name, newNode.isActive).catch(() => {});
+    } catch (_) {}
+
     return res.status(201).json({ success: true, node: sanitizedNode });
   } catch (error) {
     console.error("Error creating server node:", error.message);
@@ -428,6 +433,11 @@ exports.updateNode = async (req, res) => {
     }
 
     await node.save();
+
+    try {
+      const { notifyServerNodeToggled } = require("../services/notifications/alertManager");
+      notifyServerNodeToggled(req.user?.email || "Admin", node.name, node.isActive).catch(() => {});
+    } catch (_) {}
 
     // Auto-sync updated supported models to user-facing AIModel catalog
     const allModelsToSync = Array.from(new Set([node.defaultModel, ...(node.supportedModels || [])])).filter(Boolean);
@@ -969,6 +979,11 @@ exports.updateUserCredits = async (req, res) => {
         description: `Admin manual balance adjustment`,
         balanceAfter: newBalance
       });
+
+      try {
+        const { notifyCreditsAdjusted } = require("../services/notifications/alertManager");
+        notifyCreditsAdjusted(req.user?.email || "Admin", String(user._id), amountDiff, "Admin manual balance adjustment").catch(() => {});
+      } catch (_) {}
 
       // Atomic write — prevents race conditions with concurrent AI credit deductions.
       // Using $set for an absolute value (not relative) is correct here since admin

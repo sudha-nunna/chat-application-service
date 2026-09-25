@@ -48,70 +48,133 @@ async function processSchedulerTick() {
     }).limit(100);
 
     if (dueGenerations.length > 0) {
-      console.log(`⚡ [SCHEDULER PRE-GEN PHASE] Found ${dueGenerations.length} schedules due for pre-generation at ${now.toISOString()}`);
-
-      // Group schedules by normalizedTopic + sourceType to achieve Shared Batch Generation
-      const topicGroups = {};
+      // Multi-instance concurrency protection: Atomically claim pending schedules
+      const claimedGenerations = [];
       for (const sched of dueGenerations) {
-        // Check User Activity Protection (Inactivity > 60 days)
-        const user = await User.findById(sched.userId).select("lastActiveAt unreadNotificationCount");
-        const sixtyDaysAgo = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
-        
-        if (user && user.lastActiveAt && user.lastActiveAt < sixtyDaysAgo) {
-          console.log(`⏸️ [USER INACTIVITY AUTO-PAUSE] Auto-pausing schedule "${sched.title}" for inactive user ${sched.userId}`);
-          sched.autoPaused = true;
-          sched.generationStatus = "failed";
-          sched.lastError = "Auto-paused due to 60+ days user inactivity";
-          const newTimes = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
-          sched.nextRunAt = newTimes.nextRunAt;
-          sched.nextGenerateAt = newTimes.nextGenerateAt;
-          await sched.save();
-          continue;
-        }
-
-        const key = `${sched.sourceType}:${sched.normalizedTopic}`;
-        if (!topicGroups[key]) {
-          topicGroups[key] = [];
-        }
-        topicGroups[key].push(sched);
+        const claimed = await IntelligenceSchedule.findOneAndUpdate(
+          { _id: sched._id, generationStatus: "pending" },
+          { $set: { generationStatus: "generating" } },
+          { new: true }
+        );
+        if (claimed) claimedGenerations.push(claimed);
       }
 
-      // Process grouped topics (Max 3 parallel batch executions to protect Ollama cluster nodes)
-      const groupKeys = Object.keys(topicGroups);
-      for (let i = 0; i < groupKeys.length; i += 3) {
-        const batchKeys = groupKeys.slice(i, i + 3);
-        await Promise.all(
-          batchKeys.map(async (key) => {
-            const groupSchedules = topicGroups[key];
-            if (!groupSchedules || groupSchedules.length === 0) return;
+      if (claimedGenerations.length > 0) {
+        console.log(`⚡ [SCHEDULER PRE-GEN PHASE] Claimed ${claimedGenerations.length} schedules due for pre-generation at ${now.toISOString()}`);
 
-            const sampleSched = groupSchedules[0];
-            const { normalizedTopic, sourceType, rawPrompt, title } = sampleSched;
+        // Group schedules by normalizedTopic + sourceType to achieve Shared Batch Generation
+        const topicGroups = {};
+        for (const sched of claimedGenerations) {
+          // Check User Activity Protection (60 days inactivity)
+          const user = await User.findById(sched.userId).select("credits lastActiveAt unreadNotificationCount");
+          const sixtyDaysAgo = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
+          
+          if (user && user.lastActiveAt && user.lastActiveAt < sixtyDaysAgo) {
+            console.log(`⏸️ [USER INACTIVITY AUTO-PAUSE] Auto-pausing schedule "${sched.title}" for inactive user ${sched.userId}`);
+            sched.autoPaused = true;
+            sched.generationStatus = "failed";
+            sched.lastError = "Auto-paused due to 60+ days user inactivity";
+            const newTimes = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
+            sched.nextRunAt = newTimes.nextRunAt;
+            sched.nextGenerateAt = newTimes.nextGenerateAt;
+            await sched.save();
+            continue;
+          }
 
-            // Step 1: Check Dynamic Cache Layer
-            let content = await getCachedContent(normalizedTopic, sourceType);
+          // Step A: Upfront Credit Verification BEFORE Pre-Generation
+          if (!user || typeof user.credits !== "number" || user.credits < 1) {
+            console.log(`⏸️ [INSUFFICIENT CREDITS PRE-GEN] Skipping pre-generation for schedule "${sched.title}" (User ${sched.userId} balance: ${user?.credits || 0})`);
+            sched.generationStatus = "failed";
+            sched.lastError = `Insufficient credits for scheduled briefing (Balance: ${user?.credits || 0})`;
+            const newTimes = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
+            sched.nextRunAt = newTimes.nextRunAt;
+            sched.nextGenerateAt = newTimes.nextGenerateAt;
+            await sched.save();
+            continue;
+          }
 
-            // Step 2: If Cache Miss, Generate Content via Search + Low-Priority Ollama Offload
-            if (!content) {
-              const startGenTime = Date.now();
-              try {
-                content = await generateIntelligenceContent(rawPrompt, sourceType, title);
-                if (content) {
-                  await setCachedContent(normalizedTopic, sourceType, content);
+          // Step B: Upfront Atomic Credit Deduction BEFORE AI / Search Execution
+          const updatedUser = await User.findOneAndUpdate(
+            { _id: sched.userId, credits: { $gte: 1 } },
+            { $inc: { credits: -1 } },
+            { new: true }
+          );
+
+          if (!updatedUser) {
+            console.log(`⏸️ [CREDIT DEDUCTION FAILED] Unable to deduct credit for schedule "${sched.title}" for user ${sched.userId}`);
+            sched.generationStatus = "failed";
+            sched.lastError = "Credit deduction failed at pre-generation time";
+            const newTimes = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
+            sched.nextRunAt = newTimes.nextRunAt;
+            sched.nextGenerateAt = newTimes.nextGenerateAt;
+            await sched.save();
+            continue;
+          }
+
+          // Record Credit Transaction Audit Record
+          try {
+            const CreditTransaction = require("../models/CreditTransaction");
+            await CreditTransaction.create({
+              userId: sched.userId,
+              amount: -1,
+              type: "other",
+              description: `1 credit deducted for scheduled intelligence briefing pre-generation: "${sched.title}"`,
+              balanceAfter: updatedUser.credits,
+            });
+          } catch (txErr) {
+            console.warn("⚠️ [SCHEDULER CREDIT TX PRE-GEN WARNING]", txErr.message);
+          }
+
+          const key = `${sched.sourceType}:${sched.normalizedTopic}`;
+          if (!topicGroups[key]) {
+            topicGroups[key] = [];
+          }
+          topicGroups[key].push(sched);
+        }
+
+        // Process grouped topics (Max 3 parallel batch executions to protect Ollama cluster nodes)
+        const groupKeys = Object.keys(topicGroups);
+        for (let i = 0; i < groupKeys.length; i += 3) {
+          const batchKeys = groupKeys.slice(i, i + 3);
+          await Promise.all(
+            batchKeys.map(async (key) => {
+              const groupSchedules = topicGroups[key];
+              if (!groupSchedules || groupSchedules.length === 0) return;
+
+              const sampleSched = groupSchedules[0];
+              const { normalizedTopic, sourceType, rawPrompt, title } = sampleSched;
+
+              // Step 1: Check Dynamic Cache Layer
+              let content = await getCachedContent(normalizedTopic, sourceType);
+
+              // Step 2: If Cache Miss, Generate Content via Search + Low-Priority Ollama Offload
+              if (!content) {
+                try {
+                  content = await generateIntelligenceContent(rawPrompt, sourceType, title);
+                  if (content) {
+                    await setCachedContent(normalizedTopic, sourceType, content);
+                  }
+                } catch (genErr) {
+                  console.error(`❌ [PRE-GEN ERROR] Topic "${normalizedTopic}" generation failed:`, genErr.message);
                 }
-              } catch (genErr) {
-                console.error(`❌ [PRE-GEN ERROR] Topic "${normalizedTopic}" generation failed:`, genErr.message);
               }
-            }
 
-            // Step 3: Update generation status for all schedules in this topic group
-            for (const sched of groupSchedules) {
-              sched.generationStatus = content ? "completed" : "failed";
-              if (!content) sched.lastError = "AI generation returned empty response";
-              await sched.save();
-            }
-          })
-        );
+              // Step 3: Update generation status based on pre-generation results
+              for (const sched of groupSchedules) {
+                const isUnavailable = !content || 
+                  (typeof content === "string" && (content.includes("Update Unavailable") || content.includes("INSUFFICIENT_DATA")));
+                
+                if (isUnavailable) {
+                  sched.generationStatus = "failed";
+                  sched.lastError = "Insufficient search data at time of pre-generation";
+                } else {
+                  sched.generationStatus = "completed";
+                }
+                await sched.save();
+              }
+            })
+          );
+        }
       }
     }
 
@@ -125,24 +188,76 @@ async function processSchedulerTick() {
     }).limit(100);
 
     if (dueDeliveries.length > 0) {
-      console.log(`🚀 [SCHEDULER DELIVERY PHASE] Found ${dueDeliveries.length} schedules ready for instant delivery`);
+      console.log(`🚀 [SCHEDULER DELIVERY PHASE] Found ${dueDeliveries.length} schedules ready for instant delivery evaluation`);
 
       for (const sched of dueDeliveries) {
         const startDeliveryTime = Date.now();
 
+        // Multi-Instance Concurrency / Deduplication Safeguard:
+        // Check if a notification for this schedule was already created in the last 12 hours
+        const existingNotif = await Notification.findOne({
+          "metadata.scheduleId": sched._id,
+          createdAt: { $gte: new Date(now.getTime() - 12 * 60 * 60 * 1000) },
+        });
+
+        if (existingNotif) {
+          console.log(`ℹ️ [SCHEDULER DEDUP] Notification already delivered for "${sched.title}" (Schedule ${sched._id}) in this cycle. Skipping duplicate.`);
+          const newTimestamps = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
+          sched.nextRunAt = newTimestamps.nextRunAt;
+          sched.nextGenerateAt = newTimestamps.nextGenerateAt;
+          sched.generationStatus = "pending";
+          await sched.save();
+          continue;
+        }
+
         // Read pre-generated content from cache
         let content = await getCachedContent(sched.normalizedTopic, sched.sourceType);
 
-        // Fallback: If pre-gen failed, try fast dynamic generation now
+        // Fallback: If pre-gen failed or was missing, check credits and try dynamic generation
         if (!content) {
+          const userDoc = await User.findById(sched.userId).select("credits");
+          if (!userDoc || typeof userDoc.credits !== "number" || userDoc.credits < 1) {
+            console.log(`⏸️ [INSUFFICIENT CREDITS DELIVERY] Skipping delivery fallback for "${sched.title}" (User balance: ${userDoc?.credits || 0})`);
+            const newTimestamps = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
+            sched.lastExecutionStatus = "failed_insufficient_credits";
+            sched.lastError = `Insufficient credits for fallback briefing (Balance: ${userDoc?.credits || 0})`;
+            sched.nextRunAt = newTimestamps.nextRunAt;
+            sched.nextGenerateAt = newTimestamps.nextGenerateAt;
+            sched.generationStatus = "pending";
+            await sched.save();
+            continue;
+          }
+
           try {
             content = await generateIntelligenceContent(sched.rawPrompt, sched.sourceType, sched.title);
           } catch (_) {}
         }
 
-        const bodyText = typeof content === "string" ? content : (content?.text || `Daily update for ${sched.title}`);
+        const bodyText = typeof content === "string" ? content : (content?.text || "");
 
-        // Create Notification Record
+        // Quality Guard: If content is unavailable or search results were insufficient, do NOT deliver an "Unavailable" notification
+        const isUnavailable = !bodyText || 
+          bodyText.includes("Update Unavailable") || 
+          bodyText.includes("AI News Update Unavailable") || 
+          bodyText.includes("INSUFFICIENT_DATA") ||
+          bodyText.trim().length < 30;
+
+        if (isUnavailable) {
+          console.log(`⚠️ [DELIVERY SKIPPED] Skipped delivering unavailable briefing for "${sched.title}" to user ${sched.userId}. Re-scheduled for next cycle.`);
+          
+          const newTimestamps = calculateScheduleTimestamps(sched.scheduledTime, sched.timezone, now);
+          sched.executionCount = (sched.executionCount || 0) + 1;
+          sched.lastExecutionAt = now;
+          sched.lastExecutionStatus = "skipped_insufficient_data";
+          sched.lastError = "Insufficient search data at execution time";
+          sched.nextRunAt = newTimestamps.nextRunAt;
+          sched.nextGenerateAt = newTimestamps.nextGenerateAt;
+          sched.generationStatus = "pending";
+          await sched.save();
+          continue;
+        }
+
+        // Create Notification Record for verified briefing
         await Notification.create({
           userId: sched.userId,
           title: sched.title,
@@ -158,7 +273,7 @@ async function processSchedulerTick() {
           read: false,
         });
 
-        // O(1) Fast Unread Count Increment on User Document
+        // O(1) Increment Unread Notification Count
         await User.findByIdAndUpdate(sched.userId, { $inc: { unreadNotificationCount: 1 } }).catch(() => {});
 
         // Update Operational Observability Metrics
@@ -176,11 +291,21 @@ async function processSchedulerTick() {
         sched.generationStatus = "pending";
 
         await sched.save();
-        console.log(`✅ [DELIVERED] Notification delivered for "${sched.title}" to user ${sched.userId} in ${execDuration}ms`);
+        console.log(`✅ [DELIVERED] Briefing delivered for "${sched.title}" to user ${sched.userId} in ${execDuration}ms`);
       }
     }
   } catch (err) {
     console.error("❌ [SCHEDULER WORKER ERROR]", err);
+    try {
+      const { sendAlert } = require("./notifications/telegramAlertService");
+      const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+      sendAlert({
+        type: ALERT_TYPES.JOBS,
+        severity: SEVERITY.ERROR,
+        title: "⚙️ Background Scheduler Worker Error",
+        message: err.stack || err.message
+      }).catch(() => {});
+    } catch (_) {}
   } finally {
     isWorkerRunning = false;
   }
@@ -217,11 +342,24 @@ async function generateIntelligenceContent(rawPrompt, sourceType, title) {
   if (!searchContext) {
     try {
       const webSearchService = require("./webSearchService");
-      const searchRes = await webSearchService.searchOrFetch(rawPrompt);
+      const queryTerm = rawPrompt && rawPrompt.trim() ? rawPrompt.trim() : displayTitle;
+      const enhancedQuery = isFinance ? queryTerm : `${queryTerm} news updates latest`;
+      
+      let searchRes = await webSearchService.searchOrFetch(enhancedQuery);
+      
+      // Fallback: If enhanced search returned empty or sparse context, try raw prompt query
+      const isContextSparse = !searchRes || 
+        (typeof searchRes === "string" && searchRes.length < 50) || 
+        (typeof searchRes === "object" && (!searchRes.formattedContext || searchRes.formattedContext.length < 50));
+
+      if (isContextSparse) {
+        searchRes = await webSearchService.searchOrFetch(queryTerm);
+      }
+
       if (typeof searchRes === "string") {
         searchContext = searchRes;
       } else if (searchRes && typeof searchRes === "object") {
-        searchContext = searchRes.formattedContext || JSON.stringify(searchRes);
+        searchContext = searchRes.formattedContext || "";
       }
     } catch (searchErr) {
       console.warn("⚠️ [SCHEDULER SEARCH WARNING]", searchErr.message);
@@ -262,32 +400,50 @@ Rules:
 - Keep it direct, crisp, and under 200 words.
 - Do NOT output any intro text, markdown headers like # or ##, or meta commentary outside the structure above.`;
   } else {
-    promptText = `You are a senior tech & market intelligence analyst providing a structured intelligence briefing.
+    // If no live search context at all, skip AI call entirely — return unavailable notice directly.
+    if (!searchContext || searchContext.trim().length < 50) {
+      return `# ⚠️ AI News Update Unavailable\n\nUnable to retrieve enough verified AI news from trusted sources during this execution.\n\n**Reason:**\nInsufficient or unavailable live search results.\n\n**Recommendation:**\nThe system will attempt to gather fresh information during the next scheduled execution.`;
+    }
+
+    promptText = `You are an AI Intelligence Analyst responsible for generating high-quality scheduled news briefings.
 
 Topic: "${displayTitle}" (Raw request: "${rawPrompt}")
 
 Live Search & News Data:
-${searchContext || "No live search context available."}
+${searchContext}
 
-Generate a concise, professional intelligence report adhering strictly to this exact format:
+CRITICAL REQUIREMENTS:
+1. NEVER generate generic filler content.
+2. NEVER invent, assume, or hallucinate news.
+3. Generate a comprehensive briefing using ONLY the verified search data provided above.
+4. Every major point must be based on retrieved information from the search context.
+5. Prioritize: OpenAI updates, Google Gemini updates, Anthropic/Claude updates, Meta AI developments, Microsoft AI announcements, new model releases, AI infrastructure developments, AI regulations and policy updates, major funding/acquisitions/partnerships, significant open-source AI releases.
 
-🚀 ${displayTitle} Intelligence Update
+OUTPUT FORMAT — respond using EXACTLY this structure:
 
-Latest Developments:
-• <bullet 1 highlighting a major recent announcement, release, or news event from search data>
-• <bullet 2 highlighting a secondary key update or feature>
+# 🚀 ${displayTitle} Intelligence Update
 
-Market & Industry Impact:
-<2-3 sentence AI summary explaining industry significance and implications based on search results>
+## Latest Developments
 
-Key Takeaway:
-<1 concise actionable takeaway sentence>
+• <verified news item 1 from search data — specific, concrete, named>
+• <verified news item 2 from search data — specific, concrete, named>
+• <verified news item 3 if available in search data>
 
-Rules:
-- Base ALL facts, product names, and events strictly on the provided real-time search data.
-- NEVER output generic placeholder text like "Operational & Stable", "Positive Movement", or "Focus Topic".
-- Keep it direct, crisp, and under 200 words.
-- Do NOT output any intro text, markdown headers like # or ##, or meta commentary outside the structure above.`;
+## Industry Impact
+
+<2-3 sentence explanation of how these developments affect developers, businesses, startups, and AI adoption — based strictly on the search results above>
+
+## Key Takeaways
+
+• <actionable insight 1 — specific and concrete>
+• <actionable insight 2 — specific and concrete>
+• <actionable insight 3 — specific and concrete>
+
+QUALITY RULES:
+- Do NOT output vague statements such as "Infrastructure scaling remains a focus area", "Regulatory developments continue", "Stakeholders should monitor developments", or any similar generic filler text.
+- If the search data does not contain enough verified news, output ONLY: "INSUFFICIENT_DATA" and nothing else.
+- A user reading this briefing should immediately learn something new and concrete.
+- Keep it under 300 words. Do NOT add any intro text or meta commentary outside the structure above.`;
   }
 
   // Step 3: Multi-Endpoint AI Offloading
@@ -352,7 +508,12 @@ Rules:
           : (data.message?.content || data.response || "");
 
         if (summary && summary.trim() && !summary.includes("I'm sorry")) {
-          return summary.trim();
+          const cleaned = summary.trim();
+          // Model signalled insufficient verified data — return proper unavailability notice
+          if (cleaned === "INSUFFICIENT_DATA" || cleaned.startsWith("INSUFFICIENT_DATA")) {
+            return `# ⚠️ AI News Update Unavailable\n\nUnable to retrieve enough verified AI news from trusted sources during this execution.\n\n**Reason:**\nInsufficient or unavailable live search results.\n\n**Recommendation:**\nThe system will attempt to gather fresh information during the next scheduled execution.`;
+          }
+          return cleaned;
         }
       }
     } catch (_) {}
@@ -404,7 +565,8 @@ Rules:
       if (isFinance) {
         return `📈 ${displayTitle} Update\n\nCurrent Prices:\n• Real-Time Search Rate: ${dev1}\n\nMarket Summary:\n${summaryText}\n\nKey Developments:\n• ${dev1}\n• ${dev2}\n\nKey Takeaway:\nKeep tracking upcoming updates for ${displayTitle}.`;
       } else {
-        return `🚀 ${displayTitle} Intelligence Update\n\nLatest Developments:\n• ${dev1}\n• ${dev2}\n\nMarket & Industry Impact:\n${summaryText}\n\nKey Takeaway:\nStay updated on ongoing developments and official announcements for ${displayTitle}.`;
+        // For news/AI topics, raw snippets alone are insufficient for a verified briefing.
+        return `# ⚠️ AI News Update Unavailable\n\nUnable to retrieve enough verified AI news from trusted sources during this execution.\n\n**Reason:**\nInsufficient or unavailable live search results.\n\n**Recommendation:**\nThe system will attempt to gather fresh information during the next scheduled execution.`;
       }
     }
   }
@@ -414,7 +576,8 @@ Rules:
     return `📈 ${displayTitle} Update\n\nCurrent Prices:\n• Market Monitoring: Active session tracking\n\nMarket Summary:\nScheduled intelligence tracking is active for ${displayTitle}. Live search results will refresh in the next cycle.\n\nKey Developments:\n• Centralized worker tracking engaged.\n• Continuous feed monitoring.\n\nKey Takeaway:\nCheck back during the next scheduled update for verified price action.`;
   }
 
-  return `🚀 ${displayTitle} Intelligence Update\n\nLatest Developments:\n• Scheduled monitoring enabled for ${displayTitle}.\n• News & market search context active.\n\nMarket & Industry Impact:\nAutomated background intelligence worker is actively polling live web feeds for fresh announcements regarding ${displayTitle}.\n\nKey Takeaway:\nUpdated intelligence will be delivered in the upcoming schedule cycle.`;
+  // Non-finance: return proper unavailability notice instead of filler.
+  return `# ⚠️ AI News Update Unavailable\n\nUnable to retrieve enough verified AI news from trusted sources during this execution.\n\n**Reason:**\nInsufficient or unavailable live search results.\n\n**Recommendation:**\nThe system will attempt to gather fresh information during the next scheduled execution.`;
 }
 
 /**
@@ -423,13 +586,24 @@ Rules:
 function startWorker() {
   console.log("⏰ [SCHEDULER WORKER INITIALIZED] Centralized background scheduler worker started (* * * * *)...");
   if (cron && typeof cron.schedule === "function") {
-    cron.schedule("* * * * *", () => {
-      processSchedulerTick().catch((err) => console.error("Worker tick execution error:", err));
-    });
+    cron.schedule(
+      "* * * * *",
+      () => {
+        setImmediate(() => {
+          processSchedulerTick().catch((err) => console.error("Worker tick execution error:", err));
+        });
+      },
+      {
+        scheduled: true,
+        recoverMissedExecutions: false,
+      }
+    );
   } else {
     console.log("ℹ️ [SCHEDULER WORKER] Using native setInterval (60s tick interval) fallback");
     setInterval(() => {
-      processSchedulerTick().catch((err) => console.error("Worker tick execution error:", err));
+      setImmediate(() => {
+        processSchedulerTick().catch((err) => console.error("Worker tick execution error:", err));
+      });
     }, 60 * 1000);
   }
 }

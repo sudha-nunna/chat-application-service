@@ -36,6 +36,17 @@ knowledgeWorker.on("completed", (job) => {
 
 knowledgeWorker.on("failed", (job, err) => {
   console.error(`❌ [BULLMQ JOB FAILED] Job ${job?.id} error:`, err.message);
+  try {
+    const { sendAlert } = require("../services/notifications/telegramAlertService");
+    const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+    sendAlert({
+      type: ALERT_TYPES.JOBS,
+      severity: SEVERITY.ERROR,
+      title: "⚙️ BullMQ Queue Job Failure",
+      message: `Job ${job?.id || 'unknown'} in knowledgeProcessingQueue failed: ${err.message}`,
+      meta: { jobId: job?.id, attempts: job?.attemptsMade, error: err.message }
+    }).catch(() => {});
+  } catch (_) {}
 });
 
 knowledgeQueue.on("error", () => {});

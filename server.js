@@ -36,6 +36,17 @@ process.on("unhandledRejection", (reason, promise) => {
     reason: reason instanceof Error ? reason.stack : String(reason),
     promise: String(promise),
   });
+
+  try {
+    const { sendAlert } = require("./services/notifications/telegramAlertService");
+    const { ALERT_TYPES, SEVERITY } = require("./config/alertTypes");
+    sendAlert({
+      type: ALERT_TYPES.CRITICAL,
+      severity: SEVERITY.CRITICAL,
+      title: "🚨 Unhandled Promise Rejection",
+      message: reason instanceof Error ? reason.stack || reason.message : String(reason)
+    }).catch(() => {});
+  } catch (_) {}
 });
 
 /**
@@ -47,6 +58,18 @@ process.on("uncaughtException", (err) => {
     error: err.message,
     stack: err.stack,
   });
+
+  try {
+    const { sendAlert } = require("./services/notifications/telegramAlertService");
+    const { ALERT_TYPES, SEVERITY } = require("./config/alertTypes");
+    sendAlert({
+      type: ALERT_TYPES.CRITICAL,
+      severity: SEVERITY.CRITICAL,
+      title: "🚨 Uncaught Synchronous Exception",
+      message: err.stack || err.message
+    }).catch(() => {});
+  } catch (_) {}
+
   // Give in-flight requests a moment to finish, then exit (PM2 will restart)
   setTimeout(() => process.exit(1), 1000).unref();
 });
@@ -64,6 +87,16 @@ connectDB()
   })
   .catch((err) => {
     logger.error("Database connection failed — server cannot start", { error: err.message });
+    try {
+      const { sendAlert } = require("./services/notifications/telegramAlertService");
+      const { ALERT_TYPES, SEVERITY } = require("./config/alertTypes");
+      sendAlert({
+        type: ALERT_TYPES.CRITICAL,
+        severity: SEVERITY.CRITICAL,
+        title: "🚨 MongoDB Database Connection Failed",
+        message: err.message
+      }).catch(() => {});
+    } catch (_) {}
     process.exit(1);
   });
 
@@ -228,6 +261,8 @@ const creditRoutes = require("./routes/creditRoutes");
 const agentStudioRoutes = require("./routes/agentStudioRoutes");
 const mcpAuthRoutes = require("./routes/mcpAuthRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
+const apiKeyRoutes = require("./routes/apiKeyRoutes");
+const openAiRoutes = require("./routes/openAiRoutes");
 
 app.use("/chats", chatRoutes);
 app.use("/chat", chatRoutes);
@@ -253,6 +288,12 @@ app.use("/api/mcp", mcpAuthRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/v1/notifications", notificationRoutes);
+
+// ─── API Keys & Public OpenAI-Compatible Gateway ──────────────
+app.use("/api/api-keys", apiKeyRoutes);
+app.use("/api/v1/api-keys", apiKeyRoutes);
+app.use("/api/v1", openAiRoutes);
+app.use("/v1", openAiRoutes);
 
 
 const promoController = require("./controllers/promoController");
@@ -307,7 +348,23 @@ app.use((err, req, res, next) => {
       stack: err.stack,
       path: req.originalUrl,
     });
-    return res.status(err.status || 500).json({
+
+    const status = err.status || 500;
+    if (status >= 500) {
+      try {
+        const { sendAlert } = require("./services/notifications/telegramAlertService");
+        const { ALERT_TYPES, SEVERITY } = require("./config/alertTypes");
+        sendAlert({
+          type: ALERT_TYPES.CRITICAL,
+          severity: SEVERITY.ERROR,
+          title: `🚨 Express Error (${status})`,
+          message: `${req.method} ${req.originalUrl}: ${err.message}`,
+          meta: { path: req.originalUrl, method: req.method, status }
+        }).catch(() => {});
+      } catch (_) {}
+    }
+
+    return res.status(status).json({
       error: err.message || "Internal Server Error"
     });
   }
@@ -319,6 +376,18 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   logger.info("Server started", { port: PORT, env: process.env.NODE_ENV || "development" });
+
+  try {
+    const { sendAlert } = require("./services/notifications/telegramAlertService");
+    const { ALERT_TYPES, SEVERITY } = require("./config/alertTypes");
+    sendAlert({
+      type: ALERT_TYPES.DEPLOYMENT,
+      severity: SEVERITY.INFO,
+      title: "🚀 Server Booted / Deployment Heartbeat",
+      message: `CodeGene Backend Service successfully booted on Port ${PORT}`,
+      meta: { port: PORT, env: process.env.NODE_ENV || "development" }
+    }).catch(() => {});
+  } catch (_) {}
 
   const f5Url = process.env.F5_TTS_URL || process.env.VOICE_ENGINE_URL || "http://127.0.0.1:8000";
   logger.info("Voice synthesis endpoint configured", { url: f5Url });

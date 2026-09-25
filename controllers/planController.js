@@ -63,6 +63,12 @@ exports.createPlan = async (req, res) => {
     }
 
     const plan = await Plan.create({ ...planData, key: keyLower });
+
+    try {
+      const { notifyPlanCreated } = require("../services/notifications/alertManager");
+      notifyPlanCreated(req.user?.email || "Admin", { key: plan.key, name: plan.name, price: plan.price }).catch(() => {});
+    } catch (_) {}
+
     res.status(201).json({
       success: true,
       message: "Plan created successfully",
@@ -91,6 +97,11 @@ exports.updatePlan = async (req, res) => {
     if (!plan) {
       return res.status(404).json({ success: false, message: "Plan not found" });
     }
+
+    try {
+      const { notifyPlanUpdated } = require("../services/notifications/alertManager");
+      notifyPlanUpdated(req.user?.email || "Admin", { key: plan.key, name: plan.name, updates }).catch(() => {});
+    } catch (_) {}
 
     res.json({
       success: true,

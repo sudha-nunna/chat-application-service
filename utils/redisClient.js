@@ -24,6 +24,19 @@ const redis = process.env.REDIS_URL
 
 redis.on("connect", () => {
   console.log("⚡ [REDIS CONNECTED] High-speed Redis connected successfully.");
+  if (hasLoggedRedisNotice) {
+    hasLoggedRedisNotice = false;
+    try {
+      const { sendAlert } = require("../services/notifications/telegramAlertService");
+      const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+      sendAlert({
+        type: ALERT_TYPES.JOBS,
+        severity: SEVERITY.INFO,
+        title: "✅ [RECOVERY] Redis Connection Restored",
+        message: "Redis cache & task queue connection has successfully recovered."
+      }).catch(() => {});
+    } catch (_) {}
+  }
 });
 
 let hasLoggedRedisNotice = false;
@@ -33,6 +46,17 @@ redis.on("error", (err) => {
     if (!hasLoggedRedisNotice) {
       console.warn("⚠️ [REDIS NOTICE] Redis is offline (127.0.0.1:6379). Application is running in direct database fallback mode.");
       hasLoggedRedisNotice = true;
+      try {
+        const { sendAlert } = require("../services/notifications/telegramAlertService");
+        const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+        sendAlert({
+          type: ALERT_TYPES.JOBS,
+          severity: SEVERITY.WARN,
+          title: "⚙️ Redis Offline (Fallback Mode)",
+          message: "Redis connection failed. App running in direct database fallback mode.",
+          meta: { error: err.message, code: err.code }
+        }).catch(() => {});
+      } catch (_) {}
     }
   } else {
     console.warn("⚠️ [REDIS NOTICE]", err.message);

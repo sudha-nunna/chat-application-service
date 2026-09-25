@@ -118,6 +118,18 @@ async function refreshClusterNodesFromDB(force = false) {
             ServerNode.findByIdAndUpdate(n._id, { status: "ACTIVE", consecutiveFailures: 0, retryAfter: null, errorMessage: "" })
               .catch(err => console.error("Notice: ServerNode status reset failed:", err.message || err));
             console.log(`  ✅ [RATE_LIMIT RECOVERED] Node ${n.name} retryAfter expired — restored to ACTIVE.`);
+
+            try {
+              const { sendAlert } = require("../services/notifications/telegramAlertService");
+              const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+              sendAlert({
+                type: ALERT_TYPES.AI,
+                severity: SEVERITY.INFO,
+                title: "✅ [RECOVERY] AI Server Node Restored",
+                message: `Server Node "${n.name}" (${n.url}) rate-limit period expired — successfully restored to ACTIVE.`,
+                meta: { nodeId: String(n._id), nodeName: n.name }
+              }).catch(() => {});
+            } catch (_) {}
           }
         }
 
@@ -318,6 +330,18 @@ async function checkClusterHealth() {
           if (node.consecutiveFailures >= 5) {
             node.status = "INACTIVE";
             console.warn(`  ├── ⚡ [CIRCUIT BREAKER TRIGGERED] Node ${node.name} failed 5 consecutive health checks. Transitioned to INACTIVE.`);
+            
+            try {
+              const { sendAlert } = require("../services/notifications/telegramAlertService");
+              const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+              sendAlert({
+                type: ALERT_TYPES.AI,
+                severity: SEVERITY.ERROR,
+                title: "🤖 AI Circuit Breaker Triggered",
+                message: `Server Node "${node.name}" (${node.url}) failed 5 consecutive health checks and has been set to INACTIVE.`,
+                meta: { nodeId: node.id, nodeName: node.name, url: node.url, errorMsg }
+              }).catch(() => {});
+            } catch (_) {}
           } else {
             node.status = "CHECKING";
           }

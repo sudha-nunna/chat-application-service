@@ -332,6 +332,18 @@ async function generateClonedSpeechAndVisemes(text, voiceSampleBuffer, reqHost =
     if (is530) {
       console.error(`❌ [F5-TTS TUNNEL EXPIRED / OFFLINE (HTTP 530/502)] The Colab Cloudflare Tunnel URL (${f5Url}) is expired or disconnected!`);
       console.error(`👉 ACTION REQUIRED: Update F5_TTS_URL in chat-application-service/.env with your new active Colab trycloudflare.com URL.`);
+
+      try {
+        const { sendAlert } = require("./notifications/telegramAlertService");
+        const { ALERT_TYPES, SEVERITY } = require("../config/alertTypes");
+        sendAlert({
+          type: ALERT_TYPES.AI,
+          severity: SEVERITY.ERROR,
+          title: "🤖 Voice TTS Tunnel Offline / Expired",
+          message: `F5-TTS Voice Engine endpoint (${f5Url}) returned HTTP 530/502. Tunnel is expired or disconnected.`,
+          meta: { f5Url, error: f5Err.message }
+        }).catch(() => {});
+      } catch (_) {}
     } else {
       console.warn("⚠️ [F5-TTS NOTICE] Direct cloning server notice (falling back to standard TTS):", f5Err.message);
     }
