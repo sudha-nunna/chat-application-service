@@ -19,14 +19,15 @@ const IntelligenceScheduleSchema = new Schema(
     scheduledTime: { type: String, required: true }, // 24-hr format "09:00"
 
     // Dual-Timestamp Strategy for 2-Minute Pre-Generation Buffer
-    nextGenerateAt: { type: Date, required: true },
-    nextRunAt: { type: Date, required: true },
+    nextGenerateAt: { type: Date },
+    nextRunAt: { type: Date },
     lastSentAt: { type: Date },
+    lastClaimedAt: { type: Date }, // Set atomically when a worker claims this schedule for delivery
 
     // Staggered Generation Lifecycle State
     generationStatus: {
       type: String,
-      enum: ["pending", "generating", "completed", "failed"],
+      enum: ["pending", "generating", "delivering", "completed", "failed"],
       default: "pending",
     },
 
@@ -39,7 +40,14 @@ const IntelligenceScheduleSchema = new Schema(
     lastExecutionAt: { type: Date },
     lastExecutionStatus: {
       type: String,
-      enum: ["success", "failed", "cached", "skipped"],
+      enum: [
+        "success",
+        "failed",
+        "cached",
+        "skipped",
+        "skipped_insufficient_data",
+        "failed_insufficient_credits"
+      ],
     },
     lastError: { type: String },
     averageExecutionTime: { type: Number, default: 0 },

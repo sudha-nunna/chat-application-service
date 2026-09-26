@@ -1,6 +1,7 @@
 const Chat = require("../models/Chat");
 const Message = require("../models/Message");
 const Summary = require("../models/Summary");
+const SharedConversation = require("../models/SharedConversation");
 const { generateLLMSummary } = require("../utils/ragEngine");
 const { getOllamaBaseUrl, getAvailableOllamaModel } = require("../utils/ollamaHelper");
 
@@ -381,10 +382,19 @@ exports.updateChat = async (req, res) => {
 exports.deleteChat = async (req, res) => {
   try {
     const { chatId } = req.params;
+    const userId = req.user?.id || req.user?._id;
+
+    // Ownership check — only the chat owner can delete their chat
+    const chat = await Chat.findOne({ _id: chatId, userId });
+    if (!chat) {
+      return res.status(403).json({ success: false, message: "Chat not found or you do not have permission to delete it." });
+    }
+
     await Promise.all([
       Chat.findByIdAndDelete(chatId),
       Message.deleteMany({ chatId }),
-      Summary.deleteOne({ chatId })
+      Summary.deleteOne({ chatId }),
+      SharedConversation.deleteMany({ chatId }),
     ]);
 
     res.json({ success: true, message: "Chat cleared successfully." });
@@ -1559,20 +1569,72 @@ CORE BEHAVIOR & OUTPUT FORMAT RULES:
 exports.shareChat = async (req, res) => {
   try {
     const { chatId } = req.params;
-    const chat = await Chat.findOne({ _id: chatId, userId: req.user.id });
+    const userId = req.user?.id || req.user?._id;
+
+    const chat = await Chat.findOne({ _id: chatId, userId });
     if (!chat) {
       return res.status(404).json({ success: false, message: "Chat not found or unauthorized." });
     }
 
+    const shareTimestamp = new Date();
     chat.isShared = true;
-    chat.sharedAt = new Date();
+    chat.sharedAt = shareTimestamp;
     await chat.save();
+
+    // Fetch current live messages to capture immutable snapshot
+    const liveMessages = await Message.find({ chatId }).sort({ createdAt: 1 });
+
+    const snapshotMessages = liveMessages.map((msg) => ({
+      originalMessageId: msg._id,
+      role: msg.role,
+      content: msg.content,
+      isStoppedMidway: Boolean(msg.isStoppedMidway),
+      continuationResolved: Boolean(msg.continuationResolved),
+      attachments: Array.isArray(msg.attachments)
+        ? msg.attachments.map((att) => ({
+            name: att.name,
+            fileType: att.fileType,
+            mimeType: att.mimeType,
+            data: att.data,
+            size: att.size,
+          }))
+        : [],
+      sources: Array.isArray(msg.sources)
+        ? msg.sources.map((src) => ({
+            id: src.id,
+            title: src.title,
+            url: src.url,
+            domain: src.domain,
+            snippet: src.snippet,
+          }))
+        : [],
+      requiresWebSearch: Boolean(msg.requiresWebSearch),
+      followUps: Array.isArray(msg.followUps) ? msg.followUps : [],
+      createdAt: msg.createdAt || new Date(),
+      updatedAt: msg.updatedAt || new Date(),
+    }));
+
+    // Save or update dedicated immutable snapshot in SharedConversation
+    await SharedConversation.findOneAndUpdate(
+      { chatId: chat._id },
+      {
+        $set: {
+          chatId: chat._id,
+          ownerId: chat.userId,
+          title: chat.title,
+          conversationSummary: chat.conversationSummary || "",
+          snapshotMessages,
+          sharedAt: shareTimestamp,
+        },
+      },
+      { upsert: true, new: true, runValidators: true }
+    );
 
     res.json({
       success: true,
       chatId: chat._id,
       isShared: true,
-      sharedAt: chat.sharedAt
+      sharedAt: chat.sharedAt,
     });
   } catch (err) {
     console.error("Error sharing chat:", err);
@@ -1582,11 +1644,13 @@ exports.shareChat = async (req, res) => {
 
 /**
  * Retrieves a shared conversation for viewing by authenticated users.
+ * Reads ONLY from SharedConversation.snapshotMessages (never from live Message collection).
  */
 exports.getSharedChat = async (req, res) => {
   try {
     const { chatId } = req.params;
-    const chat = await Chat.findById(chatId).populate("userId", "name email");
+    // Only select fields we need — never pull sensitive user data like credits, password hash, etc.
+    const chat = await Chat.findById(chatId).populate("userId", "name");
     if (!chat) {
       return res.status(404).json({ success: false, message: "Shared conversation not found." });
     }
@@ -1598,22 +1662,55 @@ exports.getSharedChat = async (req, res) => {
       return res.status(403).json({ success: false, message: "This chat has not been shared by its author." });
     }
 
-    const messages = await Message.find({ chatId }).sort({ createdAt: 1 });
+    // Read dedicated SharedConversation snapshot document
+    let sharedDoc = await SharedConversation.findOne({ chatId });
+    let messages = [];
+
+    if (sharedDoc && Array.isArray(sharedDoc.snapshotMessages)) {
+      messages = sharedDoc.snapshotMessages;
+    } else if (chat.isShared) {
+      // Backward compatibility: create snapshot only for chats that are actually shared
+      const liveMessages = await Message.find({ chatId }).sort({ createdAt: 1 });
+      const snapshotMessages = liveMessages.map((msg) => ({
+        originalMessageId: msg._id,
+        role: msg.role,
+        content: msg.content,
+        isStoppedMidway: Boolean(msg.isStoppedMidway),
+        continuationResolved: Boolean(msg.continuationResolved),
+        attachments: Array.isArray(msg.attachments) ? msg.attachments : [],
+        sources: Array.isArray(msg.sources) ? msg.sources : [],
+        requiresWebSearch: Boolean(msg.requiresWebSearch),
+        followUps: Array.isArray(msg.followUps) ? msg.followUps : [],
+        createdAt: msg.createdAt || new Date(),
+        updatedAt: msg.updatedAt || new Date(),
+      }));
+
+      sharedDoc = await SharedConversation.create({
+        chatId: chat._id,
+        ownerId: chat.userId._id || chat.userId,
+        title: chat.title,
+        conversationSummary: chat.conversationSummary || "",
+        snapshotMessages,
+        sharedAt: chat.sharedAt || chat.updatedAt || new Date(),
+      });
+
+      messages = sharedDoc.snapshotMessages;
+    }
 
     res.json({
       success: true,
       chat: {
         _id: chat._id,
-        title: chat.title,
+        title: sharedDoc?.title || chat.title,
         createdAt: chat.createdAt,
-        sharedAt: chat.sharedAt,
+        sharedAt: sharedDoc?.sharedAt || chat.sharedAt,
+        // Only expose the owner's display name — never their email or any other PII
         author: {
           name: chat.userId?.name || "Codegene User",
-          email: chat.userId?.email || ""
         },
-        isOwner
+        isOwner,
       },
-      messages
+      messages,
     });
   } catch (err) {
     console.error("Error getting shared chat:", err);
@@ -1622,7 +1719,7 @@ exports.getSharedChat = async (req, res) => {
 };
 
 /**
- * Clones / Forks a shared chat into the viewing user's private chat list.
+ * Clones / Forks a shared chat into the viewing user's private chat list from the snapshot.
  */
 exports.forkSharedChat = async (req, res) => {
   try {
@@ -1649,10 +1746,18 @@ exports.forkSharedChat = async (req, res) => {
       conversationSummary: originalChat.conversationSummary || ""
     });
 
-    // 2. Clone all messages into the new chat
-    const originalMessages = await Message.find({ chatId }).sort({ createdAt: 1 });
-    if (originalMessages.length > 0) {
-      const clonedDocs = originalMessages.map((msg) => ({
+    // 2. Read snapshot messages if available, or fall back to live messages
+    const sharedDoc = await SharedConversation.findOne({ chatId });
+    let messagesToFork = [];
+
+    if (sharedDoc && Array.isArray(sharedDoc.snapshotMessages) && sharedDoc.snapshotMessages.length > 0) {
+      messagesToFork = sharedDoc.snapshotMessages;
+    } else {
+      messagesToFork = await Message.find({ chatId }).sort({ createdAt: 1 });
+    }
+
+    if (messagesToFork.length > 0) {
+      const clonedDocs = messagesToFork.map((msg) => ({
         chatId: newChat._id,
         role: msg.role,
         content: msg.content,

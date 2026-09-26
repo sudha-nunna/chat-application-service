@@ -42,6 +42,36 @@ const auth = async (req, res, next) => {
 
 auth.protect = auth;
 
+/**
+ * optionalAuth — Like protect, but never blocks the request.
+ * If a valid JWT is present, req.user is populated (enables isOwner checks).
+ * If no token or invalid token, req.user remains undefined and the request continues.
+ * Used for public share endpoints accessible to both logged-in and anonymous viewers.
+ */
+auth.optionalAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization || req.headers["x-auth-token"];
+  if (!authHeader) return next();
+
+  let token = String(authHeader).trim();
+  if (token.startsWith("Bearer ") || token.includes(" ")) {
+    token = token.split(" ")[1];
+  }
+
+  if (!token || token === "null" || token === "undefined") return next();
+
+  try {
+    const secret = process.env.JWT_SECRET || "mysecretkey";
+    const decoded = jwt.verify(token, secret);
+    req.user = decoded;
+    if (req.user && !req.user.id && req.user._id) {
+      req.user.id = req.user._id;
+    }
+  } catch (_) {
+    // Invalid token — treat as anonymous, do not block
+  }
+  next();
+};
+
 const { isUserAdmin } = require("../utils/adminConfig");
 
 auth.requireAdmin = async (req, res, next) => {

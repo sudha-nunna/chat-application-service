@@ -187,6 +187,13 @@ exports.getSchedules = async (req, res) => {
 };
 
 // 8. Create Intelligence Schedule (with Automatic Topic/Source Resolution & Semantic Duplicate Check)
+const normalizeRateString = (r, type) => {
+  const val = (r || type || "daily").toString().toLowerCase().trim();
+  if (val === "one_time" || val === "onetime" || val === "one-time") return "one_time";
+  return val;
+};
+
+// 8. Create Intelligence Schedule (with Automatic Topic/Source Resolution & Semantic Duplicate Check)
 exports.createSchedule = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -200,8 +207,9 @@ exports.createSchedule = async (req, res) => {
     }
 
     const rawPrompt = rawInput.trim();
-    const timeStr = scheduledTime || deliveryTime || "08:00";
+    const timeStr = scheduledTime || deliveryTime || "08:30";
     const userTz = timezone || "Asia/Kolkata";
+    const backendRate = normalizeRateString(rate, sourceConfig?.scheduleType);
 
     // Step 1: Automatic Topic & Source Resolution
     const normalizedTopic = normalizeTopic(rawPrompt);
@@ -224,8 +232,15 @@ exports.createSchedule = async (req, res) => {
     }
 
     // Step 3: Calculate Dual Timestamps (nextRunAt & nextGenerateAt)
-    const targetStartDate = sourceConfig?.startDate ? new Date(sourceConfig.startDate) : new Date();
-    const timestamps = calculateScheduleTimestamps(timeStr, userTz, targetStartDate);
+    const timestamps = calculateScheduleTimestamps(timeStr, userTz, {
+      rate: backendRate,
+      startDate: sourceConfig?.startDate,
+      weeklyDays: sourceConfig?.weeklyDays,
+      monthlyRunOn: sourceConfig?.monthlyRunOn,
+      customInterval: sourceConfig?.customInterval,
+      customUnit: sourceConfig?.customUnit,
+      fromDate: new Date(),
+    });
 
     const schedule = await IntelligenceSchedule.create({
       userId,
@@ -236,7 +251,7 @@ exports.createSchedule = async (req, res) => {
       sourceType,
       timezone: userTz,
       scheduledTime: timeStr,
-      rate: rate || "daily",
+      rate: backendRate,
       sourceConfig: sourceConfig || {},
       nextRunAt: timestamps.nextRunAt,
       nextGenerateAt: timestamps.nextGenerateAt,
@@ -245,6 +260,17 @@ exports.createSchedule = async (req, res) => {
       autoPaused: false,
     });
 
+    console.log("📌 [SCHEDULE CREATED]", JSON.stringify({
+      scheduleId: schedule._id,
+      userId,
+      title: scheduleTitle,
+      rate: backendRate,
+      scheduledTime: timeStr,
+      timezone: userTz,
+      nextRunAt: timestamps.nextRunAt,
+      nextGenerateAt: timestamps.nextGenerateAt,
+    }));
+
     return res.status(201).json({ success: true, schedule });
   } catch (err) {
     console.error("Error creating schedule:", err);
@@ -252,7 +278,7 @@ exports.createSchedule = async (req, res) => {
   }
 };
 
-// 9. Update Intelligence Schedule
+// 9. Update Intelligence Schedule (Immediately Recalculates & Reschedules)
 exports.updateSchedule = async (req, res) => {
   try {
     const userId = getUserId(req);
@@ -272,9 +298,11 @@ exports.updateSchedule = async (req, res) => {
     if (enabled !== undefined) schedule.enabled = Boolean(enabled);
     if (newTime) schedule.scheduledTime = newTime;
     if (timezone) schedule.timezone = timezone;
-    if (rate) schedule.rate = rate;
     if (title) schedule.title = title;
     if (sourceConfig) schedule.sourceConfig = { ...(schedule.sourceConfig || {}), ...sourceConfig };
+
+    const backendRate = normalizeRateString(rate || schedule.rate, schedule.sourceConfig?.scheduleType);
+    schedule.rate = backendRate;
 
     if (newPrompt && newPrompt.trim()) {
       schedule.rawPrompt = newPrompt.trim();
@@ -284,15 +312,37 @@ exports.updateSchedule = async (req, res) => {
       schedule.sourceType = resolveSourceType(newPrompt.trim());
     }
 
-    // Recalculate timestamps with startDate if provided
-    const targetStartDate = schedule.sourceConfig?.startDate ? new Date(schedule.sourceConfig.startDate) : new Date();
-    const timestamps = calculateScheduleTimestamps(schedule.scheduledTime, schedule.timezone, targetStartDate);
+    // Recalculate precision timestamps immediately with updated options
+    const timestamps = calculateScheduleTimestamps(schedule.scheduledTime, schedule.timezone, {
+      rate: backendRate,
+      startDate: schedule.sourceConfig?.startDate,
+      weeklyDays: schedule.sourceConfig?.weeklyDays,
+      monthlyRunOn: schedule.sourceConfig?.monthlyRunOn,
+      customInterval: schedule.sourceConfig?.customInterval,
+      customUnit: schedule.sourceConfig?.customUnit,
+      fromDate: new Date(),
+    });
+
     schedule.nextRunAt = timestamps.nextRunAt;
     schedule.nextGenerateAt = timestamps.nextGenerateAt;
     schedule.generationStatus = "pending";
+    schedule.failureCount = 0;
+    schedule.lastError = "";
     if (enabled === true) schedule.autoPaused = false; // Reactivate if re-enabled
 
     await schedule.save();
+
+    console.log("✏️ [SCHEDULE UPDATED / RESCHEDULED]", JSON.stringify({
+      scheduleId: schedule._id,
+      userId,
+      title: schedule.title,
+      rate: backendRate,
+      scheduledTime: schedule.scheduledTime,
+      timezone: schedule.timezone,
+      nextRunAt: timestamps.nextRunAt,
+      nextGenerateAt: timestamps.nextGenerateAt,
+      enabled: schedule.enabled,
+    }));
 
     return res.status(200).json({ success: true, schedule });
   } catch (err) {
@@ -310,6 +360,11 @@ exports.deleteSchedule = async (req, res) => {
     const { id } = req.params;
 
     await IntelligenceSchedule.deleteOne({ _id: id, userId });
+
+    console.log("🗑️ [SCHEDULE DELETED]", JSON.stringify({
+      scheduleId: id,
+      userId,
+    }));
 
     return res.status(200).json({ success: true, message: "Schedule deleted successfully" });
   } catch (err) {
